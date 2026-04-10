@@ -3,10 +3,9 @@
 //
 // Built-in filters:
 //
-//   - PathFilter: URI glob allow/deny.
-//   - TagFilter:  resource tag allow/deny.
-//
-// Phase 3 will add RedactionFilter (regex-based content redaction).
+//   - PathFilter:      URI glob allow/deny.
+//   - TagFilter:       resource tag allow/deny.
+//   - RedactionFilter: regex-based content masking.
 //
 // Filters are optional. A CompositeFilter with an empty filter list (or
 // constructed with filters disabled) is a pass-through — every URI, every
@@ -15,6 +14,7 @@ package filter
 
 import (
 	"fmt"
+	"regexp"
 
 	"github.com/bmatcuk/doublestar/v4"
 
@@ -98,6 +98,14 @@ func NewFromConfig(cfg config.FiltersConfig) (*CompositeFilter, error) {
 
 	if len(cfg.Tags.Allow) > 0 || len(cfg.Tags.Deny) > 0 {
 		filters = append(filters, NewTagFilter(cfg.Tags.Allow, cfg.Tags.Deny))
+	}
+
+	if cfg.Redaction.Enabled && len(cfg.Redaction.Rules) > 0 {
+		rf, err := NewRedactionFilter(cfg.Redaction.Rules)
+		if err != nil {
+			return nil, err
+		}
+		filters = append(filters, rf)
 	}
 
 	return NewCompositeFilter(filters...), nil
@@ -203,3 +211,53 @@ func (t *TagFilter) AllowTags(_ string, tags []string, _ *model.Caller) bool {
 
 // FilterContent is a pass-through for TagFilter.
 func (*TagFilter) FilterContent(content string, _ string) string { return content }
+
+// ───────────────────────── RedactionFilter ─────────────────────────
+
+// RedactionFilter masks content bytes that match any configured regex rule.
+// It runs in the FilterContent stage — after the backend has read the
+// resource and after tag/path checks have decided to let the content
+// through. Rules are compiled once at construction time so a bad pattern
+// fails fast at server start rather than surfacing at request time.
+//
+// Replacement strings use Go's [regexp.Regexp.ReplaceAllString] semantics,
+// so capture groups (`$1`, `$2`, …) work inside the replacement. The
+// conventional replacement for a "drop this secret" rule is a literal
+// `[REDACTED]`.
+type RedactionFilter struct {
+	rules []redactionRule
+}
+
+type redactionRule struct {
+	pattern     *regexp.Regexp
+	replacement string
+}
+
+// NewRedactionFilter compiles the rules and returns a filter. An invalid
+// regex pattern returns an error — construction is the cheapest place to
+// catch operator typos.
+func NewRedactionFilter(rules []config.RedactionRule) (*RedactionFilter, error) {
+	compiled := make([]redactionRule, 0, len(rules))
+	for i, r := range rules {
+		re, err := regexp.Compile(r.Pattern)
+		if err != nil {
+			return nil, fmt.Errorf("filter: redaction rule %d: compile %q: %w", i, r.Pattern, err)
+		}
+		compiled = append(compiled, redactionRule{pattern: re, replacement: r.Replacement})
+	}
+	return &RedactionFilter{rules: compiled}, nil
+}
+
+// AllowURI is a pass-through for RedactionFilter.
+func (*RedactionFilter) AllowURI(string, *model.Caller) bool { return true }
+
+// AllowTags is a pass-through for RedactionFilter.
+func (*RedactionFilter) AllowTags(string, []string, *model.Caller) bool { return true }
+
+// FilterContent applies every compiled rule in order.
+func (f *RedactionFilter) FilterContent(content string, _ string) string {
+	for _, r := range f.rules {
+		content = r.pattern.ReplaceAllString(content, r.replacement)
+	}
+	return content
+}

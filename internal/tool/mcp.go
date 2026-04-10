@@ -63,7 +63,7 @@ func registerGetContext(srv *mcpserver.MCPServer, d *dispatcher.ToolDispatcher) 
 			mcppkg.Required(),
 		),
 		mcppkg.WithString("format",
-			mcppkg.Description("Output format: 'markdown' (default) or 'json'"),
+			mcppkg.Description("Output format: 'markdown' (default), 'markdown-with-metadata', or 'json'"),
 		),
 	)
 	srv.AddTool(t, func(ctx context.Context, req mcppkg.CallToolRequest) (*mcppkg.CallToolResult, error) {

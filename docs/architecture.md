@@ -60,11 +60,11 @@ MCP and REST.
 | `internal/model`        | Shared types (`Caller`) and sentinel errors |
 | `internal/backend`      | `Backend` / `SubagentBackend` interfaces and five built-in types: `filesystem` (P1), `subprocess`, `http`, `subagent-cli`, `subagent-http` (P2) |
 | `internal/auth`         | `AuthProvider` interface, Bearer/None/TrustedHeader, middleware |
-| `internal/filter`       | `Filter` interface, `CompositeFilter`, PathFilter, TagFilter |
+| `internal/filter`       | `Filter` interface, `CompositeFilter`, PathFilter, TagFilter, RedactionFilter (P3) |
 | `internal/audit`        | `Logger` interface, JSONL/stdout/nop sinks, arg sanitization |
-| `internal/dispatcher`   | Central tool router: filter + backend + audit pipeline |
+| `internal/dispatcher`   | Central tool router: filter + backend + audit pipeline, markdown / markdown-with-metadata / json context formats |
 | `internal/tool`         | Per-tool Handle\* functions and MCP registrations |
-| `internal/server`       | chi router, MCP mount, REST adapter, health endpoint |
+| `internal/server`       | chi router, MCP mount, REST adapter, health probes, CORS + rate limit middleware, OpenAPI spec |
 
 ## Request flow
 
@@ -93,7 +93,7 @@ caller → AllowURI  ──(block)──▶ 403 ErrAccessViolation
          AllowTags ──(block)──▶ 403 ErrAccessViolation
          │
          ▼
-         FilterContent   (Phase 3 redaction: identity in Phase 1)
+         FilterContent   (RedactionFilter; identity when disabled)
          │
          ▼
          audit.Log
@@ -106,8 +106,9 @@ caller → AllowURI  ──(block)──▶ 403 ErrAccessViolation
   hits disk.
 - **AllowTags** runs after the backend returns, with the resource's tag set
   (from `auto_tag` config rules on the filesystem backend).
-- **FilterContent** is the identity function in Phase 1; Phase 3 adds regex
-  redaction.
+- **FilterContent** runs `RedactionFilter` (Phase 3) when rules are
+  configured; otherwise it is the identity function. The un-redacted
+  copy never leaves the dispatcher.
 
 ## Backend model
 
@@ -257,6 +258,6 @@ the config — see `docs/config-doc.md`.
 See `plan.md` §10 for the full roadmap. Short version:
 
 - **Phase 2 (shipped in 0.3.0):** subagent / subprocess / http backends, `pf_fault` (deep retrieval), `pf_ps` (list agents), plus matching CLI subcommands.
-- **Phase 3:** redaction filter, OpenAPI spec, CORS, rate limiting
+- **Phase 3 (shipped in 0.4.0):** `RedactionFilter`, JSON / markdown-with-metadata context formats, `/api/openapi.json`, opt-in CORS, per-caller rate limiting, `HealthChecker` interface + richer `/health`, structured REST error envelope.
 - **Phase 4:** write support (direct append + agent writeback)
 - **Phase 5:** OAuth2, caching, streaming, metrics

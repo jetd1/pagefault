@@ -190,7 +190,7 @@ func runMaps(args []string) error {
 func runLoad(args []string) error {
 	fs := flag.NewFlagSet("load", flag.ContinueOnError)
 	configPath, noFilter, asJSON := registerCommonFlags(fs)
-	format := fs.String("format", "", "output format: markdown | json (default from config)")
+	format := fs.String("format", "", "output format: markdown | markdown-with-metadata | json (default from config)")
 	if err := parseInterspersed(fs, args); err != nil {
 		return err
 	}

@@ -748,21 +748,11 @@ Four additional backend types — `subprocess` (rg/grep/plain), generic `http`, 
 
 See `CHANGELOG.md` §0.3.0 / §0.3.1 / §0.3.2 for the detailed per-release notes.
 
-### Phase 3 — Polish + Production
+### Phase 3 — Polish + Production ✅ (shipped in 0.4.0)
 
-(`pagefault token` CLI subcommands already shipped in 0.1.0 — originally
-slated here, moved to Phase 1 during implementation.)
+`RedactionFilter` (Go regexp with capture-group replacements, compiled at server start), JSON and `markdown-with-metadata` context formats for `pf_load` (JSON mode drops sources from the tail rather than byte-truncating so the emitted document stays valid), public `/api/openapi.json` generated live from the current config + dispatcher (ChatGPT Custom GPT Actions importable), opt-in `server.cors` with preflight support, per-caller in-process rate limiting via `server.rate_limit` keyed on `caller.id` (429 + `Retry-After` on over-budget), optional `HealthChecker` backend interface with the filesystem backend probing its root and `/health` reporting `ok` / `degraded` / `unavailable` per-backend, and a structured REST error envelope (`{"error":{"code","status","message"}}`) with stable snake_case codes for every sentinel. README gained client setup guides for Claude Code, Claude Desktop, and ChatGPT Custom GPT. Circuit-breaker-style backoff for flaky backends is deferred — `pf_scan`'s "one backend failing doesn't break search" already covers the common case.
 
-1. `internal/filter/filter.go` — `RedactionFilter` (regex-based content redaction)
-2. Context formats: JSON, markdown-with-metadata
-3. OpenAPI spec at `/api/openapi.json` (for ChatGPT Actions)
-4. Graceful degradation when backends are unreachable (health probes, backoff)
-5. Structured error responses (error codes, not just messages)
-6. Rate limiting (configurable per-caller)
-7. CORS config
-8. README.md setup guides for Claude Code, Claude Desktop, ChatGPT Custom GPT
-9. Update all docs (`api-doc.md`, `config-doc.md`, `security.md`)
-10. Version bump + CHANGELOG
+See `CHANGELOG.md` §0.4.0 for the detailed breakdown.
 
 ### Phase 4 — Writeback (Read-Write)
 
@@ -881,20 +871,19 @@ OpenAPI spec available at `/api/openapi.json` — paste this URL into ChatGPT Cu
 
 ## 13. Open Questions
 
-Questions from the original pre-Phase-1 list have been resolved by shipped
-work (OpenClaw CLI shape → configurable via `subagent-cli` template;
-mcp-go chi mounting → verified in `internal/server`; multi-backend merging
-→ interleave, no cross-ranking). What's still open, all Phase 3+:
+Questions from earlier phases have been resolved by shipped work
+(OpenClaw CLI shape → configurable via `subagent-cli` template;
+mcp-go chi mounting → verified in `internal/server`; multi-backend
+merging → interleave, no cross-ranking; context response format →
+Phase 3 ships `markdown`, `markdown-with-metadata`, and `json`).
+What's still open:
 
-1. **Context response format.** Should contexts default to `text/markdown`
-   (raw concatenation, current behavior) or grow an `application/json`
-   mode (structured with metadata)? Phase 3.
-2. **Write concurrency.** When two writers (e.g. Cha via OpenClaw and an
+1. **Write concurrency.** When two writers (e.g. Cha via OpenClaw and an
    external agent via pagefault) append to the same daily note, `flock`
    serializes the writes but the entry order depends on lock-acquisition
    order. Is that acceptable, or do we need a write queue with ordering
    guarantees? Phase 4.
-3. **Agent writeback trust boundary.** `mode: "agent"` will bypass
+2. **Agent writeback trust boundary.** `mode: "agent"` will bypass
    pagefault's `write_paths` allowlist because the subagent writes
    directly (not through pagefault). Should pagefault validate the
    subagent's write result against `write_paths`, or fully trust the
@@ -903,7 +892,7 @@ mcp-go chi mounting → verified in `internal/server`; multi-backend merging
 
 ## 14. For Claude Code: How to Start
 
-Phases 1 and 2 have shipped — the foundations (filesystem backend, MCP + REST transports, four additional backend types, the six `pf_*` tools, CLI subcommands, auth, filters, audit) all exist in working form. The original step-by-step Phase-1 build order lived here but was removed once it became historical; for *new* work the canonical entry points are:
+Phases 1, 2, and 3 have shipped — the foundations (filesystem backend, MCP + REST transports, four additional backend types, the six `pf_*` tools, CLI subcommands, auth, path/tag/redaction filters, audit, live OpenAPI spec, opt-in CORS and rate limiting, structured error envelope) all exist in working form. The original step-by-step Phase-1 build order lived here but was removed once it became historical; for *new* work the canonical entry points are:
 
 - **`CLAUDE.md`** — directory tree, build/test commands, per-task recipes ("add a backend / tool / filter"), conventions, and rules. Read this first.
 - **Section 0** of this file — conventions and non-negotiables from the project's early days that still apply.

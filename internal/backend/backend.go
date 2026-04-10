@@ -70,3 +70,14 @@ type Backend interface {
 	// for the list/discovery tools and context source resolution.
 	ListResources(ctx context.Context) ([]ResourceInfo, error)
 }
+
+// HealthChecker is an optional interface that backends may implement to
+// signal liveness to the /health endpoint. Backends that do not
+// implement it are reported as "ok" — only backends with a non-nil
+// Health method get real probing. Implementations should honor the
+// passed context (which carries the probe deadline) and return a
+// short, cheap error on failure; /health summarises the first line
+// of the error in its response.
+type HealthChecker interface {
+	Health(ctx context.Context) error
+}

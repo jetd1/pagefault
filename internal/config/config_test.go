@@ -114,6 +114,101 @@ contexts:
 	assert.Equal(t, "off", cfg.Audit.Mode, "audit mode default when disabled")
 }
 
+func TestParse_CORSDefaults(t *testing.T) {
+	// Enabled with no other fields set — defaults should fill methods/headers/max_age.
+	raw := `
+server:
+  host: "127.0.0.1"
+  port: 8444
+  cors:
+    enabled: true
+    allowed_origins: ["https://example.com"]
+auth:
+  mode: "none"
+backends:
+  - name: fs
+    type: filesystem
+    root: "/tmp"
+    include: ["**/*"]
+    uri_scheme: "memory"
+`
+	cfg, err := Parse([]byte(raw))
+	require.NoError(t, err)
+	assert.True(t, cfg.Server.CORS.Enabled)
+	assert.Equal(t, []string{"https://example.com"}, cfg.Server.CORS.AllowedOrigins)
+	assert.ElementsMatch(t, []string{"GET", "POST", "OPTIONS"}, cfg.Server.CORS.AllowedMethods)
+	assert.ElementsMatch(t, []string{"Content-Type", "Authorization"}, cfg.Server.CORS.AllowedHeaders)
+	assert.Equal(t, 600, cfg.Server.CORS.MaxAge)
+}
+
+func TestParse_CORSDisabledByDefault(t *testing.T) {
+	raw := `
+server:
+  host: "127.0.0.1"
+  port: 8444
+auth:
+  mode: "none"
+backends:
+  - name: fs
+    type: filesystem
+    root: "/tmp"
+    include: ["**/*"]
+    uri_scheme: "memory"
+`
+	cfg, err := Parse([]byte(raw))
+	require.NoError(t, err)
+	assert.False(t, cfg.Server.CORS.Enabled)
+	// Defaults only apply when enabled; disabled config stays empty.
+	assert.Empty(t, cfg.Server.CORS.AllowedMethods)
+}
+
+func TestParse_RateLimitDefaults(t *testing.T) {
+	raw := `
+server:
+  host: "127.0.0.1"
+  port: 8444
+  rate_limit:
+    enabled: true
+auth:
+  mode: "none"
+backends:
+  - name: fs
+    type: filesystem
+    root: "/tmp"
+    include: ["**/*"]
+    uri_scheme: "memory"
+`
+	cfg, err := Parse([]byte(raw))
+	require.NoError(t, err)
+	assert.True(t, cfg.Server.RateLimit.Enabled)
+	assert.Equal(t, 10.0, cfg.Server.RateLimit.RPS)
+	assert.Equal(t, 20, cfg.Server.RateLimit.Burst)
+}
+
+func TestParse_RateLimitExplicit(t *testing.T) {
+	raw := `
+server:
+  host: "127.0.0.1"
+  port: 8444
+  rate_limit:
+    enabled: true
+    rps: 5
+    burst: 8
+auth:
+  mode: "none"
+backends:
+  - name: fs
+    type: filesystem
+    root: "/tmp"
+    include: ["**/*"]
+    uri_scheme: "memory"
+`
+	cfg, err := Parse([]byte(raw))
+	require.NoError(t, err)
+	assert.Equal(t, 5.0, cfg.Server.RateLimit.RPS)
+	assert.Equal(t, 8, cfg.Server.RateLimit.Burst)
+}
+
 func TestParse_InvalidYAML(t *testing.T) {
 	_, err := Parse([]byte("this is : not : valid : yaml : [["))
 	require.Error(t, err)

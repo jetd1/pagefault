@@ -19,6 +19,7 @@ import (
 	"github.com/jet/pagefault/internal/config"
 	"github.com/jet/pagefault/internal/dispatcher"
 	"github.com/jet/pagefault/internal/filter"
+	"github.com/jet/pagefault/internal/model"
 )
 
 // newTestServer spins up a full pagefault Server with a filesystem backend
@@ -125,7 +126,64 @@ func TestServer_Health_NoAuthRequired(t *testing.T) {
 	require.NoError(t, json.Unmarshal(body, &out))
 	assert.Equal(t, "ok", out["status"])
 	backends := out["backends"].(map[string]any)
-	assert.Equal(t, "ok", backends["fs"])
+	fs := backends["fs"].(map[string]any)
+	assert.Equal(t, "ok", fs["status"])
+	// A healthy filesystem backend should not have an error field.
+	_, hasErr := fs["error"]
+	assert.False(t, hasErr)
+}
+
+func TestServer_Health_DegradedWhenBackendDown(t *testing.T) {
+	// Build a server whose filesystem backend root is deleted after
+	// startup — Health should return "unavailable" for that backend and
+	// "degraded" overall. /health still returns 200 so operators can
+	// fetch it cheaply.
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "hello.md"), []byte("hi"), 0o600))
+
+	fsCfg := &config.FilesystemBackendConfig{
+		Name: "fs", Type: "filesystem", Root: dir,
+		Include: []string{"**/*.md"}, URIScheme: "memory", Sandbox: true,
+	}
+	fsBackend, err := backend.NewFilesystemBackend(fsCfg)
+	require.NoError(t, err)
+
+	d, err := dispatcher.New(dispatcher.Options{
+		Backends: []backend.Backend{fsBackend},
+		Filter:   filter.NewCompositeFilter(),
+		Audit:    audit.NopLogger{},
+	})
+	require.NoError(t, err)
+
+	cfg := &config.Config{
+		Server: config.ServerConfig{Host: "127.0.0.1", Port: 0},
+		Auth:   config.AuthConfig{Mode: "none"},
+	}
+	p, err := auth.NewProvider(cfg.Auth)
+	require.NoError(t, err)
+	srv, err := New(cfg, d, p)
+	require.NoError(t, err)
+	ts := httptest.NewServer(srv.Handler)
+	defer ts.Close()
+
+	// Replace the root with a regular file so Health's stat call sees a
+	// non-directory and fails. os.Remove+create keeps the same path.
+	require.NoError(t, os.RemoveAll(dir))
+	require.NoError(t, os.WriteFile(dir, []byte("not a dir"), 0o600))
+	defer os.Remove(dir)
+
+	resp, body := get(t, ts, "/health", "")
+	assert.Equal(t, http.StatusOK, resp.StatusCode, "health should always return 200")
+
+	var out map[string]any
+	require.NoError(t, json.Unmarshal(body, &out))
+	// Only one backend and it's down → overall "unavailable".
+	assert.Equal(t, "unavailable", out["status"])
+
+	backends := out["backends"].(map[string]any)
+	fs := backends["fs"].(map[string]any)
+	assert.Equal(t, "unavailable", fs["status"])
+	assert.NotEmpty(t, fs["error"])
 }
 
 func TestServer_Root_Landing(t *testing.T) {
@@ -167,7 +225,35 @@ func TestServer_GetContext_MissingName(t *testing.T) {
 	ts, _ := newTestServer(t, "none", "")
 	resp, body := post(t, ts, "/api/pf_load", map[string]any{}, "")
 	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
-	assert.Contains(t, string(body), "invalid request")
+
+	var env struct {
+		Error struct {
+			Code    string `json:"code"`
+			Status  int    `json:"status"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	require.NoError(t, json.Unmarshal(body, &env))
+	assert.Equal(t, "invalid_request", env.Error.Code)
+	assert.Equal(t, http.StatusBadRequest, env.Error.Status)
+	assert.Contains(t, env.Error.Message, "name is required")
+}
+
+func TestServer_Read_Missing_StructuredError(t *testing.T) {
+	ts, _ := newTestServer(t, "none", "")
+	resp, body := post(t, ts, "/api/pf_peek", map[string]any{"uri": "memory://nope.md"}, "")
+	assert.Equal(t, http.StatusNotFound, resp.StatusCode)
+
+	var env struct {
+		Error struct {
+			Code    string `json:"code"`
+			Status  int    `json:"status"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	require.NoError(t, json.Unmarshal(body, &env))
+	assert.Equal(t, "resource_not_found", env.Error.Code)
+	assert.Equal(t, http.StatusNotFound, env.Error.Status)
 }
 
 func TestServer_GetContext_UnknownName(t *testing.T) {
@@ -265,7 +351,107 @@ func TestServer_Bearer_HealthStillOpen(t *testing.T) {
 	assert.Equal(t, http.StatusOK, resp.StatusCode)
 }
 
+// ───────────────── OpenAPI spec ─────────────────
+
+func TestServer_OpenAPISpec_NoAuth(t *testing.T) {
+	ts, _ := newTestServer(t, "bearer", writeTestTokens(t))
+	// Should be reachable without a token — ChatGPT Actions imports it
+	// before the user pastes the bearer credential.
+	resp, body := get(t, ts, "/api/openapi.json", "")
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+
+	var spec map[string]any
+	require.NoError(t, json.Unmarshal(body, &spec))
+	assert.Equal(t, "3.1.0", spec["openapi"])
+
+	info := spec["info"].(map[string]any)
+	assert.Equal(t, "pagefault", info["title"])
+
+	paths := spec["paths"].(map[string]any)
+	for _, want := range []string{"/api/pf_maps", "/api/pf_load", "/api/pf_scan", "/api/pf_peek"} {
+		_, ok := paths[want]
+		assert.True(t, ok, "missing path %s", want)
+	}
+
+	components := spec["components"].(map[string]any)
+	schemas := components["schemas"].(map[string]any)
+	_, hasEnvelope := schemas["ErrorEnvelope"]
+	assert.True(t, hasEnvelope, "components.schemas.ErrorEnvelope missing")
+}
+
+func TestServer_OpenAPISpec_RespectsDisabledTools(t *testing.T) {
+	// Manually build a dispatcher with pf_peek disabled so we can assert
+	// the spec drops its path entry.
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "hello.md"), []byte("hi"), 0o600))
+
+	fsCfg := &config.FilesystemBackendConfig{
+		Name: "fs", Type: "filesystem", Root: dir,
+		Include: []string{"**/*.md"}, URIScheme: "memory", Sandbox: true,
+	}
+	fsBackend, err := backend.NewFilesystemBackend(fsCfg)
+	require.NoError(t, err)
+
+	f := false
+	d, err := dispatcher.New(dispatcher.Options{
+		Backends: []backend.Backend{fsBackend},
+		Filter:   filter.NewCompositeFilter(),
+		Audit:    audit.NopLogger{},
+		Tools:    config.ToolsConfig{PfPeek: &f},
+	})
+	require.NoError(t, err)
+
+	cfg := &config.Config{
+		Server: config.ServerConfig{Host: "127.0.0.1", Port: 0},
+		Auth:   config.AuthConfig{Mode: "none"},
+	}
+	p, err := auth.NewProvider(cfg.Auth)
+	require.NoError(t, err)
+	srv, err := New(cfg, d, p)
+	require.NoError(t, err)
+	ts := httptest.NewServer(srv.Handler)
+	t.Cleanup(ts.Close)
+
+	resp, body := get(t, ts, "/api/openapi.json", "")
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+
+	var spec map[string]any
+	require.NoError(t, json.Unmarshal(body, &spec))
+	paths := spec["paths"].(map[string]any)
+	_, hasPeek := paths["/api/pf_peek"]
+	assert.False(t, hasPeek, "pf_peek should not appear in spec when disabled")
+}
+
 // ───────────────── MCP transport smoke ─────────────────
+
+// TestErrorCodeMapping covers the error-sentinel → stable-code mapping
+// that both writeError and writeAuthError lean on. The rate_limited entry
+// was added in 0.4.1 so any caller that wraps model.ErrRateLimited and
+// hands it to writeError gets the same envelope the rate-limit middleware
+// emits — guard it with a direct table test so a future typo can't
+// silently diverge the two paths.
+func TestErrorCodeMapping(t *testing.T) {
+	cases := []struct {
+		err        error
+		wantCode   string
+		wantStatus int
+	}{
+		{model.ErrInvalidRequest, "invalid_request", http.StatusBadRequest},
+		{model.ErrUnauthenticated, "unauthenticated", http.StatusUnauthorized},
+		{model.ErrAccessViolation, "access_violation", http.StatusForbidden},
+		{model.ErrResourceNotFound, "resource_not_found", http.StatusNotFound},
+		{model.ErrContextNotFound, "context_not_found", http.StatusNotFound},
+		{model.ErrBackendNotFound, "backend_not_found", http.StatusNotFound},
+		{model.ErrAgentNotFound, "agent_not_found", http.StatusNotFound},
+		{model.ErrBackendUnavailable, "backend_unavailable", http.StatusBadGateway},
+		{model.ErrSubagentTimeout, "subagent_timeout", http.StatusGatewayTimeout},
+		{model.ErrRateLimited, "rate_limited", http.StatusTooManyRequests},
+	}
+	for _, tc := range cases {
+		assert.Equal(t, tc.wantCode, errorCode(tc.err), "code for %v", tc.err)
+		assert.Equal(t, tc.wantStatus, errorStatus(tc.err), "status for %v", tc.err)
+	}
+}
 
 // TestServer_MCP_Initialize verifies the /mcp endpoint accepts the MCP
 // initialize request. This is a smoke test — it proves the mcp-go handler is

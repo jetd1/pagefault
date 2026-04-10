@@ -126,17 +126,32 @@ Authorization: Bearer pf_xxx...
 
 Success: HTTP 200 with a JSON object.
 
-Errors:
+Errors use a single structured envelope with a stable `code` (snake_case)
+that clients can branch on without parsing `message`:
 
-| Condition | HTTP status | Body |
-|-----------|-------------|------|
-| Missing/invalid JSON body | 400 | `{"error":"bad request","message":"..."}` |
-| Missing required field    | 400 | `{"error":"bad request","message":"invalid request: ..."}` |
-| Missing/invalid token     | 401 | `{"error":"unauthenticated","message":"..."}` |
-| Blocked by filter         | 403 | `{"error":"forbidden","message":"access violation: ..."}` |
-| Unknown resource/context  | 404 | `{"error":"not found","message":"..."}` |
-| Backend unavailable       | 502 | `{"error":"bad gateway","message":"..."}` |
-| Internal error            | 500 | `{"error":"internal server error","message":"..."}` |
+```json
+{
+  "error": {
+    "code": "invalid_request",
+    "status": 400,
+    "message": "invalid request: name is required"
+  }
+}
+```
+
+| HTTP status | Code                  | Typical cause |
+|-------------|-----------------------|---------------|
+| 400         | `invalid_request`     | Missing or malformed field, empty query, bad JSON body. |
+| 401         | `unauthenticated`     | Missing, unknown, or revoked bearer token. |
+| 403         | `access_violation`    | URI blocked by filter; untrusted proxy IP. |
+| 404         | `resource_not_found`  | `pf_peek` URI does not exist. |
+| 404         | `context_not_found`   | `pf_load` name does not exist. |
+| 404         | `backend_not_found`   | `pf_scan` named an unknown backend, or `pf_peek` URI uses an unknown scheme. |
+| 404         | `agent_not_found`     | `pf_fault` named an unconfigured agent. |
+| 429         | `rate_limited`        | Caller exceeded `server.rate_limit` budget. Response includes a `Retry-After` header. |
+| 502         | `backend_unavailable` | Backend network error, missing directory, misconfigured HTTP `response_path`. |
+| 504         | `subagent_timeout`    | Reserved for direct surfacing; `pf_fault` normally flattens timeouts to `timed_out: true` in a 200 response. |
+| 500         | `internal_error`      | Unexpected internal failure. |
 
 ---
 
@@ -176,7 +191,7 @@ exceeded.
 | Field    | Type    | Required | Default     | Notes |
 |----------|---------|----------|-------------|-------|
 | `name`   | string  | yes      | —           | Region name (see `pf_maps`). |
-| `format` | string  | no       | `markdown`  | `markdown` or `json`. Phase 1 only implements `markdown`. |
+| `format` | string  | no       | `markdown`  | `markdown`, `markdown-with-metadata`, or `json`. Overrides the context's configured default. |
 
 **Response:**
 
@@ -191,16 +206,33 @@ exceeded.
 }
 ```
 
-If the content is larger than the context's `max_size`, it is truncated at
-the nearest UTF-8 rune boundary (so multi-byte characters are never split)
-and `"...[truncated]"` is appended.
+### Format behaviour
+
+- **`markdown`** (default) — each source is rendered as `# {uri}` followed by
+  its body, with `\n\n---\n\n` separators. Truncated at the nearest UTF-8
+  rune boundary (so multi-byte characters are never split) with
+  `"...[truncated]"` appended when the joined output exceeds `max_size`.
+- **`markdown-with-metadata`** — same layout, but each header is followed by
+  a blockquote summarizing `content-type` and `tags` so downstream models
+  can see the backend-level provenance without a separate call.
+- **`json`** — the `content` field is a JSON-encoded bundle:
+  ```json
+  {"name":"demo","sources":[{"uri":"memory://a.md","content_type":"text/markdown","content":"...","tags":["notes"],"metadata":{}}]}
+  ```
+  `max_size` enforcement in JSON mode drops sources from the tail rather
+  than byte-truncating (so the emitted document is always valid JSON).
+  Dropped sources appear in `skipped_sources` with
+  `reason: "max_size budget exceeded"`.
+
+### Skipped sources
 
 If one or more configured sources were dropped (blocked by a filter, backend
-read failure), they are listed in `skipped_sources` with a human-readable
-reason. The field is omitted entirely when nothing was skipped. Each skip is
-also logged at `WARN` level with the context name, URI, and reason.
+read failure, JSON `max_size` budget), they are listed in `skipped_sources`
+with a human-readable reason. The field is omitted entirely when nothing was
+skipped. Each skip is also logged at `WARN` level with the context name,
+URI, and reason.
 
-**Errors:** 400 (missing name), 404 (unknown context).
+**Errors:** 400 (missing name, unknown format), 404 (unknown context).
 
 ---
 
@@ -361,15 +393,57 @@ disambiguate via `backend` when that happens.
 ## Health
 
 `GET /health` — returns overall status plus per-backend status. No auth
-required.
+required. Always returns HTTP 200 so liveness probes don't need to branch
+on status codes; orchestrators should read the envelope's top-level
+`status` field instead.
 
 ```json
 {
   "status": "ok",
-  "version": "0.3.2",
-  "backends": {"fs": "ok", "openclaw": "ok"}
+  "version": "0.4.0",
+  "backends": {
+    "fs":       {"status": "ok"},
+    "openclaw": {"status": "ok"}
+  }
 }
 ```
+
+Per-backend `status` is one of:
+
+- `"ok"` — backend implements the optional `HealthChecker` interface and
+  the probe succeeded, or the backend does not implement `HealthChecker`
+  (we have no better signal).
+- `"unavailable"` — probe returned an error; a truncated error message is
+  included in the `error` field on the same entry.
+
+Top-level `status` is `"ok"` when every backend is ok, `"degraded"` when
+at least one is unavailable but others are still ok, and `"unavailable"`
+when every backend is unavailable.
+
+The filesystem backend implements `HealthChecker` by stat'ing its
+configured root; a deleted / unmounted root surfaces as `"unavailable"`
+within a 2 second probe timeout.
+
+## OpenAPI spec
+
+`GET /api/openapi.json` — returns an OpenAPI 3.1.0 document describing
+every *enabled* REST tool. The endpoint is public (no auth required) so
+importers like ChatGPT Custom GPT Actions can fetch the schema before
+a bearer token is supplied.
+
+```
+GET /api/openapi.json → 200 application/json
+```
+
+The document is generated live from the current config — the
+`servers[0].url` field echoes `server.public_url`, paths are dropped for
+disabled tools, and response schemas include the Phase-3 error envelope
+(`ErrorEnvelope`) so clients can generate types for both success and
+failure responses.
+
+To connect a ChatGPT Custom GPT: **Actions → Import from URL →
+`https://<your-pagefault>/api/openapi.json` → Authentication: Bearer →
+paste your `pf_…` token**.
 
 ## Planned (future phases)
 

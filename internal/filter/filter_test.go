@@ -137,3 +137,91 @@ func TestCompositeFilter_UsesCaller(t *testing.T) {
 	assert.True(t, c.AllowURI("memory://a", caller))
 	assert.True(t, c.AllowTags("memory://a", nil, caller))
 }
+
+func TestRedactionFilter_SimpleSubstitution(t *testing.T) {
+	rf, err := NewRedactionFilter([]config.RedactionRule{
+		{Pattern: `(?i)api[_-]?key\s*[:=]\s*\S+`, Replacement: "[REDACTED]"},
+	})
+	require.NoError(t, err)
+	got := rf.FilterContent("api_key: secret123 trailing", "memory://x")
+	assert.Equal(t, "[REDACTED] trailing", got)
+}
+
+func TestRedactionFilter_MultipleRulesOrdered(t *testing.T) {
+	rf, err := NewRedactionFilter([]config.RedactionRule{
+		{Pattern: `secret`, Replacement: "[S]"},
+		{Pattern: `\[S\]\d+`, Replacement: "[MASK]"},
+	})
+	require.NoError(t, err)
+	// First rule produces "[S]123"; second rule masks it to "[MASK]".
+	assert.Equal(t, "[MASK]", rf.FilterContent("secret123", "memory://x"))
+}
+
+func TestRedactionFilter_CaptureGroupReplacement(t *testing.T) {
+	rf, err := NewRedactionFilter([]config.RedactionRule{
+		{Pattern: `(\w+)@example\.com`, Replacement: "$1@redacted"},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "jet@redacted says hi", rf.FilterContent("jet@example.com says hi", "memory://x"))
+}
+
+func TestRedactionFilter_InvalidPattern(t *testing.T) {
+	_, err := NewRedactionFilter([]config.RedactionRule{
+		{Pattern: "[unclosed", Replacement: "x"},
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "redaction rule 0")
+}
+
+func TestRedactionFilter_PassThroughAllowStages(t *testing.T) {
+	rf, err := NewRedactionFilter(nil)
+	require.NoError(t, err)
+	assert.True(t, rf.AllowURI("memory://x", nil))
+	assert.True(t, rf.AllowTags("memory://x", []string{"any"}, nil))
+	// Zero rules leaves content untouched.
+	assert.Equal(t, "hello", rf.FilterContent("hello", "memory://x"))
+}
+
+func TestNewFromConfig_Redaction(t *testing.T) {
+	cfg := config.FiltersConfig{
+		Enabled: true,
+		Redaction: config.RedactionConfig{
+			Enabled: true,
+			Rules: []config.RedactionRule{
+				{Pattern: `pf_[A-Za-z0-9]+`, Replacement: "[TOKEN]"},
+			},
+		},
+	}
+	c, err := NewFromConfig(cfg)
+	require.NoError(t, err)
+	assert.Equal(t, "Bearer [TOKEN] trailing", c.FilterContent("Bearer pf_abc123 trailing", "memory://x"))
+}
+
+func TestNewFromConfig_RedactionDisabledRulesIgnored(t *testing.T) {
+	// Redaction.Enabled=false means the rules are not compiled or applied
+	// even if the outer filter pipeline is enabled.
+	cfg := config.FiltersConfig{
+		Enabled: true,
+		Redaction: config.RedactionConfig{
+			Enabled: false,
+			Rules: []config.RedactionRule{
+				{Pattern: `pf_[A-Za-z0-9]+`, Replacement: "[TOKEN]"},
+			},
+		},
+	}
+	c, err := NewFromConfig(cfg)
+	require.NoError(t, err)
+	assert.Equal(t, "Bearer pf_abc123", c.FilterContent("Bearer pf_abc123", "memory://x"))
+}
+
+func TestNewFromConfig_RedactionInvalidPattern(t *testing.T) {
+	cfg := config.FiltersConfig{
+		Enabled: true,
+		Redaction: config.RedactionConfig{
+			Enabled: true,
+			Rules:   []config.RedactionRule{{Pattern: "[bad", Replacement: "x"}},
+		},
+	}
+	_, err := NewFromConfig(cfg)
+	require.Error(t, err)
+}

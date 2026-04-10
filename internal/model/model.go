@@ -58,4 +58,11 @@ var (
 	// ErrAgentNotFound indicates a pf_fault request named an agent that
 	// is not configured on any SubagentBackend.
 	ErrAgentNotFound = errors.New("agent not found")
+
+	// ErrRateLimited indicates a request was rejected by the per-caller
+	// rate limiter. The REST transport maps this to HTTP 429 and code
+	// "rate_limited"; the rate-limit middleware uses this sentinel so
+	// the error envelope matches the shape emitted for every other
+	// rejection.
+	ErrRateLimited = errors.New("rate limited")
 )

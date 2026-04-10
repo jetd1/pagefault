@@ -8,6 +8,7 @@ package dispatcher
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -155,9 +156,26 @@ type SkippedSource struct {
 // returned in the skipped slice — the caller is responsible for surfacing
 // them to the user.
 //
-// format overrides the context's configured format when non-empty. Phase 1
-// supports "markdown" (concatenate with separators).
-func (d *ToolDispatcher) GetContext(ctx context.Context, name string, format string, caller model.Caller) (string, []SkippedSource, error) {
+// The resolved format (after applying the request override → context
+// default → "markdown" fallback chain) is returned so callers can echo
+// the actual format used in their response envelope, not the format the
+// caller *asked* for.
+//
+// format overrides the context's configured format when non-empty.
+// Supported formats:
+//
+//   - "markdown" (default): per-source `# {uri}` headers, joined with
+//     `\n\n---\n\n`. Truncated at the byte level (rune-aligned) if the
+//     joined output exceeds cfg.MaxSize.
+//   - "markdown-with-metadata": same as markdown but each header is
+//     followed by a blockquote summarizing content-type and tags.
+//   - "json": a structured JSON document
+//     `{"name":..., "sources":[{"uri","content_type","content","tags","metadata"}]}`.
+//     Sources whose inclusion would push the marshaled output past
+//     cfg.MaxSize are dropped from the tail and recorded in the skipped
+//     slice with reason `max_size budget exceeded` — ensures the emitted
+//     JSON remains valid.
+func (d *ToolDispatcher) GetContext(ctx context.Context, name string, format string, caller model.Caller) (string, string, []SkippedSource, error) {
 	start := time.Now()
 
 	var out string
@@ -172,7 +190,7 @@ func (d *ToolDispatcher) GetContext(ctx context.Context, name string, format str
 	cfg, ok := d.contexts[name]
 	if !ok {
 		err = fmt.Errorf("%w: %q", model.ErrContextNotFound, name)
-		return "", nil, err
+		return "", "", nil, err
 	}
 
 	if format == "" {
@@ -180,6 +198,12 @@ func (d *ToolDispatcher) GetContext(ctx context.Context, name string, format str
 	}
 	if format == "" {
 		format = "markdown"
+	}
+	switch format {
+	case "markdown", "markdown-with-metadata", "json":
+	default:
+		err = fmt.Errorf("%w: unknown context format %q", model.ErrInvalidRequest, format)
+		return "", "", nil, err
 	}
 
 	addSkip := func(uri, reason string) {
@@ -192,14 +216,22 @@ func (d *ToolDispatcher) GetContext(ctx context.Context, name string, format str
 		)
 	}
 
-	var parts []string
+	type loadedSource struct {
+		URI         string
+		ContentType string
+		Content     string
+		Tags        []string
+		Metadata    map[string]any
+	}
+
+	var loaded []loadedSource
 	for _, src := range cfg.Sources {
 		be, ok := d.backends[src.Backend]
 		if !ok {
 			// Context references a backend we don't have — configuration
 			// error, fail hard instead of silently dropping.
 			err = fmt.Errorf("%w: context %q references unknown backend %q", model.ErrBackendNotFound, name, src.Backend)
-			return "", nil, err
+			return "", "", nil, err
 		}
 		if !d.filter.AllowURI(src.URI, &caller) {
 			addSkip(src.URI, "blocked by uri filter")
@@ -213,26 +245,119 @@ func (d *ToolDispatcher) GetContext(ctx context.Context, name string, format str
 			addSkip(src.URI, fmt.Sprintf("read error: %s", rerr.Error()))
 			continue
 		}
-		if !d.filter.AllowTags(res.URI, resourceTags(res), &caller) {
+		tags := resourceTags(res)
+		if !d.filter.AllowTags(res.URI, tags, &caller) {
 			addSkip(res.URI, "blocked by tag filter")
 			continue
 		}
 		content := d.filter.FilterContent(res.Content, res.URI)
-		parts = append(parts, fmt.Sprintf("# %s\n\n%s", res.URI, content))
+		loaded = append(loaded, loadedSource{
+			URI:         res.URI,
+			ContentType: res.ContentType,
+			Content:     content,
+			Tags:        tags,
+			Metadata:    res.Metadata,
+		})
 	}
 
-	joined := strings.Join(parts, "\n\n---\n\n")
-	if cfg.MaxSize > 0 && len(joined) > cfg.MaxSize {
-		// Walk back from the byte-level cut point to the nearest rune
-		// boundary so we never split a multi-byte UTF-8 sequence.
-		cut := cfg.MaxSize
-		for cut > 0 && !utf8.RuneStart(joined[cut]) {
-			cut--
+	switch format {
+	case "markdown":
+		parts := make([]string, 0, len(loaded))
+		for _, s := range loaded {
+			parts = append(parts, fmt.Sprintf("# %s\n\n%s", s.URI, s.Content))
 		}
-		joined = joined[:cut] + "\n\n...[truncated]"
+		joined := strings.Join(parts, "\n\n---\n\n")
+		if cfg.MaxSize > 0 && len(joined) > cfg.MaxSize {
+			cut := cfg.MaxSize
+			for cut > 0 && !utf8.RuneStart(joined[cut]) {
+				cut--
+			}
+			joined = joined[:cut] + "\n\n...[truncated]"
+		}
+		out = joined
+
+	case "markdown-with-metadata":
+		parts := make([]string, 0, len(loaded))
+		for _, s := range loaded {
+			meta := renderMarkdownMetadata(s.ContentType, s.Tags)
+			parts = append(parts, fmt.Sprintf("# %s\n\n%s%s", s.URI, meta, s.Content))
+		}
+		joined := strings.Join(parts, "\n\n---\n\n")
+		if cfg.MaxSize > 0 && len(joined) > cfg.MaxSize {
+			cut := cfg.MaxSize
+			for cut > 0 && !utf8.RuneStart(joined[cut]) {
+				cut--
+			}
+			joined = joined[:cut] + "\n\n...[truncated]"
+		}
+		out = joined
+
+	case "json":
+		type jsonSource struct {
+			URI         string         `json:"uri"`
+			ContentType string         `json:"content_type,omitempty"`
+			Content     string         `json:"content"`
+			Tags        []string       `json:"tags,omitempty"`
+			Metadata    map[string]any `json:"metadata,omitempty"`
+		}
+		type jsonBundle struct {
+			Name    string       `json:"name"`
+			Sources []jsonSource `json:"sources"`
+		}
+		bundle := jsonBundle{Name: name, Sources: make([]jsonSource, 0, len(loaded))}
+		for _, s := range loaded {
+			bundle.Sources = append(bundle.Sources, jsonSource{
+				URI:         s.URI,
+				ContentType: s.ContentType,
+				Content:     s.Content,
+				Tags:        s.Tags,
+				Metadata:    s.Metadata,
+			})
+		}
+
+		// Enforce max_size in JSON mode by dropping tail sources — byte
+		// truncation would produce invalid JSON, and truncating a single
+		// source's content mid-string is surprising. Dropping whole
+		// sources keeps the document valid and reports the omission via
+		// skipped_sources.
+		marshaled, merr := json.Marshal(bundle)
+		if merr != nil {
+			err = fmt.Errorf("get_context: marshal json: %w", merr)
+			return "", "", nil, err
+		}
+		if cfg.MaxSize > 0 {
+			for len(marshaled) > cfg.MaxSize && len(bundle.Sources) > 0 {
+				dropped := bundle.Sources[len(bundle.Sources)-1]
+				bundle.Sources = bundle.Sources[:len(bundle.Sources)-1]
+				addSkip(dropped.URI, "max_size budget exceeded")
+				marshaled, merr = json.Marshal(bundle)
+				if merr != nil {
+					err = fmt.Errorf("get_context: remarshal json: %w", merr)
+					return "", "", nil, err
+				}
+			}
+		}
+		out = string(marshaled)
 	}
-	out = joined
-	return out, skipped, nil
+
+	return out, format, skipped, nil
+}
+
+// renderMarkdownMetadata formats a per-source metadata blockquote for the
+// markdown-with-metadata context format. Returns an empty string when there
+// is nothing to render so the content flows naturally.
+func renderMarkdownMetadata(contentType string, tags []string) string {
+	var lines []string
+	if contentType != "" {
+		lines = append(lines, fmt.Sprintf("> content-type: %s", contentType))
+	}
+	if len(tags) > 0 {
+		lines = append(lines, fmt.Sprintf("> tags: %s", strings.Join(tags, ", ")))
+	}
+	if len(lines) == 0 {
+		return ""
+	}
+	return strings.Join(lines, "\n") + "\n\n"
 }
 
 // ───────────────────── search ─────────────────────

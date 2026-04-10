@@ -2,6 +2,7 @@ package dispatcher
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"path/filepath"
 	"testing"
@@ -16,6 +17,14 @@ import (
 	"github.com/jet/pagefault/internal/filter"
 	"github.com/jet/pagefault/internal/model"
 )
+
+// jsonUnmarshal is a tiny test helper that parses a JSON string into v,
+// wrapping the error with context about the source string for easier
+// debugging when assertions fail.
+func jsonUnmarshal(t *testing.T, in string, v any) error {
+	t.Helper()
+	return json.Unmarshal([]byte(in), v)
+}
 
 // mockBackend is a simple in-memory backend for dispatcher tests. It implements
 // the Backend interface plus the URIScheme hook used by the dispatcher for
@@ -152,9 +161,10 @@ func TestDispatcher_ListContexts(t *testing.T) {
 
 func TestDispatcher_GetContext_Concatenates(t *testing.T) {
 	d, _ := newTestDispatcher(t)
-	out, skipped, err := d.GetContext(context.Background(), "greeting", "", model.AnonymousCaller)
+	out, format, skipped, err := d.GetContext(context.Background(), "greeting", "", model.AnonymousCaller)
 	require.NoError(t, err)
 	assert.Empty(t, skipped)
+	assert.Equal(t, "markdown", format)
 	assert.Contains(t, out, "memory://foo.md")
 	assert.Contains(t, out, "hello world")
 	assert.Contains(t, out, "memory://bar.md")
@@ -164,7 +174,7 @@ func TestDispatcher_GetContext_Concatenates(t *testing.T) {
 
 func TestDispatcher_GetContext_UnknownName(t *testing.T) {
 	d, _ := newTestDispatcher(t)
-	_, _, err := d.GetContext(context.Background(), "nope", "", model.AnonymousCaller)
+	_, _, _, err := d.GetContext(context.Background(), "nope", "", model.AnonymousCaller)
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, model.ErrContextNotFound))
 }
@@ -176,7 +186,7 @@ func TestDispatcher_GetContext_Truncates(t *testing.T) {
 	cfg.MaxSize = 50
 	d.contexts["greeting"] = cfg
 
-	out, _, err := d.GetContext(context.Background(), "greeting", "", model.AnonymousCaller)
+	out, _, _, err := d.GetContext(context.Background(), "greeting", "", model.AnonymousCaller)
 	require.NoError(t, err)
 	assert.Contains(t, out, "[truncated]")
 	assert.LessOrEqual(t, len(out), 70) // 50 + suffix length
@@ -204,10 +214,93 @@ func TestDispatcher_GetContext_TruncatesUTF8Safely(t *testing.T) {
 		},
 	})
 	require.NoError(t, err)
-	out, _, err := d.GetContext(context.Background(), "cn", "", model.AnonymousCaller)
+	out, _, _, err := d.GetContext(context.Background(), "cn", "", model.AnonymousCaller)
 	require.NoError(t, err)
 	assert.True(t, utf8.ValidString(out), "truncated output must be valid UTF-8")
 	assert.Contains(t, out, "[truncated]")
+}
+
+func TestDispatcher_GetContext_JSONFormat(t *testing.T) {
+	d, _ := newTestDispatcher(t)
+	out, format, skipped, err := d.GetContext(context.Background(), "greeting", "json", model.AnonymousCaller)
+	require.NoError(t, err)
+	assert.Empty(t, skipped)
+	assert.Equal(t, "json", format)
+
+	var parsed struct {
+		Name    string `json:"name"`
+		Sources []struct {
+			URI         string   `json:"uri"`
+			ContentType string   `json:"content_type"`
+			Content     string   `json:"content"`
+			Tags        []string `json:"tags"`
+		} `json:"sources"`
+	}
+	require.NoError(t, jsonUnmarshal(t, out, &parsed))
+	assert.Equal(t, "greeting", parsed.Name)
+	require.Len(t, parsed.Sources, 2)
+	assert.Equal(t, "memory://foo.md", parsed.Sources[0].URI)
+	assert.Equal(t, "hello world\nline two", parsed.Sources[0].Content)
+	assert.Equal(t, "text/markdown", parsed.Sources[0].ContentType)
+	assert.Equal(t, []string{"docs"}, parsed.Sources[0].Tags)
+}
+
+func TestDispatcher_GetContext_MarkdownWithMetadata(t *testing.T) {
+	d, _ := newTestDispatcher(t)
+	out, format, _, err := d.GetContext(context.Background(), "greeting", "markdown-with-metadata", model.AnonymousCaller)
+	require.NoError(t, err)
+	assert.Equal(t, "markdown-with-metadata", format)
+	assert.Contains(t, out, "# memory://foo.md")
+	assert.Contains(t, out, "> content-type: text/markdown")
+	assert.Contains(t, out, "> tags: docs")
+	assert.Contains(t, out, "hello world")
+}
+
+func TestDispatcher_GetContext_UnknownFormat(t *testing.T) {
+	d, _ := newTestDispatcher(t)
+	_, _, _, err := d.GetContext(context.Background(), "greeting", "rot13", model.AnonymousCaller)
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, model.ErrInvalidRequest))
+}
+
+func TestDispatcher_GetContext_JSONDropsTailOnMaxSize(t *testing.T) {
+	// Build a context whose first source alone fits but both together
+	// don't; JSON mode must drop the second and record it as skipped.
+	mb := &mockBackend{
+		name:   "memory",
+		scheme: "memory",
+		resources: map[string]*backend.Resource{
+			"memory://a.md": {URI: "memory://a.md", Content: "aa", ContentType: "text/plain"},
+			"memory://b.md": {URI: "memory://b.md", Content: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", ContentType: "text/plain"},
+		},
+	}
+	d, err := New(Options{
+		Backends: []backend.Backend{mb},
+		Contexts: []config.ContextConfig{
+			{
+				Name: "tight",
+				Sources: []config.ContextSource{
+					{Backend: "memory", URI: "memory://a.md"},
+					{Backend: "memory", URI: "memory://b.md"},
+				},
+				MaxSize: 100, // small enough to force dropping one source
+			},
+		},
+	})
+	require.NoError(t, err)
+	out, _, skipped, err := d.GetContext(context.Background(), "tight", "json", model.AnonymousCaller)
+	require.NoError(t, err)
+	assert.LessOrEqual(t, len(out), 100)
+	// At least one source dropped.
+	require.NotEmpty(t, skipped)
+	dropped := false
+	for _, s := range skipped {
+		if s.Reason == "max_size budget exceeded" {
+			dropped = true
+			break
+		}
+	}
+	assert.True(t, dropped, "expected max_size budget exceeded skip")
 }
 
 func TestDispatcher_GetContext_SkipsMissing(t *testing.T) {
@@ -232,7 +325,7 @@ func TestDispatcher_GetContext_SkipsMissing(t *testing.T) {
 		},
 	})
 	require.NoError(t, err)
-	out, skipped, err := d.GetContext(context.Background(), "mixed", "", model.AnonymousCaller)
+	out, _, skipped, err := d.GetContext(context.Background(), "mixed", "", model.AnonymousCaller)
 	require.NoError(t, err)
 	assert.Contains(t, out, "aaa")
 	assert.NotContains(t, out, "missing.md")

@@ -115,18 +115,23 @@ pagefault/
 │   │   └── mcp_test.go                   # MCP registration + toolResult helper tests
 │   │
 │   └── server/
-│       ├── server.go                     # chi router, MCP mount, REST adapter, /health
-│       └── server_test.go                # Integration tests via httptest (incl. MCP smoke)
+│       ├── server.go                     # chi router, MCP mount, REST adapter, /health, structured error envelope
+│       ├── server_test.go                # Integration tests via httptest (incl. MCP smoke, OpenAPI, health probe)
+│       ├── openapi.go                    # /api/openapi.json spec builder (OpenAPI 3.1.0, live from dispatcher + config)
+│       ├── cors.go                       # CORS middleware (opt-in, per server.cors config)
+│       ├── cors_test.go                  # Preflight + allowed/denied origin tests
+│       ├── ratelimit.go                  # Per-caller token bucket middleware (golang.org/x/time/rate)
+│       └── ratelimit_test.go             # 429 envelope, Retry-After, separate-caller buckets
 │
 ├── configs/
 │   ├── minimal.yaml                      # Smallest working config (filesystem only, no auth)
 │   └── example.yaml                      # Tour of every backend type with inline docs
 │
 ├── docs/
-│   ├── api-doc.md                        # Tool reference (Phase 1–2)
+│   ├── api-doc.md                        # Tool reference (Phase 1–3)
 │   ├── config-doc.md                     # Full YAML config reference
 │   ├── architecture.md                   # Architecture deep dive
-│   └── security.md                       # Threat model, auth, filters, audit
+│   └── security.md                       # Threat model, auth, filters, audit, rate limit, CORS
 │
 ├── demo-data/
 │   ├── README.md                         # Sample content for minimal.yaml

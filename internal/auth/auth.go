@@ -80,18 +80,24 @@ func Middleware(p AuthProvider) func(http.Handler) http.Handler {
 	}
 }
 
-// writeAuthError serializes an auth error as JSON with an appropriate status.
+// writeAuthError serializes an auth error as JSON with an appropriate status,
+// matching the Phase-3 structured error envelope emitted by internal/server.
 func writeAuthError(w http.ResponseWriter, err error) {
 	status := http.StatusUnauthorized
+	code := "unauthenticated"
 	if errors.Is(err, ErrForbidden) {
 		status = http.StatusForbidden
+		code = "access_violation"
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("WWW-Authenticate", "Bearer realm=\"pagefault\"")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(map[string]any{
-		"error":   "unauthenticated",
-		"message": err.Error(),
+		"error": map[string]any{
+			"code":    code,
+			"status":  status,
+			"message": err.Error(),
+		},
 	})
 }
 

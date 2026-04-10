@@ -29,13 +29,13 @@ func HandleGetContext(ctx context.Context, d *dispatcher.ToolDispatcher, in GetC
 	if in.Name == "" {
 		return GetContextOutput{}, fmt.Errorf("%w: name is required", model.ErrInvalidRequest)
 	}
-	content, skipped, err := d.GetContext(ctx, in.Name, in.Format, caller)
+	// The dispatcher returns the *resolved* format (after applying the
+	// in.Format → context default → "markdown" fallback chain). Echo that
+	// back so clients who let the context default kick in can still tell
+	// which format their content is actually in.
+	content, format, skipped, err := d.GetContext(ctx, in.Name, in.Format, caller)
 	if err != nil {
 		return GetContextOutput{}, err
-	}
-	format := in.Format
-	if format == "" {
-		format = "markdown"
 	}
 	return GetContextOutput{
 		Name:           in.Name,

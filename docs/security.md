@@ -102,15 +102,18 @@ The filter pipeline runs three checks per tool call:
 
 Filter types currently shipped:
 
-| Filter       | Purpose                                       | Phase |
-|--------------|-----------------------------------------------|-------|
-| `PathFilter` | Allow/deny by glob (`docs/**/*.md`, `**/secrets/**`) | 1  |
-| `TagFilter`  | Allow/deny by metadata tags                   | 1     |
-| `Redaction`  | Regex-based content masking                   | 3 (planned) |
+| Filter       | Purpose                                              | Phase |
+|--------------|------------------------------------------------------|-------|
+| `PathFilter` | Allow/deny by glob (`docs/**/*.md`, `**/secrets/**`) | 1     |
+| `TagFilter`  | Allow/deny by metadata tags                          | 1     |
+| `Redaction`  | Regex-based content masking (Go `regexp` patterns, capture groups in replacement) | 3 |
 
 Filters compose with **AND** semantics: every configured filter must allow
-a URI for the dispatcher to serve it. The `redaction` section of the
-config is accepted by the loader today but has no effect until Phase 3.
+a URI for the dispatcher to serve it. Redaction rules run in the
+`FilterContent` stage after path and tag checks, so the transformed
+content is what the caller receives — the un-redacted copy never
+leaves the dispatcher. Rules are compiled at server start, so an
+invalid pattern fails fast rather than at request time.
 
 ### Skipped sources
 
@@ -231,6 +234,34 @@ run the agent directly, don't give them pagefault access either.
 | Shell injection via subagent task         | `subagent-cli` uses argv-per-token, no shell; `subagent-http` JSON-escapes the task before substitution. |
 | Subagent hang / runaway                   | Per-call timeout enforced by `exec.CommandContext` (CLI) or request context (HTTP); partial stdout captured. |
 | Unbounded access via subagent             | Acknowledged: subagents run outside pagefault's sandbox. Treat `pf_fault` callers as users of the configured agent. |
+| Per-caller request floods                 | `server.rate_limit` enforces a per-caller token bucket keyed on `caller.id`; over-budget requests get 429 + `Retry-After`. |
+| Browser cross-origin abuse                | `server.cors` is opt-in with an explicit origin allowlist; disabled by default. |
+
+## Rate limiting, CORS, and the OpenAPI surface (Phase 3)
+
+`server.rate_limit.enabled: true` enables an in-process per-caller token
+bucket keyed on the resolved `caller.id`. The limiter sits after the
+auth middleware so it can distinguish tokens; anonymous callers
+(auth mode `none` or trusted-header fallthrough) share a single bucket
+keyed on the literal id `"anonymous"`. Over-budget requests receive
+HTTP 429 with a `Retry-After` header and the standard error envelope
+(`code: "rate_limited"`). The limiter is per-process — if you run
+multiple pagefault instances behind a load balancer, add a shared
+rate-limiting layer at the proxy.
+
+`server.cors` is opt-in cross-origin handling. With
+`enabled: false` (the default) no CORS headers are emitted and browsers
+reject cross-origin requests — fine for loopback and same-origin
+deployments. Enabling it with an explicit `allowed_origins` list is the
+only way to let a web client (e.g. a Custom GPT in the browser) call
+`/api/pf_*` directly.
+
+`GET /api/openapi.json` is **public** (no auth) so importers can fetch
+the spec before a bearer token is configured. The document still
+advertises `BearerAuth` on every operation, so any actual call to
+`/api/pf_*` still requires authentication. Callers that only want the
+spec pay no auth cost; callers that want data still go through the
+bearer gate.
 
 ## Known limitations
 
@@ -242,10 +273,10 @@ run the agent directly, don't give them pagefault access either.
 - **Subagent sandbox is out of scope.** `pf_fault` runs the configured
   agent with whatever privileges the agent already has. See the
   "Subagent safety" section above.
-- **No rate limiting.** pagefault trusts the operator to run the server
-  behind a reverse proxy or on loopback. A single malicious client can
-  stall the server with large search queries — or exhaust a remote
-  subagent via rapid `pf_fault` calls.
+- **Rate limiting is in-process only.** A single pagefault instance
+  honours `server.rate_limit`, but if you run several behind a load
+  balancer each one keeps its own buckets. Put a shared limiter at the
+  proxy if you need global throttling.
 - **No per-tool auth.** Any authenticated caller can invoke any enabled
   tool. Per-token tool ACLs are a future addition.
 - **No TLS.** Terminate TLS at a reverse proxy (Caddy, nginx,

@@ -31,9 +31,35 @@ type Config struct {
 
 // ServerConfig configures the HTTP listener.
 type ServerConfig struct {
-	Host      string `yaml:"host" validate:"required"`
-	Port      int    `yaml:"port" validate:"required,gt=0,lt=65536"`
-	PublicURL string `yaml:"public_url,omitempty"`
+	Host      string          `yaml:"host" validate:"required"`
+	Port      int             `yaml:"port" validate:"required,gt=0,lt=65536"`
+	PublicURL string          `yaml:"public_url,omitempty"`
+	CORS      CORSConfig      `yaml:"cors,omitempty"`
+	RateLimit RateLimitConfig `yaml:"rate_limit,omitempty"`
+}
+
+// CORSConfig configures Cross-Origin Resource Sharing headers for the REST
+// transport. Only origins in AllowedOrigins are echoed in the
+// Access-Control-Allow-Origin header; the wildcard "*" is permitted when you
+// explicitly want any origin. An empty AllowedOrigins list disables CORS
+// (no headers emitted, preflight requests are not intercepted).
+type CORSConfig struct {
+	Enabled          bool     `yaml:"enabled,omitempty"`
+	AllowedOrigins   []string `yaml:"allowed_origins,omitempty"`
+	AllowedMethods   []string `yaml:"allowed_methods,omitempty"`
+	AllowedHeaders   []string `yaml:"allowed_headers,omitempty"`
+	AllowCredentials bool     `yaml:"allow_credentials,omitempty"`
+	MaxAge           int      `yaml:"max_age,omitempty"` // seconds; default 600
+}
+
+// RateLimitConfig configures a per-caller token bucket applied to every
+// authenticated request. RPS is the steady-state refill rate and Burst is
+// the bucket size. Anonymous callers share a single bucket keyed on the
+// literal caller id "anonymous".
+type RateLimitConfig struct {
+	Enabled bool    `yaml:"enabled,omitempty"`
+	RPS     float64 `yaml:"rps,omitempty"`   // tokens per second; default 10
+	Burst   int     `yaml:"burst,omitempty"` // bucket size; default 20
 }
 
 // AuthConfig configures the authentication layer.
@@ -333,6 +359,25 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Server.Port == 0 {
 		c.Server.Port = 8444
+	}
+	if c.Server.CORS.Enabled {
+		if len(c.Server.CORS.AllowedMethods) == 0 {
+			c.Server.CORS.AllowedMethods = []string{"GET", "POST", "OPTIONS"}
+		}
+		if len(c.Server.CORS.AllowedHeaders) == 0 {
+			c.Server.CORS.AllowedHeaders = []string{"Content-Type", "Authorization"}
+		}
+		if c.Server.CORS.MaxAge == 0 {
+			c.Server.CORS.MaxAge = 600
+		}
+	}
+	if c.Server.RateLimit.Enabled {
+		if c.Server.RateLimit.RPS <= 0 {
+			c.Server.RateLimit.RPS = 10
+		}
+		if c.Server.RateLimit.Burst <= 0 {
+			c.Server.RateLimit.Burst = 20
+		}
 	}
 	if c.Audit.Mode == "" {
 		if c.Audit.LogPath != "" {

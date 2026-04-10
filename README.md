@@ -10,12 +10,14 @@ backing store and resumes execution. pagefault does the same for AI agents:
 when they need context they don't have, they fault to this server, which
 loads the right information from configured backends.
 
-Phases 1-2 ship a Go binary that serves markdown files from a directory,
-answers search via subprocess or HTTP backends, and spawns real subagents
-for deep retrieval — six tools (`pf_maps`, `pf_load`, `pf_scan`, `pf_peek`,
-`pf_fault`, `pf_ps`), bearer-token auth, path/tag filters, and JSONL audit
-logging. Tool names follow a `pf_*` scheme borrowed from Unix memory
-management and kernel debugging — see `docs/api-doc.md` for the mapping.
+Phases 1–3 ship a Go binary that serves markdown files from a directory,
+answers search via subprocess or HTTP backends, spawns real subagents for
+deep retrieval, and exposes the surface over MCP, REST, and the CLI with
+opt-in rate limiting, CORS, and a live OpenAPI spec. Six tools
+(`pf_maps`, `pf_load`, `pf_scan`, `pf_peek`, `pf_fault`, `pf_ps`),
+bearer-token auth, path/tag/redaction filters, and JSONL audit logging.
+Tool names follow a `pf_*` scheme borrowed from Unix memory management
+and kernel debugging — see `docs/api-doc.md` for the mapping.
 
 ## Quick start
 
@@ -62,6 +64,51 @@ cp configs/example.yaml pagefault.yaml
 ./bin/pagefault serve --config ./pagefault.yaml
 ```
 
+## Connect a client
+
+Once `pagefault serve` is running behind TLS (e.g. `https://pagefault.example.com`),
+pointing an AI client at it is one or two commands.
+
+### Claude Code
+
+```bash
+claude mcp add pagefault \
+  --transport http \
+  --url https://pagefault.example.com/mcp \
+  --header "Authorization: Bearer pf_your_token_here"
+```
+
+Restart Claude Code; the `pf_*` tools appear alongside the built-ins.
+
+### Claude Desktop
+
+Add an entry to your Claude Desktop MCP server config (the file path
+depends on your platform — see the Claude Desktop docs):
+
+```json
+{
+  "mcpServers": {
+    "pagefault": {
+      "transport": { "type": "http", "url": "https://pagefault.example.com/mcp" },
+      "headers":   { "Authorization": "Bearer pf_your_token_here" }
+    }
+  }
+}
+```
+
+### ChatGPT Custom GPT (Actions)
+
+pagefault publishes a live OpenAPI spec at `/api/openapi.json`. In the
+Custom GPT editor, open **Actions → Import from URL** and paste:
+
+```
+https://pagefault.example.com/api/openapi.json
+```
+
+Then, under **Authentication**, choose **API Key → Bearer** and paste
+your `pf_...` token. The GPT can now call every enabled `pf_*` tool as
+an Action.
+
 ## Tests and linting
 
 ```bash
@@ -81,6 +128,44 @@ bash scripts/smoke.sh   # end-to-end smoke test
 
 ## Recent Changes
 
+### 0.4.1 — 2026-04-11
+
+- **`pf_load` response now reports the actual format.** Previously,
+  leaving `format` empty in the request made the handler echo back a
+  hard-coded `"markdown"` even when the context's configured default
+  was `json` or `markdown-with-metadata` — clients that branched on
+  `format` were misled. The dispatcher now returns the resolved format
+  and `HandleGetContext` echoes it.
+- **CORS preflight no longer short-circuits disallowed origins.** An
+  `OPTIONS + Access-Control-Request-Method` from an origin outside the
+  allowlist used to return 204 + no headers, bypassing the downstream
+  auth / route chain. The shortcut is now gated on `originAllowed`.
+- **`rate_limited` is a first-class sentinel error.**
+  `model.ErrRateLimited` routes through the shared `writeError` plumbing
+  so the rate-limit middleware no longer hand-rolls an envelope literal.
+- Minor: the root landing page lists `/api/openapi.json`; dead
+  `lastSeen` field dropped from `rateLimiter` with a comment explaining
+  why GC is deliberately not implemented yet; MCP `pf_load` description
+  now mentions `markdown-with-metadata`.
+
+### 0.4.0 — 2026-04-11
+
+- **Phase 3 ships.** Live `RedactionFilter` (regex content masking with
+  capture groups), JSON and `markdown-with-metadata` context formats
+  for `pf_load`, public `/api/openapi.json` (OpenAPI 3.1.0 generated
+  from the live config), opt-in `server.cors`, per-caller in-process
+  rate limiting via `server.rate_limit`, and richer `/health` output
+  (`ok` / `degraded` / `unavailable` plus per-backend error strings
+  via the new `HealthChecker` interface).
+- **Structured error envelope.** Every REST error is now
+  `{"error":{"code":"invalid_request","status":400,"message":"..."}}`
+  with a stable snake_case `code` field (`rate_limited`,
+  `backend_unavailable`, `agent_not_found`, etc.). **Breaking** for
+  REST clients that parsed the old `{"error","message"}` shape; MCP
+  clients are unaffected.
+- **README client setup guides** for Claude Code, Claude Desktop, and
+  ChatGPT Custom GPT Actions.
+
 ### 0.3.2 — 2026-04-10
 
 - **HTTP backend no longer masks operator typos.** A configured
@@ -94,37 +179,7 @@ bash scripts/smoke.sh   # end-to-end smoke test
   `subagent.go`. Behaviour unchanged.
 - **Doc cleanup.** README / CLAUDE.md / api-doc.md references to
   "Phase 1 / four tools / 0.3.0" updated to reflect the current
-  Phase-1-2 / six-tool / 0.3.2 reality. `SubprocessBackendConfig.Parse`
-  docstring now lists all three parse modes.
-
-### 0.3.1 — 2026-04-10
-
-- **`configs/example.yaml`** added — a documented tour of every backend
-  type (filesystem, subprocess, http, subagent-cli, subagent-http) with
-  three of them commented out so new users can uncomment what they need.
-- **Config test coverage rebound.** `internal/config` went from 54.6%
-  → 87.6% after direct unit tests were added for every
-  `Decode*Backend` helper (happy path, wrong type, missing required
-  fields).
-- **Shared HTTP helpers moved to `internal/backend/http_helpers.go`.**
-  `renderTemplate`, `jsonEscape`, `walkPath`, `extractResponse` are
-  now owned by their own file instead of sitting in `subagent_http.go`
-  and being called from `http.go`. No behavior change.
-
-### 0.3.0 — 2026-04-10
-
-- **Phase 2 lands.** Four new backend types: `subagent-cli`,
-  `subagent-http`, `subprocess` (ripgrep-style search), and generic
-  `http`. Each is wired into `buildDispatcher` and unit-tested.
-- **`pf_fault`** — the real page fault. Spawns a subagent to do a
-  natural-language retrieval over configured memory, with per-call
-  timeouts, partial-result capture, and a structured `timed_out` flag
-  instead of an error on deadline.
-- **`pf_ps`** — lists configured subagents ps-style (id, description,
-  host backend).
-- **New CLI subcommands.** `pagefault fault <query…> [--agent] [--timeout]`
-  and `pagefault ps` — same dispatcher, same audit/filter path as the
-  HTTP and MCP transports.
+  Phase-1-2 / six-tool / 0.3.2 reality.
 
 See [`CHANGELOG.md`](CHANGELOG.md) for the full history.
 

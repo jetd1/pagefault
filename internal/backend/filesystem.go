@@ -39,6 +39,24 @@ type FilesystemBackend struct {
 	sandbox   bool
 }
 
+// Health reports the backend as unhealthy if the configured root has
+// disappeared or is no longer a directory (e.g., unmounted volume). It
+// is cheap — a single stat call — so it is safe to run on every
+// /health probe.
+func (b *FilesystemBackend) Health(ctx context.Context) error {
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	info, err := os.Stat(b.root)
+	if err != nil {
+		return fmt.Errorf("stat root: %w", err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("root %q is not a directory", b.root)
+	}
+	return nil
+}
+
 // NewFilesystemBackend constructs a filesystem backend from config. It
 // resolves the root to an absolute path, verifies it exists and is a
 // directory, and validates glob patterns.

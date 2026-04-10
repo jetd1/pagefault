@@ -1,0 +1,340 @@
+// Package server — OpenAPI spec generation for the REST transport.
+//
+// The /api/openapi.json endpoint emits a machine-readable description of
+// every enabled pf_* tool. ChatGPT Custom GPT Actions (and any other
+// OpenAPI-consuming client) can import this spec directly by pointing at
+// `<server.public_url>/api/openapi.json`.
+//
+// The spec is built dynamically from the live config + dispatcher so tool
+// enable/disable toggles and `server.public_url` are always reflected. No
+// external OpenAPI library is pulled in — we hand-shape the document as
+// `map[string]any` because the surface is small and stable.
+
+package server
+
+import (
+	"net/http"
+
+	"github.com/jet/pagefault/internal/dispatcher"
+)
+
+// buildOpenAPISpec returns a JSON-serializable OpenAPI 3.1.0 document for
+// the currently-enabled pf_* REST tools. Callers pass the resolved public
+// base URL (empty string if unset — the spec falls back to "/").
+func buildOpenAPISpec(version, publicURL string, d *dispatcher.ToolDispatcher) map[string]any {
+	if publicURL == "" {
+		publicURL = "/"
+	}
+
+	paths := map[string]any{}
+	if d.ToolEnabled("pf_maps") {
+		paths["/api/pf_maps"] = pathItem("pf_maps", "List memory regions (contexts) exposed by pagefault.",
+			openapiRef("ListContextsInput"), openapiRef("ListContextsOutput"))
+	}
+	if d.ToolEnabled("pf_load") {
+		paths["/api/pf_load"] = pathItem("pf_load", "Load a named context bundle, optionally overriding format.",
+			openapiRef("GetContextInput"), openapiRef("GetContextOutput"))
+	}
+	if d.ToolEnabled("pf_scan") {
+		paths["/api/pf_scan"] = pathItem("pf_scan", "Search backends for content matching a query.",
+			openapiRef("SearchInput"), openapiRef("SearchOutput"))
+	}
+	if d.ToolEnabled("pf_peek") {
+		paths["/api/pf_peek"] = pathItem("pf_peek", "Read a single resource by URI.",
+			openapiRef("ReadInput"), openapiRef("ReadOutput"))
+	}
+	if d.ToolEnabled("pf_fault") {
+		paths["/api/pf_fault"] = pathItem("pf_fault", "Spawn a subagent to perform a deep retrieval.",
+			openapiRef("DeepRetrieveInput"), openapiRef("DeepRetrieveOutput"))
+	}
+	if d.ToolEnabled("pf_ps") {
+		paths["/api/pf_ps"] = pathItem("pf_ps", "List configured subagents.",
+			openapiRef("ListAgentsInput"), openapiRef("ListAgentsOutput"))
+	}
+
+	return map[string]any{
+		"openapi": "3.1.0",
+		"info": map[string]any{
+			"title":       "pagefault",
+			"description": "Config-driven memory server. REST counterpart of the MCP transport.",
+			"version":     version,
+		},
+		"servers": []any{
+			map[string]any{"url": publicURL},
+		},
+		"paths": paths,
+		"components": map[string]any{
+			"securitySchemes": map[string]any{
+				"BearerAuth": map[string]any{
+					"type":   "http",
+					"scheme": "bearer",
+				},
+			},
+			"schemas": openapiSchemas(),
+		},
+		"security": []any{
+			map[string]any{"BearerAuth": []any{}},
+		},
+	}
+}
+
+// pathItem builds a POST-only path item entry. Every pf_* tool accepts a
+// JSON body and returns JSON on success; shared 4xx/5xx error shapes come
+// from the ErrorEnvelope schema.
+func pathItem(opID, summary string, requestRef, responseRef map[string]any) map[string]any {
+	return map[string]any{
+		"post": map[string]any{
+			"operationId": opID,
+			"summary":     summary,
+			"requestBody": map[string]any{
+				"required": true,
+				"content": map[string]any{
+					"application/json": map[string]any{
+						"schema": requestRef,
+					},
+				},
+			},
+			"responses": map[string]any{
+				"200": map[string]any{
+					"description": "Success",
+					"content": map[string]any{
+						"application/json": map[string]any{
+							"schema": responseRef,
+						},
+					},
+				},
+				"400": errorResponse("Invalid request"),
+				"401": errorResponse("Missing or invalid bearer token"),
+				"403": errorResponse("Request blocked by filter or untrusted proxy"),
+				"404": errorResponse("Unknown context / resource / agent"),
+				"429": errorResponse("Rate limit exceeded"),
+				"502": errorResponse("Backend unreachable"),
+				"504": errorResponse("Subagent timed out"),
+			},
+		},
+	}
+}
+
+// errorResponse is the shared response descriptor for non-2xx entries.
+func errorResponse(desc string) map[string]any {
+	return map[string]any{
+		"description": desc,
+		"content": map[string]any{
+			"application/json": map[string]any{
+				"schema": openapiRef("ErrorEnvelope"),
+			},
+		},
+	}
+}
+
+// openapiRef builds a `$ref` pointer into components.schemas.
+func openapiRef(name string) map[string]any {
+	return map[string]any{"$ref": "#/components/schemas/" + name}
+}
+
+// openapiSchemas returns the schemas block for every pf_* tool plus the
+// shared error envelope. Field names are kept aligned with the JSON tags
+// on the Go request/response structs in internal/tool.
+func openapiSchemas() map[string]any {
+	stringProp := func(desc string) map[string]any {
+		return map[string]any{"type": "string", "description": desc}
+	}
+	intProp := func(desc string) map[string]any {
+		return map[string]any{"type": "integer", "description": desc}
+	}
+	stringArray := func(desc string) map[string]any {
+		return map[string]any{
+			"type":        "array",
+			"items":       map[string]any{"type": "string"},
+			"description": desc,
+		}
+	}
+
+	return map[string]any{
+		"ErrorEnvelope": map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"error": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"code":    stringProp("Stable snake_case error code (e.g. invalid_request, resource_not_found)"),
+						"status":  intProp("HTTP status code"),
+						"message": stringProp("Human-readable error message"),
+					},
+					"required": []any{"code", "status", "message"},
+				},
+			},
+			"required": []any{"error"},
+		},
+
+		// pf_maps
+		"ListContextsInput": map[string]any{
+			"type":        "object",
+			"description": "Empty body — pf_maps takes no arguments.",
+		},
+		"ListContextsOutput": map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"contexts": map[string]any{
+					"type": "array",
+					"items": map[string]any{
+						"type": "object",
+						"properties": map[string]any{
+							"name":        stringProp("Context name (unique)"),
+							"description": stringProp("Human-readable description"),
+						},
+					},
+				},
+			},
+			"required": []any{"contexts"},
+		},
+
+		// pf_load
+		"GetContextInput": map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"name":   stringProp("Context name to load"),
+				"format": stringProp("Output format: markdown (default), markdown-with-metadata, or json"),
+			},
+			"required": []any{"name"},
+		},
+		"GetContextOutput": map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"name":    stringProp("Context name"),
+				"format":  stringProp("Format the content was rendered in"),
+				"content": stringProp("Concatenated / structured content of the bundle"),
+				"skipped_sources": map[string]any{
+					"type": "array",
+					"items": map[string]any{
+						"type": "object",
+						"properties": map[string]any{
+							"uri":    stringProp("Source URI that was omitted"),
+							"reason": stringProp("Why it was skipped"),
+						},
+					},
+				},
+			},
+			"required": []any{"name", "format", "content"},
+		},
+
+		// pf_scan
+		"SearchInput": map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"query":    stringProp("Free-text query"),
+				"limit":    intProp("Maximum number of results (default 10)"),
+				"backends": stringArray("Restrict to these backend names (default: all)"),
+				"date_range": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"from": stringProp("ISO-8601 start date"),
+						"to":   stringProp("ISO-8601 end date"),
+					},
+					"description": "Accepted for forward compatibility; ignored by current backends.",
+				},
+			},
+			"required": []any{"query"},
+		},
+		"SearchOutput": map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"results": map[string]any{
+					"type": "array",
+					"items": map[string]any{
+						"type": "object",
+						"properties": map[string]any{
+							"uri":      stringProp("Resource URI"),
+							"snippet":  stringProp("Match excerpt"),
+							"score":    map[string]any{"type": "number", "description": "Relevance score (nullable)"},
+							"metadata": map[string]any{"type": "object", "additionalProperties": true},
+							"backend":  stringProp("Name of the backend that produced the hit"),
+						},
+					},
+				},
+			},
+			"required": []any{"results"},
+		},
+
+		// pf_peek
+		"ReadInput": map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"uri":       stringProp("Resource URI (e.g. memory://foo.md)"),
+				"from_line": intProp("Optional 1-indexed inclusive slice start"),
+				"to_line":   intProp("Optional 1-indexed inclusive slice end"),
+			},
+			"required": []any{"uri"},
+		},
+		"ReadOutput": map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"resource": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"uri":          stringProp("Resource URI"),
+						"content":      stringProp("Body text"),
+						"content_type": stringProp("IANA media type"),
+						"metadata":     map[string]any{"type": "object", "additionalProperties": true},
+					},
+				},
+			},
+			"required": []any{"resource"},
+		},
+
+		// pf_fault
+		"DeepRetrieveInput": map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"query":           stringProp("Natural-language task for the subagent"),
+				"agent":           stringProp("Agent id (default: first configured)"),
+				"timeout_seconds": intProp("Per-call timeout; default 120"),
+			},
+			"required": []any{"query"},
+		},
+		"DeepRetrieveOutput": map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"answer":          stringProp("Subagent response on success"),
+				"agent":           stringProp("Agent that ran the task"),
+				"backend":         stringProp("Subagent backend name"),
+				"elapsed_seconds": map[string]any{"type": "number", "description": "Wall-clock elapsed seconds"},
+				"timed_out":       map[string]any{"type": "boolean", "description": "True if the deadline fired"},
+				"partial_result":  stringProp("Stdout captured before timeout"),
+			},
+			"required": []any{"agent", "backend", "elapsed_seconds"},
+		},
+
+		// pf_ps
+		"ListAgentsInput": map[string]any{
+			"type":        "object",
+			"description": "Empty body — pf_ps takes no arguments.",
+		},
+		"ListAgentsOutput": map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"agents": map[string]any{
+					"type": "array",
+					"items": map[string]any{
+						"type": "object",
+						"properties": map[string]any{
+							"id":          stringProp("Agent id"),
+							"description": stringProp("Agent description"),
+							"backend":     stringProp("Hosting backend name"),
+						},
+					},
+				},
+			},
+			"required": []any{"agents"},
+		},
+	}
+}
+
+// handleOpenAPISpec serves the live OpenAPI document for the REST
+// transport. The endpoint is public (no auth) so importers like ChatGPT
+// Custom GPT Actions can fetch the schema without supplying a bearer
+// token first.
+func (s *Server) handleOpenAPISpec(w http.ResponseWriter, _ *http.Request) {
+	spec := buildOpenAPISpec(Version, s.cfg.Server.PublicURL, s.dispatcher)
+	writeJSON(w, http.StatusOK, spec)
+}

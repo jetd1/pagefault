@@ -19,7 +19,6 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -27,6 +26,7 @@ import (
 	mcpserver "github.com/mark3labs/mcp-go/server"
 
 	"github.com/jet/pagefault/internal/auth"
+	"github.com/jet/pagefault/internal/backend"
 	"github.com/jet/pagefault/internal/config"
 	"github.com/jet/pagefault/internal/dispatcher"
 	"github.com/jet/pagefault/internal/model"
@@ -83,14 +83,21 @@ func New(cfg *config.Config, d *dispatcher.ToolDispatcher, authP auth.AuthProvid
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.RealIP)
 	r.Use(requestLogger)
+	r.Use(corsMiddleware(cfg.Server.CORS))
 
 	// Public endpoints (no auth).
 	r.Get("/health", s.handleHealth)
 	r.Get("/", s.handleRoot)
+	// OpenAPI spec is public so importers (ChatGPT Custom GPT Actions, etc.)
+	// can fetch it without a bearer token. The spec itself advertises the
+	// BearerAuth scheme, so downstream calls to /api/pf_* still require auth.
+	r.Get("/api/openapi.json", s.handleOpenAPISpec)
 
-	// Authenticated endpoints.
+	// Authenticated endpoints. Rate limiting runs after auth so the
+	// limiter can key on the resolved caller id.
 	r.Group(func(pr chi.Router) {
 		pr.Use(auth.Middleware(authP))
+		pr.Use(rateLimitMiddleware(cfg.Server.RateLimit))
 
 		// MCP transport. The streamable-http handler expects any method
 		// (POST/GET/DELETE) on the endpoint path.
@@ -130,17 +137,58 @@ func New(cfg *config.Config, d *dispatcher.ToolDispatcher, authP auth.AuthProvid
 
 // ───────────────── handlers ─────────────────
 
-// handleHealth reports overall liveness and per-backend status.
+// handleHealth reports overall liveness and per-backend status. Every
+// backend that implements [backend.HealthChecker] is probed with a
+// short timeout; backends without Health are reported as "ok" (we have
+// no better signal without forcing every backend to lie).
 //
-// Phase 1: all configured backends are reported as "ok" by name. A real
-// ping/probe mechanism can be added in a later phase.
-func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
-	backends := map[string]string{}
+// Per-backend entries have the shape `{"status": "ok"|"unavailable",
+// "error"?: "..."}`. The top-level "status" field is:
+//
+//   - "ok"          — every backend is ok
+//   - "degraded"    — at least one backend is unavailable
+//   - "unavailable" — every backend is unavailable
+//
+// /health always returns HTTP 200 so operators can fetch it cheaply
+// from liveness probes; branch on the envelope's top-level "status"
+// field for orchestration decisions.
+func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	const probeTimeout = 2 * time.Second
+	backends := map[string]any{}
+	okCount, badCount := 0, 0
+
 	for _, name := range s.dispatcher.SortedBackendNames() {
-		backends[name] = "ok"
+		be, ok := s.dispatcher.Backend(name)
+		if !ok {
+			continue
+		}
+		entry := map[string]any{"status": "ok"}
+		if hc, ok := be.(backend.HealthChecker); ok {
+			ctx, cancel := context.WithTimeout(r.Context(), probeTimeout)
+			if herr := hc.Health(ctx); herr != nil {
+				entry["status"] = "unavailable"
+				entry["error"] = herr.Error()
+				badCount++
+			} else {
+				okCount++
+			}
+			cancel()
+		} else {
+			okCount++
+		}
+		backends[name] = entry
 	}
+
+	overall := "ok"
+	switch {
+	case badCount > 0 && okCount == 0:
+		overall = "unavailable"
+	case badCount > 0:
+		overall = "degraded"
+	}
+
 	writeJSON(w, http.StatusOK, map[string]any{
-		"status":   "ok",
+		"status":   overall,
 		"version":  Version,
 		"backends": backends,
 	})
@@ -151,8 +199,9 @@ func (s *Server) handleRoot(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	_, _ = fmt.Fprintf(w, "pagefault %s\n\n", Version)
 	_, _ = io.WriteString(w, "Endpoints:\n")
-	_, _ = io.WriteString(w, "  GET  /health           — health probe\n")
-	_, _ = io.WriteString(w, "  POST /mcp              — MCP streamable-http\n")
+	_, _ = io.WriteString(w, "  GET  /health             — health probe\n")
+	_, _ = io.WriteString(w, "  GET  /api/openapi.json   — live OpenAPI 3.1 spec (public)\n")
+	_, _ = io.WriteString(w, "  POST /mcp                — MCP streamable-http\n")
 	_, _ = io.WriteString(w, "  POST /api/pf_maps        — list memory regions (contexts)\n")
 	_, _ = io.WriteString(w, "  POST /api/pf_load        — load a region by name\n")
 	_, _ = io.WriteString(w, "  POST /api/pf_scan        — scan backends for content\n")
@@ -206,8 +255,40 @@ func errorStatus(err error) int {
 		return http.StatusBadGateway
 	case errors.Is(err, model.ErrSubagentTimeout):
 		return http.StatusGatewayTimeout
+	case errors.Is(err, model.ErrRateLimited):
+		return http.StatusTooManyRequests
 	default:
 		return http.StatusInternalServerError
+	}
+}
+
+// errorCode maps dispatcher/model errors to stable, snake_case codes that
+// clients can branch on without parsing the message. The returned code is
+// what clients should match against — messages are for humans.
+func errorCode(err error) string {
+	switch {
+	case errors.Is(err, model.ErrInvalidRequest):
+		return "invalid_request"
+	case errors.Is(err, model.ErrUnauthenticated):
+		return "unauthenticated"
+	case errors.Is(err, model.ErrAccessViolation):
+		return "access_violation"
+	case errors.Is(err, model.ErrResourceNotFound):
+		return "resource_not_found"
+	case errors.Is(err, model.ErrContextNotFound):
+		return "context_not_found"
+	case errors.Is(err, model.ErrBackendNotFound):
+		return "backend_not_found"
+	case errors.Is(err, model.ErrAgentNotFound):
+		return "agent_not_found"
+	case errors.Is(err, model.ErrBackendUnavailable):
+		return "backend_unavailable"
+	case errors.Is(err, model.ErrSubagentTimeout):
+		return "subagent_timeout"
+	case errors.Is(err, model.ErrRateLimited):
+		return "rate_limited"
+	default:
+		return "internal_error"
 	}
 }
 
@@ -218,11 +299,28 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-// writeError writes a JSON error envelope.
+// errorEnvelope is the Phase-3 structured error shape. The REST transport
+// always emits this envelope for non-2xx responses so clients can branch on
+// Code without parsing Message. Fields are intentionally minimal — detail
+// goes in Message, not in extra keys.
+type errorEnvelope struct {
+	Error errorBody `json:"error"`
+}
+
+type errorBody struct {
+	Code    string `json:"code"`
+	Status  int    `json:"status"`
+	Message string `json:"message"`
+}
+
+// writeError writes a structured JSON error envelope with a stable code.
 func writeError(w http.ResponseWriter, status int, err error) {
-	writeJSON(w, status, map[string]any{
-		"error":   strings.ToLower(http.StatusText(status)),
-		"message": err.Error(),
+	writeJSON(w, status, errorEnvelope{
+		Error: errorBody{
+			Code:    errorCode(err),
+			Status:  status,
+			Message: err.Error(),
+		},
 	})
 }
 

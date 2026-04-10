@@ -102,6 +102,43 @@ func TestHandleGetContext_DefaultFormat(t *testing.T) {
 	assert.Equal(t, "markdown", out.Format)
 }
 
+// TestHandleGetContext_EchoesResolvedFormat is a regression test for a
+// bug where HandleGetContext echoed the caller-supplied format back
+// verbatim, defaulting to "markdown" when empty. If the context's
+// configured default was "json" or "markdown-with-metadata", the
+// handler would return JSON content while reporting `format:"markdown"`.
+// Fix: the dispatcher returns the resolved format and the handler
+// echoes that.
+func TestHandleGetContext_EchoesResolvedFormat(t *testing.T) {
+	fb := &fakeBackend{
+		resources: map[string]*backend.Resource{
+			"memory://foo.md": {URI: "memory://foo.md", Content: "hi", ContentType: "text/markdown"},
+		},
+	}
+	d, err := dispatcher.New(dispatcher.Options{
+		Backends: []backend.Backend{fb},
+		Contexts: []config.ContextConfig{
+			{
+				Name:    "jsonctx",
+				Sources: []config.ContextSource{{Backend: "fake", URI: "memory://foo.md"}},
+				Format:  "json", // context default is JSON
+				MaxSize: 10_000,
+			},
+		},
+		Filter: filter.NewCompositeFilter(),
+		Audit:  audit.NopLogger{},
+	})
+	require.NoError(t, err)
+
+	// Caller leaves in.Format empty → dispatcher falls through to cfg.Format
+	// → "json". Handler must echo "json", not the old "markdown" fallback.
+	out, err := HandleGetContext(context.Background(), d,
+		GetContextInput{Name: "jsonctx", Format: ""}, model.AnonymousCaller)
+	require.NoError(t, err)
+	assert.Equal(t, "json", out.Format)
+	assert.Contains(t, out.Content, `"name":"jsonctx"`)
+}
+
 func TestHandleGetContext_MissingName(t *testing.T) {
 	d := makeDispatcher(t)
 	_, err := HandleGetContext(context.Background(), d, GetContextInput{}, model.AnonymousCaller)

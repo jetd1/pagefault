@@ -30,14 +30,62 @@ backend only). For a tour of every backend type with inline docs, see
 server:
   host: "127.0.0.1"     # required
   port: 8444            # required (1..65535)
-  public_url: ""        # optional, used by OpenAPI spec (Phase 3)
+  public_url: "https://pagefault.example.com"  # optional — advertised by /api/openapi.json
+  cors:
+    enabled: false
+    allowed_origins: ["https://chat.openai.com"]
+    allowed_methods: ["GET", "POST", "OPTIONS"]
+    allowed_headers: ["Content-Type", "Authorization"]
+    allow_credentials: false
+    max_age: 600
+  rate_limit:
+    enabled: false
+    rps: 10              # steady-state tokens per second per caller
+    burst: 20            # bucket size per caller
 ```
 
 | Field        | Type   | Default       | Notes |
 |--------------|--------|---------------|-------|
 | `host`       | string | `127.0.0.1`   | Bind address. |
 | `port`       | int    | `8444`        | Listen port. |
-| `public_url` | string | empty         | Reserved for Phase 3 OpenAPI spec generation. |
+| `public_url` | string | empty         | Advertised as the `servers[0].url` in `/api/openapi.json`. Falls back to `/` when unset. |
+
+### `server.cors`
+
+Opt-in cross-origin handling for the REST transport. When `enabled: false`
+(default) no CORS headers are emitted and browsers reject cross-origin
+requests — fine for loopback and same-origin deployments. Setting
+`enabled: true` with an empty `allowed_origins` list is equivalent to
+`enabled: false`.
+
+| Field                    | Type     | Default                         | Notes |
+|--------------------------|----------|---------------------------------|-------|
+| `enabled`                | bool     | `false`                         | Master switch. |
+| `allowed_origins`        | string[] | `[]`                            | Exact-match origin allowlist. Use `"*"` for any origin (downgraded to echo-mode when `allow_credentials: true`). |
+| `allowed_methods`        | string[] | `[GET, POST, OPTIONS]`          | Preflight `Access-Control-Allow-Methods`. |
+| `allowed_headers`        | string[] | `[Content-Type, Authorization]` | Preflight `Access-Control-Allow-Headers`. |
+| `allow_credentials`      | bool     | `false`                         | Emits `Access-Control-Allow-Credentials: true`. |
+| `max_age`                | int      | `600`                           | Preflight cache in seconds. |
+
+### `server.rate_limit`
+
+Per-caller token bucket applied after auth. Callers are keyed on their
+resolved `caller.id` (token id for bearer auth, header value for
+trusted-header auth, or literal `"anonymous"` for `mode: none`). When
+`enabled: false` the middleware is a no-op.
+
+| Field      | Type    | Default | Notes |
+|------------|---------|---------|-------|
+| `enabled`  | bool    | `false` | Master switch. |
+| `rps`      | float   | `10`    | Steady-state refill rate (tokens/second). |
+| `burst`    | int     | `20`    | Bucket size — maximum burst before throttling kicks in. |
+
+A caller that exceeds its budget receives HTTP 429 with a
+`Retry-After` header and the standard structured error envelope:
+
+```json
+{"error": {"code": "rate_limited", "status": 429, "message": "rate limit exceeded"}}
+```
 
 ---
 
@@ -275,7 +323,7 @@ contexts:
 | `sources[].backend` | string | yes    | —          | Backend name from the `backends` section. |
 | `sources[].uri`     | string | yes    | —          | URI to load. |
 | `sources[].params`  | object | no     | —          | Reserved for future dynamic-source features; currently accepted but ignored. |
-| `format`       | string   | no       | `markdown` | Output format: `markdown` or `json`. |
+| `format`       | string   | no       | `markdown` | Output format: `markdown`, `markdown-with-metadata`, or `json`. Clients can override per request via `pf_load.format`. |
 | `max_size`     | int      | no       | `16000`    | Max characters before truncation. Truncation is UTF-8-safe (rune-aligned). |
 
 When a source cannot be read (missing file, filter block), the source is
@@ -322,11 +370,13 @@ filters:
   tags:
     allow: []
     deny: ["intimate"]
-  redaction:                              # Phase 3 only
-    enabled: false
+  redaction:
+    enabled: true
     rules:
       - pattern: '(?i)api[_-]?key\s*[:=]\s*\S+'
         replacement: "[REDACTED]"
+      - pattern: 'pf_[A-Za-z0-9]+'
+        replacement: "[TOKEN]"
 ```
 
 | Field              | Type                     | Notes |
@@ -336,12 +386,14 @@ filters:
 | `path.deny`        | string[] (glob)          | URI denylist. Deny beats allow. |
 | `tags.allow`       | string[]                 | Resources without any matching tag are hidden. |
 | `tags.deny`        | string[]                 | Resources with any matching tag are hidden. |
-| `redaction.*`      | (Phase 3)                | Regex redaction on content. Not implemented in Phase 1. |
+| `redaction.enabled`| bool                     | Compiles `rules` into a content filter. Unused rules (with `enabled: false`) are ignored. |
+| `redaction.rules`  | []object                 | Each rule has `pattern` (Go regexp) and `replacement` (supports `$1`/`$2` capture groups). Invalid patterns fail fast at server start. |
 
 ### Pattern syntax
 
 Doublestar globs (`**` for recursive match) for path patterns, plain strings
-for tags.
+for tags, and Go `regexp` syntax for redaction rules (`(?i)` inline flag,
+`\d`, `$1` capture groups, etc.).
 
 ### Order of operations
 
@@ -349,7 +401,9 @@ for tags.
    hit the backend.
 2. **Tag check** (post-fetch): `tags.allow` + `tags.deny` — applied to
    resource metadata tags.
-3. **Content transform** (Phase 3): `redaction.rules`.
+3. **Content transform**: `redaction.rules` — every rule is applied in
+   declaration order. The transformed content is what the caller receives
+   (no unredacted copy hits the wire).
 
 ---
 
