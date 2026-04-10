@@ -99,10 +99,25 @@ MCPServer, so tool registrations, auth, and rate limiting are identical
 across the two — this block just gates the SSE pair and lets operators
 replace the built-in instructions text.
 
-| Field          | Type   | Default  | Notes |
-|----------------|--------|----------|-------|
-| `sse_enabled`  | bool   | `true`   | Mounts `GET /sse` and `POST /message`. Keep the default on so Claude Desktop and other SSE-only clients work out of the box; set `false` if you only serve streamable-http clients and want to minimise the public surface. |
-| `instructions` | string | built-in | Overrides the server-level instructions string advertised in the MCP `initialize` response. Most MCP clients (Claude Desktop, Claude Code, etc.) surface this text in the agent's system prompt, which makes it the single most reliable lever for teaching agents *when* to reach for `pf_*` tools vs the built-ins. Empty means "use the built-in default from `internal/tool/instructions.go`", which is the recommended starting point — only override when you want to add installation-specific guidance (e.g. "daily notes live under `memory://daily/`, project docs under `memory://projects/`"). |
+| Field                              | Type   | Default  | Notes |
+|------------------------------------|--------|----------|-------|
+| `sse_enabled`                      | bool   | `true`   | Mounts `GET /sse` and `POST /message`. Keep the default on so Claude Desktop and other SSE-only clients work out of the box; set `false` if you only serve streamable-http clients and want to minimise the public surface. |
+| `instructions`                     | string | built-in | Overrides the server-level instructions string advertised in the MCP `initialize` response. Most MCP clients (Claude Desktop, Claude Code, etc.) surface this text in the agent's system prompt, which makes it the single most reliable lever for teaching agents *when* to reach for `pf_*` tools vs the built-ins. Empty means "use the built-in default from `internal/tool/instructions.go`", which is the recommended starting point — only override when you want to add installation-specific guidance (e.g. "daily notes live under `memory://daily/`, project docs under `memory://projects/`"). |
+| `sse_keepalive`                    | bool   | `true`   | Emits JSON-RPC `ping` events on the persistent `GET /sse` stream to keep intermediate proxies from closing an idle connection during a long `pf_fault` call. Defaults to **on** because the failure mode without it (tool calls dying after "几十秒" regardless of `timeout_seconds`) is hard to diagnose. Set `false` only when you have verified your proxy chain never closes idle SSE streams or you have a client that rejects unsolicited `ping` requests. |
+| `sse_keepalive_interval_seconds`   | int    | `15`     | Ticker interval (in seconds) for the SSE keepalive pings. Pagefault's default of 15 is longer than mcp-go's own 10-second default but still comfortably under the common 30 / 60 second proxy idle timeouts. Set lower for aggressive proxies (e.g. nginx with `proxy_read_timeout 10s`); values at or below zero are clamped to the default. Ignored when `sse_keepalive: false`. |
+
+> **Why keepalives?** A `pf_fault` call blocks inside
+> `SubagentBackend.Spawn` for as long as the subagent takes to
+> respond — often 30-120s. On the persistent `GET /sse` stream,
+> that entire wait is silence. Any proxy in front of pagefault
+> (nginx with `proxy_read_timeout` 60s, Node undici with
+> `headersTimeout` 60s, Cloudflare free plan with a 100s hard
+> cap, …) will close the connection while pagefault is still
+> waiting, and the caller sees a failure well before the
+> configured `timeout_seconds`. The keepalive ping is a
+> few-byte JSON-RPC notification every `sse_keepalive_interval_seconds`,
+> which counts as "activity" from every proxy's perspective
+> and keeps the connection alive for the real response.
 
 **Why not just rely on tool descriptions?** Tool descriptions tell an
 agent *how* to call a tool once it has decided to; instructions tell

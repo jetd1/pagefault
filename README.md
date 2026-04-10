@@ -88,14 +88,51 @@ Restart Claude Code; the `pf_*` tools appear alongside the built-ins.
 
 ### Claude Desktop
 
-Claude Desktop speaks MCP over legacy SSE, not streamable-http, so
-point it at the `/sse` endpoint (pagefault mounts both transports in
-parallel — `/mcp` for streamable-http, `/sse` + `/message` for SSE —
-and they share the same tool set, auth chain, and instructions).
-Claude Desktop sends the `Authorization` header on both the initial
-SSE GET and subsequent message POSTs, so bearer auth works out of
-the box. Add an entry to your Claude Desktop MCP server config (the
-file path depends on your platform — see the Claude Desktop docs):
+Claude Desktop speaks MCP over legacy SSE, not streamable-http.
+pagefault mounts both transports in parallel (`/mcp` for
+streamable-http, `/sse` + `/message` for SSE — they share the same
+tool set, auth chain, and instructions), so the transport choice is
+driven entirely by what Claude Desktop supports.
+
+**The catch:** as of 2026-04 Claude Desktop's built-in SSE
+configuration only accepts **OAuth2 Client ID / Client Secret** as
+credentials — it does not expose a way to attach a plain
+`Authorization: Bearer pf_...` header to the SSE GET. Until
+pagefault ships an OAuth2 auth provider (tracked for Phase 5), the
+practical paths for a bearer-authenticated deployment are:
+
+**(A) Recommended: the `supergateway` bridge against `/mcp`.** Run
+`npx supergateway` as a local stdio-to-HTTPS adapter that injects
+the bearer header on every request:
+
+```json
+{
+  "mcpServers": {
+    "pagefault": {
+      "command": "npx",
+      "args": [
+        "-y", "supergateway",
+        "--streamableHttp", "https://pagefault.example.com/mcp",
+        "--header", "Authorization: Bearer pf_your_token_here"
+      ]
+    }
+  }
+}
+```
+
+This is the only config that works today with plain bearer auth.
+**Important caveat:** long-running `pf_fault` calls on this path
+are vulnerable to intermediate proxy idle timeouts (nginx default
+60s, Node undici `headersTimeout` 60s, Cloudflare free plan 100s).
+The 0.6.1 SSE keepalive fix does *not* help here because the
+traffic flows through `/mcp` (streamable-http), not `/sse`. If you
+run a reverse proxy in front of pagefault, bump its read / idle
+timeout to 300s or more to accommodate long subagent calls.
+
+**(B) Aspirational: native SSE when Claude Desktop supports it.**
+For future Claude Desktop versions that accept a plain
+`Authorization` header on the SSE URL, or for any other SSE-capable
+MCP client, the config looks like:
 
 ```json
 {
@@ -108,11 +145,16 @@ file path depends on your platform — see the Claude Desktop docs):
 }
 ```
 
+On this path the 0.6.1 SSE keepalive fully protects against idle
+proxy timeouts — no workaround needed.
+
 > **Before 0.6.0:** pagefault only shipped the streamable-http
-> transport, and Claude Desktop users had to proxy through
-> `npx supergateway` (or a similar SSE ↔ streamable-http bridge) to
-> connect. 0.6.0 adds a native SSE transport so that workaround is no
-> longer required.
+> transport, so `supergateway` was literally the only way to
+> connect Claude Desktop at all. 0.6.0 added the native `/sse`
+> transport (which helps OAuth2 clients and non-Claude-Desktop SSE
+> clients); 0.6.1 added the SSE keepalive that makes long tool
+> calls survive proxy timeouts. Bearer-auth Claude Desktop users
+> still need the bridge until OAuth2 ships.
 
 ### ChatGPT Custom GPT (Actions)
 
@@ -146,6 +188,35 @@ bash scripts/smoke.sh   # end-to-end smoke test
 - **`CLAUDE.md`** — developer guide for AI agents working on this repo
 
 ## Recent Changes
+
+### 0.6.1 — 2026-04-11
+
+- **Hotfix: SSE keepalive pings enabled by default.** A real
+  Claude Desktop deployment reported `pf_fault` calls dying after
+  "几十秒" (a few tens of seconds) regardless of the configured
+  `timeout_seconds`, well before the subagent finished. Root
+  cause: pagefault's internal code respects the full timeout
+  end-to-end, but mcp-go's SSE server does not enable keepalives
+  by default, so the persistent GET `/sse` stream sat idle for
+  the whole subagent wait and whichever intermediate proxy
+  timeout fired first (nginx `proxy_read_timeout` 60s, Node
+  undici `headersTimeout` 60s, Cloudflare free plan 100s, …)
+  closed the connection mid-call. Fix: pass
+  `WithKeepAlive(true)` + `WithKeepAliveInterval(15s)` when
+  mounting the SSE server, so pagefault emits a JSON-RPC `ping`
+  event on the stream every 15 seconds. Two new opt-out YAML
+  fields — `server.mcp.sse_keepalive` and
+  `server.mcp.sse_keepalive_interval_seconds` — let operators
+  tune or disable the feature. Operators using
+  `supergateway --streamableHttp → /mcp` are **not** helped by
+  this fix (mcp-go's streamable-http transport has no equivalent
+  per-request keepalive). Native `/sse` on Claude Desktop is
+  *only* an option for OAuth2-authenticated deployments as of
+  2026-04 — Claude Desktop's built-in SSE config does not accept
+  a plain bearer header, so bearer-auth users still need the
+  `supergateway` bridge or a reverse-proxy workaround until
+  pagefault ships an OAuth2 auth provider (tracked for Phase 5).
+  Other SSE clients benefit from the keepalive fix directly.
 
 ### 0.6.0 — 2026-04-11
 

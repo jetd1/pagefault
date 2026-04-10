@@ -30,6 +30,21 @@ server:
   # and Claude Desktop can both connect without any extra bridging.
   mcp:
     sse_enabled: true   # set false to disable /sse + /message
+    # ── SSE keepalive ─────────────────────────────
+    # sse_keepalive: true                 # default; emits JSON-RPC ping
+    #                                     # events on the /sse stream to
+    #                                     # keep intermediate proxies from
+    #                                     # closing the connection mid-call
+    #                                     # (nginx proxy_read_timeout 60s,
+    #                                     # Node undici headersTimeout 60s,
+    #                                     # Cloudflare free plan 100s, …).
+    #                                     # Only opt out if you have
+    #                                     # verified your proxy chain never
+    #                                     # closes idle SSE.
+    # sse_keepalive_interval_seconds: 15  # default; longer than mcp-go's
+    #                                     # 10s default, comfortably under
+    #                                     # common proxy idle timeouts.
+    #                                     # Lower it for aggressive proxies.
     # instructions: |
     #   Optional override for the server-level instructions string
     #   advertised in the MCP initialize response. This is a full

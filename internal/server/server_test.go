@@ -887,6 +887,148 @@ func TestServer_SSE_Disabled_RootLandingHidesIt(t *testing.T) {
 	assert.NotContains(t, string(body), "/message")
 }
 
+// TestServer_SSE_KeepAliveEmitsPing verifies that pagefault enables
+// mcp-go's SSE keepalive by default and that a ping event shows up on
+// the stream within the configured interval. Without this, a long
+// pf_fault call leaves the /sse connection idle for its entire
+// duration and intermediate proxies (nginx proxy_read_timeout,
+// undici headersTimeout, Cloudflare free plan, …) close the
+// connection well before the subagent returns — the failure mode
+// reported in a real Claude Desktop deployment where tool calls
+// would die after "几十秒" regardless of the caller-supplied
+// timeout_seconds.
+func TestServer_SSE_KeepAliveEmitsPing(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "hello.md"), []byte("hi"), 0o600))
+	fsCfg := &config.FilesystemBackendConfig{
+		Name: "fs", Type: "filesystem", Root: dir,
+		Include: []string{"**/*.md"}, URIScheme: "memory", Sandbox: true,
+	}
+	fsBackend, err := backend.NewFilesystemBackend(fsCfg)
+	require.NoError(t, err)
+	d, err := dispatcher.New(dispatcher.Options{
+		Backends: []backend.Backend{fsBackend},
+		Filter:   filter.NewCompositeFilter(),
+		Audit:    audit.NopLogger{},
+	})
+	require.NoError(t, err)
+
+	// Keepalive is opt-out (SSEKeepAlive defaults to true), so we
+	// only need to override the interval to something fast enough
+	// for a test to observe. 1 second keeps the test under 3s.
+	cfg := &config.Config{
+		Server: config.ServerConfig{
+			Host: "127.0.0.1", Port: 0,
+			MCP: config.MCPConfig{SSEKeepAliveIntervalSeconds: 1},
+		},
+		Auth: config.AuthConfig{Mode: "none"},
+	}
+	p, err := auth.NewProvider(cfg.Auth)
+	require.NoError(t, err)
+	srv, err := New(cfg, d, p)
+	require.NoError(t, err)
+	ts := httptest.NewServer(srv.Handler)
+	defer ts.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, ts.URL+"/sse", nil)
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	reader := bufio.NewReader(resp.Body)
+
+	// First event is always the endpoint announcement.
+	first := readSSEEvent(t, reader)
+	require.Contains(t, first, "event: endpoint")
+
+	// Within the next few events we should see a ping. mcp-go's
+	// keepalive emits a JSON-RPC `ping` request as a message event
+	// on the ticker. Read up to 5 events to avoid an unbounded loop
+	// — with a 1s interval, a ping should arrive immediately after
+	// we open the stream.
+	var sawPing bool
+	for i := 0; i < 5 && !sawPing; i++ {
+		event := readSSEEvent(t, reader)
+		if strings.Contains(event, `"method":"ping"`) {
+			sawPing = true
+		}
+	}
+	assert.True(t, sawPing,
+		"expected a ping event on the SSE stream within the keepalive interval — without it, long pf_fault calls will be killed by intermediate proxies")
+}
+
+// TestServer_SSE_KeepAliveDisabledSuppressesPing verifies the opt-out.
+// Operators who explicitly set server.mcp.sse_keepalive: false get the
+// old behaviour (no pings). This is the belt-and-braces guard that the
+// toggle actually works, and doubles as documentation for anyone
+// reading the test file and wondering how to turn it off.
+func TestServer_SSE_KeepAliveDisabledSuppressesPing(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "hello.md"), []byte("hi"), 0o600))
+	fsCfg := &config.FilesystemBackendConfig{
+		Name: "fs", Type: "filesystem", Root: dir,
+		Include: []string{"**/*.md"}, URIScheme: "memory", Sandbox: true,
+	}
+	fsBackend, err := backend.NewFilesystemBackend(fsCfg)
+	require.NoError(t, err)
+	d, err := dispatcher.New(dispatcher.Options{
+		Backends: []backend.Backend{fsBackend},
+		Filter:   filter.NewCompositeFilter(),
+		Audit:    audit.NopLogger{},
+	})
+	require.NoError(t, err)
+
+	keepaliveOff := false
+	cfg := &config.Config{
+		Server: config.ServerConfig{
+			Host: "127.0.0.1", Port: 0,
+			MCP: config.MCPConfig{
+				SSEKeepAlive:                &keepaliveOff,
+				SSEKeepAliveIntervalSeconds: 1,
+			},
+		},
+		Auth: config.AuthConfig{Mode: "none"},
+	}
+	p, err := auth.NewProvider(cfg.Auth)
+	require.NoError(t, err)
+	srv, err := New(cfg, d, p)
+	require.NoError(t, err)
+	ts := httptest.NewServer(srv.Handler)
+	defer ts.Close()
+
+	// Use a timeout that is comfortably longer than the ticker
+	// interval we set above. If keepalive is really off, we should
+	// see the endpoint event and then nothing else before the read
+	// times out — not a ping.
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, ts.URL+"/sse", nil)
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	reader := bufio.NewReader(resp.Body)
+	first := readSSEEvent(t, reader)
+	require.Contains(t, first, "event: endpoint")
+
+	// Now try to read another event. With keepalive disabled, the
+	// read should block until the request context cancels — there
+	// is no traffic to emit. ReadString returns an error when the
+	// underlying body is closed by the cancelled context, which is
+	// the signal that nothing landed on the stream.
+	line, err := reader.ReadString('\n')
+	assert.Empty(t, line,
+		"expected no further SSE data after the endpoint event when keepalive is disabled, got %q", line)
+	assert.Error(t, err,
+		"read should fail with context cancellation when keepalive is disabled; line=%q", line)
+}
+
 // TestDefaultInstructionsNotEmpty is a belt-and-braces guard that the
 // default instructions constant has not been accidentally blanked out,
 // which would silently fall back to mcp-go's empty default and leave

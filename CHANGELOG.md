@@ -7,6 +7,97 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+## 0.6.1 (2026-04-11)
+
+Hotfix for a long-running `pf_fault` failure mode reported in a real
+Claude Desktop deployment: tool calls died after "几十秒" (a few tens
+of seconds) regardless of the caller-supplied `timeout_seconds`, well
+before the subagent could finish.
+
+Full trace: pagefault's internal code respects `timeout_seconds`
+end-to-end (traced every `context.WithTimeout` from the HTTP request
+through the dispatcher into `SubagentBackend.Spawn` — no hidden
+clamp). The premature termination came from **idle connections being
+killed by intermediate proxies during the subagent wait**. On the
+native `/sse` transport, pagefault's current SSE server did not
+enable mcp-go's keepalive feature, so the persistent GET /sse stream
+sat silent for the full duration of the tool call and whichever
+proxy timeout fired first (nginx `proxy_read_timeout` default 60s,
+Node undici `headersTimeout` default 60s, Cloudflare free plan 100s,
+…) closed the connection before the response arrived.
+
+### Fixed
+- **SSE keepalive pings enabled by default.** `internal/server`
+  now passes `mcpserver.WithKeepAlive(true)` +
+  `WithKeepAliveInterval(...)` when mounting `NewSSEServer`, so the
+  persistent GET `/sse` stream emits a JSON-RPC `ping` event on a
+  ticker (default every 15 seconds) for the whole lifetime of the
+  connection. This keeps intermediate proxies from considering the
+  connection idle and closing it, so a 60-120s `pf_fault` call
+  completes cleanly instead of being killed mid-wait. The pings
+  themselves are harmless — mcp-go's client side treats them as
+  no-ops.
+- Operators using `supergateway --streamableHttp → /mcp` are
+  **not** covered by this fix. mcp-go's streamable-http transport
+  only supports keepalives on the separate long-polling GET
+  connection used for server-to-client notifications, not on the
+  tool-call POST response.
+- **Claude Desktop caveat.** As of 2026-04, Claude Desktop's
+  built-in SSE MCP config only accepts OAuth2 Client ID / Client
+  Secret as credentials — it does not expose a way to attach a
+  plain `Authorization: Bearer pf_...` header to the initial SSE
+  GET, so operators who authenticate with pagefault's bearer
+  tokens cannot drop `supergateway` and point Claude Desktop at
+  `/sse` natively. For that specific combination, the
+  recommended path until pagefault ships an OAuth2 auth provider
+  (tracked for Phase 5) is to keep the `supergateway` bridge and
+  work around the proxy-timeout problem at the proxy layer
+  instead — raise `proxy_read_timeout` / equivalent on whatever
+  sits in front of pagefault.jetd.one to 300s or more. Other
+  SSE clients (and future Claude Desktop versions that accept
+  an `Authorization` header on the SSE URL) benefit from the
+  keepalive fix directly.
+
+### Added
+- **`server.mcp.sse_keepalive`** (bool, defaults to `true`) —
+  opt-out toggle for the SSE keepalive pings. Set to `false` if
+  you have an unusual SSE client that rejects unsolicited server
+  pings, or if you have confirmed your proxy chain never closes
+  idle SSE streams.
+- **`server.mcp.sse_keepalive_interval_seconds`** (int, defaults
+  to `15`) — tuner for the ping ticker. Pagefault's default is
+  longer than mcp-go's own 10-second default because 15s is still
+  comfortably under every common proxy idle timeout and keeps the
+  wire traffic a touch lighter. Set lower if you have a
+  particularly aggressive proxy (e.g. nginx with
+  `proxy_read_timeout 10s`); leaving it at 15 is safe for
+  everything I have tested against. Values at or below zero are
+  clamped to the default.
+
+### Tests
+- `TestServer_SSE_KeepAliveEmitsPing` — spins up a test server
+  with `SSEKeepAliveIntervalSeconds: 1`, opens `/sse`, reads past
+  the endpoint event, and asserts a `"method":"ping"` event
+  arrives on the stream within 5 reads. Regression guard: if a
+  future refactor silently drops the `WithKeepAlive` option, this
+  test fails before any real deployment sees the "几十秒就挂"
+  failure again.
+- `TestServer_SSE_KeepAliveDisabledSuppressesPing` — opts out
+  via `SSEKeepAlive: false` and asserts no further SSE data
+  lands on the stream after the endpoint event (the reader
+  blocks until the test's 3-second context cancels). This is
+  the belt-and-braces guard that the toggle actually turns the
+  feature off.
+
+### Docs
+- `docs/config-doc.md` §`server.mcp` gains rows for the two new
+  fields plus a "Why keepalives?" paragraph explaining the
+  idle-proxy failure mode.
+- `configs/example.yaml` shows the new fields commented out,
+  with an inline note pointing at the proxy-timeout problem the
+  defaults are fixing.
+- `README.md` Recent Changes gets a 0.6.1 hotfix entry.
+
 ## 0.6.0 (2026-04-11)
 
 Real-deployment feedback pass, three waves. Running pagefault behind

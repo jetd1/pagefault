@@ -42,7 +42,9 @@ type ServerConfig struct {
 // MCPConfig configures the MCP transports and initialize-time
 // metadata. Both transports are served from the same MCPServer (and
 // therefore the same tool registrations); this struct just gates the
-// legacy-SSE pair and lets operators override the instructions text.
+// legacy-SSE pair, lets operators override the instructions text, and
+// exposes the SSE keepalive knobs that prevent intermediate proxies
+// from closing long-lived streams during a slow pf_fault call.
 type MCPConfig struct {
 	// SSEEnabled toggles the legacy-SSE transport (GET /sse + POST
 	// /message) alongside the streamable-http transport at /mcp.
@@ -57,6 +59,29 @@ type MCPConfig struct {
 	// tools vs the built-ins. Empty means "use the built-in default
 	// from internal/tool.DefaultInstructions".
 	Instructions string `yaml:"instructions,omitempty"`
+	// SSEKeepAlive toggles periodic JSON-RPC ping events on the
+	// persistent GET /sse stream. Without keepalives, a long-running
+	// tool call (e.g. a 60-120s pf_fault) leaves the SSE connection
+	// idle the whole time and any intermediate proxy (nginx
+	// proxy_read_timeout default 60s, Node undici headersTimeout
+	// default 60s, …) may close the connection before the tool's
+	// reply arrives. With keepalives enabled, pagefault emits a
+	// `ping` event on a ticker so the connection stays active from
+	// the proxy's perspective. Nil (unset) defaults to **true** —
+	// the fix is purely additive (a few bytes every N seconds per
+	// client) and the failure mode without it is hard to diagnose.
+	// Explicit false opts out, e.g. for operators who want to
+	// minimise traffic or who serve an SSE client that chokes on
+	// unsolicited pings.
+	SSEKeepAlive *bool `yaml:"sse_keepalive,omitempty"`
+	// SSEKeepAliveIntervalSeconds is the ticker interval for the
+	// keepalive pings described on SSEKeepAlive. Zero means "use
+	// pagefault's safe default of 15 seconds", which is longer than
+	// mcp-go's 10-second default but still comfortably under the
+	// common 30 / 60 second proxy idle timeouts. Positive values
+	// override the default; values below 1 are rounded up to 1.
+	// Ignored when SSEKeepAlive is explicitly false.
+	SSEKeepAliveIntervalSeconds int `yaml:"sse_keepalive_interval_seconds,omitempty"`
 }
 
 // SSEEnabledOrDefault returns whether the SSE transport should be
@@ -66,6 +91,28 @@ func (m MCPConfig) SSEEnabledOrDefault() bool {
 		return true
 	}
 	return *m.SSEEnabled
+}
+
+// SSEKeepAliveOrDefault returns whether the SSE transport should
+// emit keepalive pings, defaulting to true when the field is unset.
+// The failure mode without keepalives (intermediate proxies closing
+// idle connections during long tool calls) is bad enough that we
+// make the fix opt-out rather than opt-in.
+func (m MCPConfig) SSEKeepAliveOrDefault() bool {
+	if m.SSEKeepAlive == nil {
+		return true
+	}
+	return *m.SSEKeepAlive
+}
+
+// SSEKeepAliveIntervalOrDefault returns the keepalive ticker
+// interval in seconds, defaulting to 15 when the field is zero or
+// unset. Values below 1 are clamped to 1.
+func (m MCPConfig) SSEKeepAliveIntervalOrDefault() int {
+	if m.SSEKeepAliveIntervalSeconds <= 0 {
+		return 15
+	}
+	return m.SSEKeepAliveIntervalSeconds
 }
 
 // CORSConfig configures Cross-Origin Resource Sharing headers for the REST

@@ -105,6 +105,21 @@ func New(cfg *config.Config, d *dispatcher.ToolDispatcher, authP auth.AuthProvid
 		if cfg.Server.PublicURL != "" {
 			sseOpts = append(sseOpts, mcpserver.WithBaseURL(cfg.Server.PublicURL))
 		}
+		// Keepalive pings keep the persistent GET /sse stream from
+		// going idle during a long pf_fault call. Without this,
+		// intermediate proxies (nginx proxy_read_timeout default 60s,
+		// Node undici headersTimeout 60s, Cloudflare free 100s, …)
+		// close the connection while the subagent is still running,
+		// and the caller sees a "几十秒就挂" failure well before the
+		// configured timeout_seconds fires. Opt-out via
+		// server.mcp.sse_keepalive: false.
+		if cfg.Server.MCP.SSEKeepAliveOrDefault() {
+			interval := time.Duration(cfg.Server.MCP.SSEKeepAliveIntervalOrDefault()) * time.Second
+			sseOpts = append(sseOpts,
+				mcpserver.WithKeepAlive(true),
+				mcpserver.WithKeepAliveInterval(interval),
+			)
+		}
 		sseSrv = mcpserver.NewSSEServer(mcpSrv, sseOpts...)
 	}
 
