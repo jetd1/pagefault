@@ -274,6 +274,56 @@ List available subagents (names + descriptions). Allows clients to know which ag
 ]
 ```
 
+### 5.7 `write`
+
+Write content back to memory. Supports two modes: **direct append** (fast, zero-token, for simple entries) and **agent writeback** (spawns a subagent to intelligently decide where and how to write).
+
+**Design rationale:** External agents often generate insights worth persisting — e.g., "Fixed auth bug" to daily notes, or "Jet prefers X" to long-term memory. Direct append covers the 80% case (fixed format, known location). Agent writeback covers the 20% case (needs judgment about where to write, how to format, whether to merge with existing content).
+
+**Input:**
+- `uri` (string, required for `mode: "direct"`) — target resource URI (e.g. `memory://memory/2026-04-10.md`)
+- `content` (string, required) — the content to write
+- `mode` (string, required) — `"direct"` | `"agent"`
+- `format` (string, optional, default `"entry"`) — only for `mode: "direct"`:
+  - `"entry"` — auto-wrap as a timestamped entry: `\n---\n## [HH:MM] via pagefault\n\n{content}\n`
+  - `"raw"` — append content as-is (requires `write_mode: "any"` in config)
+- `agent` (string, optional) — which subagent to use for `mode: "agent"` (default: first configured)
+- `target` (string, optional, default `"auto"`) — only for `mode: "agent"`: hint for the subagent
+  - `"auto"` — subagent reads existing files and decides the best location
+  - `"daily"` — write to today's daily note
+  - `"long-term"` — write to MEMORY.md or equivalent
+  - `"self-improving"` — write to self-improving domain
+  - Any custom string — passed as-is to the subagent as a hint
+
+**Output (mode: "direct"):**
+```json
+{
+  "status": "written",
+  "uri": "memory://memory/2026-04-10.md",
+  "bytes_written": 142,
+  "mode": "direct",
+  "format": "entry"
+}
+```
+
+**Output (mode: "agent"):**
+```json
+{
+  "status": "written",
+  "agent": "wocha",
+  "elapsed_seconds": 23.5,
+  "result": "Appended to memory/2026-04-10.md as a new entry under 'OpenClaw Debugging' section.",
+  "targets_written": ["memory://memory/2026-04-10.md"]
+}
+```
+
+**Error cases:**
+- Backend is not writable → `403 AccessViolation: backend is read-only`
+- URI not in `write_paths` allowlist → `403 AccessViolation: write path not allowed`
+- Content exceeds `max_entry_size` → `413 ContentTooLarge: entry exceeds max_entry_size`
+- `format: "raw"` but `write_mode` is `"append"` → `400 InvalidRequest: raw format requires write_mode: any`
+- Subagent times out → `504 SubagentTimeout: agent writeback timed out`
+
 ## 6. Configuration Schema
 
 The entire server is driven by a single YAML file. This is the *contract* — the server is just a runtime for it.
@@ -327,6 +377,19 @@ backends:
       "USER.md": ["config", "bootstrap", "profile"]
     # Sandbox: never serve files outside root, even with symlinks
     sandbox: true
+    # ── Write config (all optional, defaults to read-only) ──
+    writable: true
+    # Only these URI patterns are allowed for writes (glob matching)
+    write_paths:
+      - "memory://memory/20*.md"        # daily notes
+      - "memory://memory/todos.md"      # todos
+      - "memory://MEMORY.md"            # long-term memory
+    # Write mode: "append" (only append) | "any" (append, prepend, overwrite)
+    write_mode: "append"
+    # Maximum single entry size in characters
+    max_entry_size: 2000
+    # File locking: "flock" (POSIX) | "none" (no locking, not recommended for writable backends)
+    file_locking: "flock"
 
   - name: self-improving
     type: filesystem
@@ -451,6 +514,7 @@ tools:
   read: true
   deep_retrieve: true
   list_agents: true
+  write: true  # writeback support (direct append + agent writeback)
 
 # ── Filters ─────────────────────────────────────
 # Optional. Can be disabled entirely with `enabled: false`.
@@ -546,16 +610,20 @@ page-fault/
 │   │   ├── search.go
 │   │   ├── read.go
 │   │   ├── deep_retrieve.go
-│   │   └── list_agents.go
+│   │   ├── list_agents.go
+│   │   └── write.go             # Direct append + agent writeback
 │   ├── backend/                 # Backend interface + registry
 │   │   ├── backend.go           # Backend, Resource, SearchResult interfaces
-│   │   ├── filesystem.go        # Local filesystem backend
+│   │   ├── filesystem.go        # Local filesystem backend (with write support)
 │   │   ├── subprocess.go        # Shell command backend (e.g., ripgrep)
 │   │   ├── http.go              # HTTP API backend
 │   │   └── subagent/            # Subagent backends
 │   │       ├── subagent.go      # SubagentBackend interface
 │   │       ├── cli.go           # CLI-based subagent spawning
 │   │       └── http.go          # HTTP-based subagent spawning
+│   ├── write/                   # Write pipeline (append, format, lock)
+│   │   ├── writer.go           # Writer interface + FilesystemWriter
+│   │   └── format.go           # Entry formatting (timestamped entry, raw)
 │   └── model/                   # Shared data types
 │       └── model.go
 │
@@ -636,7 +704,7 @@ Why Go over Python:
 
 ### Phase 3 — Polish + Production
 
-1. `filters.py` — `RedactionFilter` (regex-based content redaction)
+1. `internal/filter/filter.go` — `RedactionFilter` (regex-based content redaction)
 2. Context formats: JSON, markdown-with-metadata
 3. OpenAPI spec at `/api/openapi.json` (for ChatGPT Actions)
 4. Graceful degradation when backends are unreachable
@@ -646,7 +714,52 @@ Why Go over Python:
 8. CORS config
 9. README.md with setup guide for Claude Code, Claude Desktop, ChatGPT
 
-### Phase 4 — Hardening
+### Phase 4 — Writeback (Read-Write)
+
+Adding `write` tool with two modes: direct append and agent writeback.
+
+**4a. Direct append (filesystem backend write support):**
+
+1. `internal/write/writer.go` — `Writer` interface + `FilesystemWriter` implementation
+   - `Append(ctx, uri, content) error` — atomic append with file locking (`flock`)
+   - `WriteMode` enum: `AppendOnly`, `Any` (append, prepend, overwrite)
+   - Validates URI against `write_paths` allowlist before writing
+   - Enforces `max_entry_size` limit
+   - Uses `os.OpenFile` with `O_APPEND|O_WRONLY` for atomic appends
+2. `internal/write/format.go` — Entry formatting
+   - `FormatEntry(content, format, caller) string` — wraps content as timestamped entry
+   - `"entry"` format: `\n---\n## [HH:MM] via pagefault\n\n{content}\n`
+   - `"raw"` format: content as-is (requires `write_mode: "any"`)
+3. `internal/tool/write.go` — `write` tool handler for `mode: "direct"`
+4. `internal/backend/filesystem.go` — extend with write support
+   - `Writable() bool`, `WritePaths() []string`, `WriteMode() WriteMode`, `MaxEntrySize() int`
+   - `Write(ctx, uri, content) error` — delegates to `FilesystemWriter`
+5. `internal/config/config.go` — add `Writable`, `WritePaths`, `WriteMode`, `MaxEntrySize`, `FileLocking` fields to `FilesystemBackendConfig`
+6. `internal/filter/filter.go` — extend `PathFilter` with write-specific allowlist (`write_paths`)
+   - Read allowlist and write allowlist are separate (you can read broadly but write narrowly)
+7. `internal/audit/audit.go` — log write operations with content hash (not full content)
+8. Tests: `internal/write/writer_test.go`, `internal/write/format_test.go`, `internal/tool/write_test.go`
+9. Update `configs/openclaw.yaml` with writable filesystem backend config
+
+**4b. Agent writeback (subagent-assisted):**
+
+1. Extend `internal/tool/write.go` — handle `mode: "agent"`
+   - Compose subagent task: `"A remote agent wants to record the following to memory: '{content}'. Target: {target}. Read the relevant memory files, decide the best location, and write it appropriately. Follow existing file conventions."`
+   - Spawn subagent via `SubagentBackend.Spawn()`
+   - Return subagent's response to the caller
+2. The subagent itself uses its own write capabilities (it has full workspace access, not constrained by pagefault's write_paths). pagefault's `write_paths` only gates the `mode: "direct"` path — agent mode delegates trust to the subagent.
+3. Tests: `internal/tool/write_agent_test.go` with mock subagent backend
+
+**Security considerations for write:**
+- **Default is read-only.** `writable: false` unless explicitly enabled.
+- **Write allowlist is separate from read allowlist.** Even if a backend is writable, only `write_paths` URIs accept writes.
+- **Append-only by default.** `write_mode: "append"` prevents overwrites. `write_mode: "any"` must be explicitly configured.
+- **Size limit.** `max_entry_size` prevents dumping large content.
+- **File locking.** `flock` prevents race conditions when Cha and Claude Code write simultaneously.
+- **Agent mode trusts the subagent.** The subagent has its own write constraints (workspace rules, AGENTS.md). pagefault doesn't re-validate agent writes.
+- **Audit.** Every write is logged (who, what URI, how many bytes, mode).
+
+### Phase 5 — Hardening
 
 1. OAuth2 auth provider
 2. Caching layer (LRU in-process, or Redis)
@@ -667,6 +780,7 @@ Each MCP tool maps to a REST endpoint:
 | `read` | `/api/read` | POST |
 | `deep_retrieve` | `/api/deep_retrieve` | POST |
 | `list_agents` | `/api/list_agents` | POST |
+| `write` | `/api/write` | POST |
 
 All accept JSON bodies matching the MCP tool input schemas. All return JSON.
 
@@ -681,6 +795,17 @@ OpenAPI spec available at `/api/openapi.json` — paste this URL into ChatGPT Cu
 ### Threat: Path traversal
 - **Mitigation:** Filesystem backend enforces `sandbox: true` — resolves symlinks, rejects paths outside `root`
 - URI scheme mapping prevents arbitrary filesystem access
+
+### Threat: Unauthorized writes
+- **Mitigation:** Backends default to `writable: false`; must be explicitly enabled
+- Separate `write_paths` allowlist — even writable backends only accept writes to explicitly listed URIs
+- `write_mode: "append"` by default — prevents overwriting existing content
+- `max_entry_size` limits individual write payloads
+- `format: "entry"` auto-wraps content with timestamp, preventing raw injection into file headers
+- `format: "raw"` requires `write_mode: "any"` — an additional opt-in gate
+- File locking (`flock`) prevents race conditions from concurrent writers
+- Agent writeback (`mode: "agent"`) delegates to a subagent that has its own safety constraints
+- All writes are audit-logged
 
 ### Threat: Sensitive data exposure
 - **Mitigation:** `filters.path.deny` blocks specific URIs (e.g., intimate.md, financial details)
@@ -703,6 +828,8 @@ OpenAPI spec available at `/api/openapi.json` — paste this URL into ChatGPT Cu
 2. **mcp-go streamable-http integration:** How to mount mcp-go's streamable-http handler on a chi sub-router at `/mcp`? Verify the handler implements `http.Handler` and can be mounted cleanly.
 3. **Context response format:** Should contexts default to `text/markdown` (raw concatenation) or `application/json` (structured with metadata)? Leaning markdown for simplicity, JSON as opt-in.
 4. **Search result merging:** When multiple backends return search results, how to merge/rank? Simple: interleave by backend, no cross-backend scoring. Can be improved later.
+5. **Write concurrency:** When Cha (via OpenClaw) and an external agent (via pagefault) write to the same daily note simultaneously, `flock` serializes the writes but the entry order depends on who acquires the lock first. Is this acceptable, or do we need a write queue with ordering guarantees?
+6. **Agent writeback trust boundary:** `mode: "agent"` bypasses pagefault's `write_paths` allowlist because the subagent writes directly to the filesystem (not through pagefault). Should pagefault validate the subagent's write result against `write_paths`, or fully trust the subagent's judgment? Leaning toward full trust — the subagent already has workspace-level access.
 
 ## 14. For Claude Code: How to Start
 
