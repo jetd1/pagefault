@@ -2,6 +2,117 @@
 
 > When your agent hits a context miss, pagefault loads the right page back in.
 
+## 0. Development Guide
+
+This section is **required reading** for anyone (human or AI) contributing to pagefault.
+
+### Documentation Requirements
+
+**README.md** — Always keep up to date. Must contain:
+- One-paragraph description and the pagefault metaphor
+- Quick start (build, configure, run)
+- The 3 most recent changelog entries (synced from CHANGELOG.md)
+- Link to full docs in `docs/`
+
+**CLAUDE.md** — The AI-assistant development guide (like this section, but as a standalone file). Must contain:
+- Quick reference: build commands, test commands, directory tree
+- File-level TLDR for every file in the repo (one line each) — this is the primary navigation aid for agents
+- Architecture overview (condensed from plan.md)
+- Common development tasks (add a backend, add a tool, add a filter)
+- Conventions and rules
+
+**Update CLAUDE.md whenever:**
+- A new file is created or deleted
+- A package's responsibility changes
+- A new development pattern is established
+- The directory tree changes
+
+### Documentation in `docs/`
+
+All non-trivial subsystems get their own doc in `docs/`. Required docs:
+
+| File | Content |
+|------|---------|
+| `docs/api-doc.md` | Full MCP + REST tool reference: every tool's input schema, output schema, error cases, and example request/response. Auto-generated sections are acceptable if kept in sync. |
+| `docs/config-doc.md` | Full YAML config reference: every field, type, default, and description. Group by section (server, auth, backends, contexts, tools, filters, audit). Include at least one complete example per backend type. |
+| `docs/architecture.md` | Architecture deep dive: request flow, backend plugin model, filter pipeline, auth layer, transport details. Diagrams welcome. |
+| `docs/security.md` | Security model: threat model, auth mechanisms, filter behavior, write safety, audit format. |
+
+Update the relevant doc whenever the corresponding code changes. Stale docs are worse than no docs.
+
+### Directory Tree in CLAUDE.md
+
+Maintain a full directory tree with one-line TLDRs in CLAUDE.md. Format:
+
+```
+page-fault/
+├── cmd/pagefault/main.go          # CLI entry point: serve, token subcommands
+├── internal/
+│   ├── server/server.go           # HTTP server: chi router, MCP + REST mounts
+│   ├── config/config.go           # Config structs, YAML loader, env substitution
+│   ... (every file)
+```
+
+This is the **first thing** an agent reads to orient itself. Keep it accurate.
+
+### Versioning and Changelog
+
+- Version is in a `VERSION` file at repo root (single line, e.g., `0.1.0`) and echoed by the binary (`pagefault --version`).
+- **Bump the version before every commit that changes behavior:**
+  - Bug fixes, minor tweaks, small refactors: **patch** bump (e.g., `0.1.0` → `0.1.1`)
+  - New features, new tools, new config fields, new backends: **minor** bump (e.g., `0.1.1` → `0.2.0`)
+  - **Never** bump the major version unless explicitly asked.
+- **Update `CHANGELOG.md`** whenever the version changes. Add an entry under `## X.Y.Z (YYYY-MM-DD)` with `### Added`, `### Changed`, `### Removed`, `### Fixed` subsections as appropriate.
+- **Always document breaking changes**: renamed config fields, removed tools, changed response shapes. Include migration guidance (old → new).
+- **Before bumping the version**, run a full check:
+  1. `make test` passes
+  2. `make lint` passes
+  3. All `.md` files are up to date (README, CLAUDE.md, docs/api-doc.md, docs/config-doc.md, CHANGELOG.md)
+  4. Directory tree in CLAUDE.md matches reality
+  5. Version string in `VERSION` matches the changelog entry
+- **Keep the 3 most recent changelog entries in `README.md`** under a "Recent Changes" section.
+
+### Testing
+
+- **Every phase must have tests before it's considered complete.** No exceptions.
+- Tests live alongside source files (`internal/backend/filesystem_test.go`).
+- **Minimum test coverage per module:**
+  - Config: parse valid YAML, reject invalid YAML, env substitution, default values
+  - Backends: read, search, list, sandbox enforcement, glob matching, error cases
+  - Auth: valid token, invalid token, expired token, missing header, none mode
+  - Filters: allow/deny globs, tag matching, redaction regex, disabled filters pass-through
+  - Tools: input validation, dispatch to correct backend, error formatting
+  - Server: health endpoint, MCP mount responds, REST mount responds, auth middleware rejects
+  - Write: append, format entry, flock behavior, write_paths enforcement, max_entry_size
+- **Integration tests** use `httptest.NewServer` — spin up the full server with a test config, call tools via HTTP, verify responses.
+- **Table-driven tests** preferred (idiomatic Go): `[]struct{ name, input, want }`.
+- **Test data** goes in `testdata/` directories alongside test files. Do not use `/tmp` for test fixtures.
+- Run `make test` before every commit.
+
+### Code Conventions
+
+- **Go style**: `gofmt`, `go vet`, `staticcheck` must pass. Run `make lint`.
+- **Interfaces**: accept interfaces, return concrete structs.
+- **Context**: `context.Context` as first param in all methods that do I/O or could block.
+- **Errors**: use `fmt.Errorf("...: %w", err)` for wrapping. Use sentinel errors (`var ErrX = errors.New(...)`) for programmatic checks. Check with `errors.Is` / `errors.As`.
+- **Logging**: use `log/slog` (structured logging). No `fmt.Println` in library code.
+- **Naming**: Go conventions — `NewFilesystemBackend`, not `CreateFilesystemBackend`. Acronyms are all-caps (`URI`, `HTTP`), not `Uri`, `Http`.
+- **Comments**: Godoc on all exported types and functions. Package-level doc comment in every package.
+- **Commits**: conventional commits (`feat:`, `fix:`, `refactor:`, `docs:`, `test:`, `chore:`). Append `Co-Authored-By:` trailer as appropriate.
+
+### What NOT to Do
+
+- Do NOT import anything from OpenClaw, Hermes, or any deployment-specific package
+- Do NOT hardcode any paths, URLs, IPs, or user identifiers in code
+- Do NOT assume a specific OS, shell, or filesystem layout
+- Do NOT add caching in Phase 1 (YAGNI)
+- Do NOT add streaming responses in Phase 1
+- Do NOT build Docker/systemd/Caddy configs — that's post-deploy infra, not part of the binary
+- Do NOT skip writing tests
+- Do NOT change config schema without updating docs/config-doc.md
+- Do NOT add a tool without updating docs/api-doc.md
+- When in doubt, make it configurable rather than hardcoded
+
 ## 1. What Is This
 
 pagefault is a **config-driven memory server** that exposes personal knowledge (files, search indices, agent sessions) to external AI clients via **MCP** and **OpenAPI** transports.
@@ -583,6 +694,9 @@ Both transports dispatch to the **same** `ToolDispatcher` — zero logic duplica
 
 ```
 page-fault/
+├── CLAUDE.md                    # AI-assistant dev guide (directory tree + TLDR)
+├── CHANGELOG.md                 # Version history
+├── VERSION                      # Current version (single line)
 ├── plan.md                      # This file
 ├── README.md                    # Quick start guide
 ├── go.mod                       # Go module definition
@@ -627,6 +741,12 @@ page-fault/
 │   └── model/                   # Shared data types
 │       └── model.go
 │
+├── docs/
+│   ├── api-doc.md               # Full MCP + REST tool reference
+│   ├── config-doc.md            # Full YAML config reference
+│   ├── architecture.md          # Architecture deep dive
+│   └── security.md              # Security model and threat analysis
+│
 ├── configs/
 │   ├── minimal.yaml             # Smallest working config (single dir, no auth)
 │   └── openclaw.yaml            # Full config for Jet's OpenClaw setup
@@ -636,12 +756,6 @@ page-fault/
 │
 └── Makefile                    # Build, test, lint targets
 ```
-
-Key Go conventions:
-- `cmd/pagefault/` for the CLI binary
-- `internal/` for all library code (not importable by external packages)
-- Each package has a single primary type/file (e.g., `internal/backend/filesystem.go`)
-- Tests live alongside source: `internal/backend/filesystem_test.go`
 
 ## 9. Tech Stack
 
@@ -701,6 +815,10 @@ Why Go over Python:
 8. `configs/openclaw.yaml` — Full production config
 9. Timeout handling with `context.WithTimeout`, `Process.Kill` on expiry, partial result capture
 10. Tests for each new backend + tool
+11. Update `docs/api-doc.md` with `deep_retrieve` and `list_agents`
+12. Update `docs/config-doc.md` with new backend types
+13. Update `CLAUDE.md` directory tree and file TLDRs
+14. Version bump + CHANGELOG
 
 ### Phase 3 — Polish + Production
 
@@ -713,6 +831,8 @@ Why Go over Python:
 7. Rate limiting (configurable per-caller)
 8. CORS config
 9. README.md with setup guide for Claude Code, Claude Desktop, ChatGPT
+10. Update all docs (`api-doc.md`, `config-doc.md`, `security.md`)
+11. Version bump + CHANGELOG
 
 ### Phase 4 — Writeback (Read-Write)
 
@@ -740,6 +860,11 @@ Adding `write` tool with two modes: direct append and agent writeback.
 7. `internal/audit/audit.go` — log write operations with content hash (not full content)
 8. Tests: `internal/write/writer_test.go`, `internal/write/format_test.go`, `internal/tool/write_test.go`
 9. Update `configs/openclaw.yaml` with writable filesystem backend config
+10. Update `docs/api-doc.md` with `write` tool
+11. Update `docs/config-doc.md` with write-related config fields
+12. Update `docs/security.md` with write threat model
+13. Update `CLAUDE.md` directory tree
+14. Version bump + CHANGELOG
 
 **4b. Agent writeback (subagent-assisted):**
 
@@ -767,6 +892,8 @@ Adding `write` tool with two modes: direct append and agent writeback.
 4. Metrics endpoint (Prometheus)
 5. Docker image
 6. systemd unit file example
+7. Update all docs
+8. Version bump + CHANGELOG
 
 ## 11. OpenAPI Endpoint Mapping (for ChatGPT Actions)
 
@@ -835,26 +962,28 @@ OpenAPI spec available at `/api/openapi.json` — paste this URL into ChatGPT Cu
 
 ### Before writing any code
 
-1. **Read this entire `plan.md`** carefully. It is the spec.
-2. **Read `configs/minimal.yaml`** once it exists for a concrete example.
-3. If anything is ambiguous, **write questions to `questions.md`** rather than guessing. You can ask the human.
-4. Do NOT introduce any dependency on OpenClaw, Hermes, or any specific infrastructure in the core code. The framework is generic. All specificity goes in config files.
+1. **Read Section 0 (Development Guide)** of this file. It defines all conventions.
+2. **Read this entire `plan.md`** carefully. It is the spec.
+3. **Read `configs/minimal.yaml`** once it exists for a concrete example.
+4. If anything is ambiguous, **write questions to `questions.md`** rather than guessing. You can ask the human.
+5. Do NOT introduce any dependency on OpenClaw, Hermes, or any specific infrastructure in the core code. The framework is generic. All specificity goes in config files.
 
 ### Build order (strict)
 
 Follow this order. Each step should produce working, testable code before moving to the next.
 
-1. **Project scaffold** — `go.mod`, `cmd/pagefault/main.go`, `internal/` directory structure, `Makefile` with `build`, `test`, `lint` targets
-2. **`internal/config/config.go`** — Go structs with YAML tags + validator tags matching the schema above. YAML loader with `${ENV_VAR}` substitution. Validate against `configs/minimal.yaml`.
+0. **Create CLAUDE.md** — Initial version with directory tree (even if mostly `# TODO`), quick reference (build/test commands), and placeholder file TLDRs. **Update this file every time you create a new file.**
+1. **Project scaffold** — `go.mod`, `cmd/pagefault/main.go`, `internal/` directory structure, `Makefile` with `build`, `test`, `lint` targets. Create `VERSION` (`0.1.0`), `CHANGELOG.md`, `.gitignore`.
+2. **`internal/config/config.go`** — Go structs with YAML tags + validator tags matching the schema in Section 6. YAML loader with `${ENV_VAR}` substitution. Validate against `configs/minimal.yaml`.
 3. **`internal/backend/backend.go`** — `Backend`, `Resource`, `SearchResult` types + interface. Pure interfaces, no implementation.
 4. **`internal/backend/filesystem.go`** — Filesystem backend. This is the first real backend and the most important one to get right. Must handle: glob include/exclude, sandbox (no path traversal via `filepath.EvalSymlinks`), URI scheme ↔ filesystem path mapping, auto-tagging, line-range reads, directory listing.
 5. **`internal/auth/auth.go`** — `AuthProvider` interface, `BearerTokenAuth`, `NoneAuth`. Token file format: JSONL, one JSON object per line.
 6. **`internal/filter/filter.go`** — `CompositeFilter`, `PathFilter` (allow/deny with glob), `TagFilter`. All optional, can be disabled.
-7. **`internal/audit/audit.go`** — Simple JSONL logger. Each entry: timestamp, caller_id, caller_label, tool, args (sanitized), duration_ms, result_size, error (if any).
+7. **`internal/audit/audit.go`** — JSONL logger using `log/slog` underneath. Each entry: timestamp, caller_id, caller_label, tool, args (sanitized), duration_ms, result_size, error (if any).
 8. **`internal/dispatcher/dispatcher.go`** — `ToolDispatcher`: holds backends, contexts, filters, audit logger. Methods for each tool that route to the right backend(s).
 9. **`internal/tool/`** — One file per tool. Each registers an MCP tool handler. Keep tool logic thin — the dispatcher does the routing, the tool handler does MCP input/output formatting.
 10. **`internal/server/server.go`** — chi router. Mount mcp-go streamable-http handler on `/mcp`. Mount REST routes on `/api`. Wire up auth middleware. Health endpoint.
-11. **`cmd/pagefault/main.go`** — `pagefault serve --config <path> [--host] [--port]`, `pagefault token create --label <label>`, `pagefault token ls`, `pagefault token revoke <id>`.
+11. **`cmd/pagefault/main.go`** — `pagefault serve --config <path> [--host] [--port]`, `pagefault token create --label <label>`, `pagefault token ls`, `pagefault token revoke <id>`, `pagefault --version`.
 12. **`configs/minimal.yaml`** — Smallest working config:
     ```yaml
     server:
@@ -884,14 +1013,19 @@ Follow this order. Each step should produce working, testable code before moving
       enabled: true
       log_path: "/tmp/pagefault-audit.jsonl"
     ```
-13. **Tests** — Write tests alongside each module. Minimum: `test_config.py`, `test_backends_filesystem.py`, `test_filters.py`, `test_auth.py`, `test_server.py`.
+13. **Tests** — Write tests alongside each module (`_test.go`). Minimum: config, filesystem backend, filters, auth, server integration.
 14. **Smoke test** — `pagefault serve --config configs/minimal.yaml` → verify `/health` returns 200 → verify MCP client can connect and call `list_contexts`.
+15. **Docs** — Create `docs/api-doc.md` (Phase 1 tools only), `docs/config-doc.md` (full schema), `docs/architecture.md` (condensed from plan.md), initial `CLAUDE.md` with directory tree + file TLDRs.
+16. **Version** — Create `VERSION` file (`0.1.0`), `CHANGELOG.md` with initial entry.
 
 ### Style & conventions
+
+See **Section 0 (Development Guide)** for the full list. Key points:
 
 - Use `context.Context` as first param in all backend/tool methods (idiomatic Go)
 - Define clear interfaces; accept interfaces, return structs
 - Use `errors.Is` / `errors.As` for error handling, not type assertions
+- Use `log/slog` for structured logging (no `fmt.Println` in library code)
 - Godoc on all exported types and functions
 - Error types:
   ```go
@@ -903,18 +1037,12 @@ Follow this order. Each step should produce working, testable code before moving
   )
   ```
 - Commit messages: conventional commits style. Append `Co-Authored-By: Cha <cha@jetd.one> via OpenClaw` on every commit if spawned by Cha, or the appropriate co-author tag.
-- Run `go vet`, `staticcheck`, and `gofmt` before committing.
+- Run `make lint` (go vet + staticcheck + gofmt) before committing.
+- **Bump version and update CHANGELOG.md before every behavioral commit.** See Section 0 for the full pre-bump checklist.
 
 ### What NOT to do
 
-- Do NOT import anything from OpenClaw, Hermes, or any local package
-- Do NOT hardcode any paths, URLs, or user IDs
-- Do NOT assume a specific OS or shell
-- Do NOT add caching in Phase 1 (YAGNI)
-- Do NOT add streaming responses in Phase 1
-- Do NOT build Docker/systemd/Caddy configs — that's post-deploy infra
-- Do NOT skip writing tests
-- When in doubt, make it configurable rather than hardcoded
+See **Section 0 (Development Guide)** for the full list.
 
 ## 15. Relationship to OpenClaw (Informative Only)
 
