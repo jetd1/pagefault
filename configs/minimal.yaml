@@ -1,0 +1,50 @@
+# Smallest working pagefault config.
+# Serves markdown files from ./demo-data over HTTP with no auth.
+# Start with:  pagefault serve --config configs/minimal.yaml
+#
+# Then try:
+#   curl -s localhost:8444/health | jq
+#   curl -s -X POST localhost:8444/api/list_contexts | jq
+#   curl -s -X POST localhost:8444/api/search      -d '{"query":"pagefault"}' | jq
+#   curl -s -X POST localhost:8444/api/read        -d '{"uri":"memory://README.md"}' | jq
+#   curl -s -X POST localhost:8444/api/get_context -d '{"name":"demo"}' | jq
+
+server:
+  host: "127.0.0.1"
+  port: 8444
+
+auth:
+  mode: "none"
+
+backends:
+  - name: fs
+    type: filesystem
+    root: "./demo-data"
+    include: ["**/*.md"]
+    exclude: []
+    uri_scheme: "memory"
+    sandbox: true
+    auto_tag:
+      "**/*.md": ["demo", "markdown"]
+
+contexts:
+  - name: demo
+    description: "Demo context: the README from demo-data"
+    sources:
+      - backend: fs
+        uri: "memory://README.md"
+    format: markdown
+    max_size: 4000
+
+tools:
+  list_contexts: true
+  get_context: true
+  search: true
+  read: true
+
+filters:
+  enabled: false
+
+audit:
+  enabled: true
+  mode: "stdout"

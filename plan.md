@@ -45,7 +45,7 @@ Update the relevant doc whenever the corresponding code changes. Stale docs are 
 Maintain a full directory tree with one-line TLDRs in CLAUDE.md. Format:
 
 ```
-page-fault/
+pagefault/
 ├── cmd/pagefault/main.go          # CLI entry point: serve, token subcommands
 ├── internal/
 │   ├── server/server.go           # HTTP server: chi router, MCP + REST mounts
@@ -693,7 +693,7 @@ Both transports dispatch to the **same** `ToolDispatcher` — zero logic duplica
 ## 8. Project Structure
 
 ```
-page-fault/
+pagefault/
 ├── CLAUDE.md                    # AI-assistant dev guide (directory tree + TLDR)
 ├── CHANGELOG.md                 # Version history
 ├── VERSION                      # Current version (single line)
