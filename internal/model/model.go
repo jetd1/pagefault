@@ -50,4 +50,12 @@ var (
 	// ErrInvalidRequest indicates the request input was malformed or failed
 	// validation.
 	ErrInvalidRequest = errors.New("invalid request")
+
+	// ErrSubagentTimeout indicates a subagent (spawned via pf_fault) did
+	// not complete within the configured timeout.
+	ErrSubagentTimeout = errors.New("subagent timeout")
+
+	// ErrAgentNotFound indicates a pf_fault request named an agent that
+	// is not configured on any SubagentBackend.
+	ErrAgentNotFound = errors.New("agent not found")
 )

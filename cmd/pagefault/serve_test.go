@@ -77,17 +77,98 @@ func TestBuildDispatcher_Minimal(t *testing.T) {
 }
 
 func TestBuildDispatcher_UnsupportedBackend(t *testing.T) {
-	// Phase 1 only supports filesystem; anything else should surface a
-	// clear error from buildDispatcher.
+	// Any backend type the dispatcher builder doesn't know about must
+	// surface a clear error.
 	cfg := &config.Config{
 		Server: config.ServerConfig{Host: "127.0.0.1", Port: 8444},
 		Auth:   config.AuthConfig{Mode: "none"},
 		Backends: []config.BackendConfig{
-			{Name: "remote", Type: "http"},
+			{Name: "remote", Type: "telepath"},
 		},
 	}
 	_, _, err := buildDispatcher(cfg)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "unsupported type")
-	assert.Contains(t, err.Error(), "http")
+	assert.Contains(t, err.Error(), "telepath")
+}
+
+// TestBuildDispatcher_Phase2Backends loads a config that exercises every
+// Phase-2 backend type (subprocess, http, subagent-cli, subagent-http)
+// and verifies buildDispatcher wires them all without error. Uses only
+// the constructors — no network/process calls actually happen.
+func TestBuildDispatcher_Phase2Backends(t *testing.T) {
+	dir := t.TempDir()
+	dataDir := filepath.Join(dir, "data")
+	require.NoError(t, os.MkdirAll(dataDir, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(dataDir, "x.md"), []byte("x\n"), 0o600))
+
+	yaml := "" +
+		"server:\n" +
+		"  host: \"127.0.0.1\"\n" +
+		"  port: 8444\n" +
+		"auth:\n" +
+		"  mode: \"none\"\n" +
+		"backends:\n" +
+		"  - name: fs\n" +
+		"    type: filesystem\n" +
+		"    root: \"" + dataDir + "\"\n" +
+		"    include: [\"**/*.md\"]\n" +
+		"    uri_scheme: \"memory\"\n" +
+		"    sandbox: true\n" +
+		"  - name: rg\n" +
+		"    type: subprocess\n" +
+		"    command: \"echo {query}\"\n" +
+		"    parse: \"plain\"\n" +
+		"    timeout: 5\n" +
+		"  - name: lcm\n" +
+		"    type: http\n" +
+		"    base_url: \"http://127.0.0.1:65535\"\n" +
+		"    search:\n" +
+		"      path: \"/search\"\n" +
+		"      body_template: '{\"q\":\"{query}\"}'\n" +
+		"      response_path: \"results\"\n" +
+		"  - name: sa_cli\n" +
+		"    type: subagent-cli\n" +
+		"    command: \"echo hi\"\n" +
+		"    timeout: 10\n" +
+		"    agents:\n" +
+		"      - id: alpha\n" +
+		"        description: \"cli agent\"\n" +
+		"  - name: sa_http\n" +
+		"    type: subagent-http\n" +
+		"    base_url: \"http://127.0.0.1:65535\"\n" +
+		"    spawn:\n" +
+		"      path: \"/agents/{agent_id}/run\"\n" +
+		"      body_template: '{\"task\":\"{task}\"}'\n" +
+		"      response_path: \"result\"\n" +
+		"    agents:\n" +
+		"      - id: beta\n" +
+		"        description: \"http agent\"\n" +
+		"contexts: []\n" +
+		"tools:\n" +
+		"  pf_maps: true\n" +
+		"  pf_load: false\n" +
+		"  pf_fault: true\n" +
+		"  pf_ps: true\n" +
+		"filters:\n" +
+		"  enabled: false\n" +
+		"audit:\n" +
+		"  enabled: false\n"
+
+	cfgPath := filepath.Join(dir, "pagefault.yaml")
+	require.NoError(t, os.WriteFile(cfgPath, []byte(yaml), 0o600))
+
+	cfg, err := config.Load(cfgPath)
+	require.NoError(t, err)
+
+	d, closer, err := buildDispatcher(cfg)
+	require.NoError(t, err)
+	require.NotNil(t, d)
+	defer func() { _ = closer() }()
+
+	assert.ElementsMatch(t,
+		[]string{"fs", "rg", "lcm", "sa_cli", "sa_http"},
+		d.SortedBackendNames())
+	assert.True(t, d.ToolEnabled("pf_fault"))
+	assert.True(t, d.ToolEnabled("pf_ps"))
 }

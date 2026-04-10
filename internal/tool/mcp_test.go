@@ -11,6 +11,8 @@ import (
 
 	mcppkg "github.com/mark3labs/mcp-go/mcp"
 	mcpserver "github.com/mark3labs/mcp-go/server"
+
+	"github.com/jet/pagefault/internal/backend"
 )
 
 // ────────────────── result-helper tests ──────────────────
@@ -98,7 +100,7 @@ func textOf(t *testing.T, res *mcppkg.CallToolResult) string {
 
 func TestRegisterMCP_AllToolsRegistered(t *testing.T) {
 	srv := newMCPServerForTest(t)
-	for _, name := range []string{"pf_maps", "pf_load", "pf_scan", "pf_peek"} {
+	for _, name := range []string{"pf_maps", "pf_load", "pf_scan", "pf_peek", "pf_fault", "pf_ps"} {
 		assert.NotNil(t, srv.GetTool(name), "tool %q should be registered", name)
 	}
 }
@@ -205,4 +207,92 @@ func TestRegisterMCP_Read_UnknownURI(t *testing.T) {
 	res := callTool(t, srv, "pf_peek", map[string]any{"uri": "memory://nope.md"})
 	require.True(t, res.IsError)
 	assert.Contains(t, textOf(t, res), "resource not found")
+}
+
+// ────────────────── pf_fault / pf_ps MCP tests ──────────────────
+
+// newSubagentMCPServer builds an MCP server wired to a dispatcher that
+// contains a single stubSubagent. Shared by the pf_fault / pf_ps tests.
+func newSubagentMCPServer(t *testing.T, sa *stubSubagent) *mcpserver.MCPServer {
+	t.Helper()
+	d := makeSubagentDispatcher(t, sa)
+	srv := mcpserver.NewMCPServer("pagefault-test", "0.0.0",
+		mcpserver.WithToolCapabilities(true),
+	)
+	RegisterMCP(srv, d)
+	return srv
+}
+
+func TestRegisterMCP_ListAgents_Empty(t *testing.T) {
+	srv := newMCPServerForTest(t) // no subagent backend
+	res := callTool(t, srv, "pf_ps", nil)
+	assert.False(t, res.IsError)
+
+	var out ListAgentsOutput
+	require.NoError(t, json.Unmarshal([]byte(textOf(t, res)), &out))
+	assert.NotNil(t, out.Agents)
+	assert.Empty(t, out.Agents)
+}
+
+func TestRegisterMCP_ListAgents_Populated(t *testing.T) {
+	sa := &stubSubagent{
+		name: "cli",
+		agents: []backend.AgentInfo{
+			{ID: "alpha", Description: "primary"},
+			{ID: "beta", Description: "secondary"},
+		},
+	}
+	srv := newSubagentMCPServer(t, sa)
+
+	res := callTool(t, srv, "pf_ps", nil)
+	assert.False(t, res.IsError)
+
+	var out ListAgentsOutput
+	require.NoError(t, json.Unmarshal([]byte(textOf(t, res)), &out))
+	require.Len(t, out.Agents, 2)
+	assert.Equal(t, "alpha", out.Agents[0].ID)
+	assert.Equal(t, "primary", out.Agents[0].Description)
+	assert.Equal(t, "cli", out.Agents[0].Backend)
+}
+
+func TestRegisterMCP_DeepRetrieve_Success(t *testing.T) {
+	sa := &stubSubagent{
+		name:   "sa",
+		agents: []backend.AgentInfo{{ID: "alpha"}},
+		answer: "42",
+	}
+	srv := newSubagentMCPServer(t, sa)
+
+	res := callTool(t, srv, "pf_fault", map[string]any{
+		"query":           "what?",
+		"agent":           "alpha",
+		"timeout_seconds": float64(5),
+	})
+	assert.False(t, res.IsError)
+
+	var out DeepRetrieveOutput
+	require.NoError(t, json.Unmarshal([]byte(textOf(t, res)), &out))
+	assert.Equal(t, "42", out.Answer)
+	assert.Equal(t, "alpha", out.Agent)
+	assert.Equal(t, "sa", out.Backend)
+	assert.False(t, out.TimedOut)
+}
+
+func TestRegisterMCP_DeepRetrieve_MissingQuery(t *testing.T) {
+	sa := &stubSubagent{
+		name:   "sa",
+		agents: []backend.AgentInfo{{ID: "alpha"}},
+	}
+	srv := newSubagentMCPServer(t, sa)
+
+	res := callTool(t, srv, "pf_fault", map[string]any{})
+	require.True(t, res.IsError)
+	assert.Contains(t, textOf(t, res), "query is required")
+}
+
+func TestRegisterMCP_DeepRetrieve_NoSubagentConfigured(t *testing.T) {
+	srv := newMCPServerForTest(t) // only a fake/filesystem-like backend
+	res := callTool(t, srv, "pf_fault", map[string]any{"query": "hi"})
+	require.True(t, res.IsError)
+	assert.Contains(t, textOf(t, res), "agent not found")
 }

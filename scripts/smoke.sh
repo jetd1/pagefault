@@ -2,8 +2,11 @@
 # scripts/smoke.sh — End-to-end smoke test for pagefault.
 #
 # Starts the binary against configs/minimal.yaml, exercises every Phase-1
-# endpoint with curl, then stops the server. Fails (exit non-zero) on the
-# first unexpected status code or missing response field.
+# and Phase-2 endpoint with curl, then stops the server. Fails (exit
+# non-zero) on the first unexpected status code or missing response
+# field. Phase-2 endpoints are exercised with the empty-subagent case
+# (pf_ps returns []; pf_fault returns 404) because minimal.yaml does
+# not configure a subagent backend.
 
 set -euo pipefail
 
@@ -51,11 +54,17 @@ check() {
   echo "smoke: $label OK ($code)"
 }
 
-check "health"  "/health"
-check "pf_maps" "/api/pf_maps" "{}"
-check "pf_scan" "/api/pf_scan" '{"query":"pagefault"}'
-check "pf_peek" "/api/pf_peek" '{"uri":"memory://README.md"}'
-check "pf_load" "/api/pf_load" '{"name":"demo"}'
+check "health"   "/health"
+check "pf_maps"  "/api/pf_maps" "{}"
+check "pf_scan"  "/api/pf_scan" '{"query":"pagefault"}'
+check "pf_peek"  "/api/pf_peek" '{"uri":"memory://README.md"}'
+check "pf_load"  "/api/pf_load" '{"name":"demo"}'
+# pf_ps returns an empty agent list when no subagent is configured.
+check "pf_ps"    "/api/pf_ps" "{}"
+grep -q '"agents":\[\]' "$ROOT/bin/smoke.resp" || fail "pf_ps: expected empty agents array"
+# pf_fault returns 404 agent-not-found against minimal.yaml (no subagent).
+check "pf_fault" "/api/pf_fault" '{"query":"anything"}' 404
+grep -q 'agent not found' "$ROOT/bin/smoke.resp" || fail "pf_fault: expected 'agent not found' message"
 
 # MCP initialize smoke
 curl -s -o "$ROOT/bin/smoke.resp" \

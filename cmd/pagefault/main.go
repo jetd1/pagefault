@@ -11,12 +11,15 @@
 //	pagefault load <name> [--config] [--format markdown|json] [--no-filter] [--json]
 //	pagefault scan <query...> [--config] [--limit N] [--backends a,b] [--no-filter] [--json]
 //	pagefault peek <uri>  [--config] [--from N] [--to N] [--no-filter] [--json]
+//	pagefault fault <query...> [--config] [--agent ID] [--timeout N] [--no-filter] [--json]
+//	pagefault ps          [--config] [--no-filter] [--json]
 //
 //	pagefault --version
 //
-// The tool subcommands (maps, load, scan, peek) are the CLI form of the
-// pf_maps / pf_load / pf_scan / pf_peek tools exposed over MCP and REST.
-// See CLAUDE.md §Tool Naming for the wire ↔ CLI ↔ code mapping.
+// The tool subcommands (maps, load, scan, peek, fault, ps) are the CLI
+// form of the pf_maps / pf_load / pf_scan / pf_peek / pf_fault / pf_ps
+// tools exposed over MCP and REST. See CLAUDE.md §Tool Naming for the
+// wire ↔ CLI ↔ code mapping.
 package main
 
 import (
@@ -67,6 +70,16 @@ func main() {
 			fmt.Fprintf(os.Stderr, "peek: %v\n", err)
 			os.Exit(1)
 		}
+	case "fault":
+		if err := runFault(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "fault: %v\n", err)
+			os.Exit(1)
+		}
+	case "ps":
+		if err := runPs(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "ps: %v\n", err)
+			os.Exit(1)
+		}
 	case "-h", "--help", "help":
 		usage()
 	default:
@@ -87,11 +100,13 @@ Tokens:
   pagefault token ls                     [--config <path>] [--tokens-file <path>]
   pagefault token revoke <id>            [--config <path>] [--tokens-file <path>]
 
-Tools (local CLI form of pf_maps / pf_load / pf_scan / pf_peek):
+Tools (local CLI form of pf_maps / pf_load / pf_scan / pf_peek / pf_fault / pf_ps):
   pagefault maps                 — list configured memory regions
   pagefault load <name>          — load an assembled region to stdout
   pagefault scan <query...>      — scan backends for a query
   pagefault peek <uri>           — read a resource by URI
+  pagefault fault <query...>     — spawn a subagent for deep retrieval
+  pagefault ps                   — list configured subagents
 
   Common flags: --config <path>, --no-filter, --json
   Config lookup: --config → $PAGEFAULT_CONFIG → ./pagefault.yaml

@@ -171,6 +171,50 @@ protections apply:
 
 Do not enable writes without reading this section.
 
+## Subagent safety (Phase 2+)
+
+`pf_fault` delegates a natural-language query to an external subagent
+process (via `subagent-cli` or `subagent-http`). **The subagent runs
+outside pagefault's sandbox** — the filter pipeline applies only to
+the query and agent id, not to what the agent reads, writes, or sends
+over the network. In effect, configuring a subagent backend is equivalent
+to granting `pf_fault` clients the ability to invoke that agent with
+arbitrary natural-language input.
+
+Guardrails pagefault *can* enforce:
+
+- **Timeouts.** Every call has a deadline (`pf_fault.timeout_seconds`,
+  or the backend's `timeout` default). `exec.CommandContext` kills the
+  child process on expiry; HTTP subagents cancel the request context.
+- **Argv isolation.** `subagent-cli` tokenizes the command template
+  into argv once at startup and does placeholder substitution per call
+  — there is **no shell interpretation**, so a caller-supplied `{task}`
+  cannot inject shell metacharacters.
+- **JSON escaping.** `subagent-http` JSON-escapes `{task}` before
+  substituting it into `body_template`, so a task containing quotes
+  cannot break the request body.
+- **Audit.** Every `pf_fault` call is logged with query, agent, backend,
+  elapsed seconds, and any error — even timeouts (they surface in the
+  structured response, not as errors).
+- **Agent allowlist.** Only agents listed in `agents:` can be spawned.
+  Unknown ids fail fast with `404 agent not found`.
+
+Guardrails pagefault *cannot* enforce (operator responsibility):
+
+- **What the agent reads or writes.** If the agent has filesystem
+  access, it can read or modify files that pagefault's filter pipeline
+  would otherwise block. Choose an agent whose own sandbox matches the
+  trust level of `pf_fault` callers.
+- **Outbound network calls.** A CLI agent inherits pagefault's
+  network posture; an HTTP agent is entirely remote.
+- **Resource exhaustion.** A caller who can spawn subagents can drive
+  load on the subagent's runtime. Rate-limit `pf_fault` at a proxy if
+  that matters.
+
+Bottom line: treat `pf_fault` callers as *users of the configured
+subagent*, not as sandboxed memory clients. If you wouldn't let them
+run the agent directly, don't give them pagefault access either.
+
 ## Threats and mitigations
 
 | Threat                                    | Mitigation                                                                                          |
@@ -183,19 +227,27 @@ Do not enable writes without reading this section.
 | Backend timeout / hang                    | `context.Context` is threaded through every call; clients receive `502` on backend failure.         |
 | Log poisoning via tool args               | `SanitizeArgs` strips known-sensitive keys before writing to the audit log.                         |
 | Partial context with silent data loss     | `skipped_sources` surfaced in `pf_load` output; skips logged at `WARN`.                             |
+| Shell injection via subagent task         | `subagent-cli` uses argv-per-token, no shell; `subagent-http` JSON-escapes the task before substitution. |
+| Subagent hang / runaway                   | Per-call timeout enforced by `exec.CommandContext` (CLI) or request context (HTTP); partial stdout captured. |
+| Unbounded access via subagent             | Acknowledged: subagents run outside pagefault's sandbox. Treat `pf_fault` callers as users of the configured agent. |
 
 ## Known limitations
 
-- **Naive scan.** Phase 1 `pf_scan` is a case-insensitive substring scan
-  across every included file. It is fine for small trees (tens to a few
-  hundred files) but does not scale. Phase 2 will add indexed / semantic
-  search via subprocess or subagent backends.
-- **No rate limiting.** Phase 1 trusts the operator to run the server
+- **Naive filesystem scan.** The filesystem backend's `pf_scan` is a
+  case-insensitive substring scan across every included file. Fine for
+  small trees (hundreds of files); does not scale. Wire a `subprocess`
+  backend (ripgrep) or an `http` backend (LCM-style search) alongside
+  it for larger corpora.
+- **Subagent sandbox is out of scope.** `pf_fault` runs the configured
+  agent with whatever privileges the agent already has. See the
+  "Subagent safety" section above.
+- **No rate limiting.** pagefault trusts the operator to run the server
   behind a reverse proxy or on loopback. A single malicious client can
-  stall the server with large search queries.
+  stall the server with large search queries — or exhaust a remote
+  subagent via rapid `pf_fault` calls.
 - **No per-tool auth.** Any authenticated caller can invoke any enabled
   tool. Per-token tool ACLs are a future addition.
-- **No Phase-1 TLS.** Terminate TLS at a reverse proxy (Caddy, nginx,
+- **No TLS.** Terminate TLS at a reverse proxy (Caddy, nginx,
   Cloudflare) — pagefault does not ship its own cert handling.
 - **Audit log is append-only but not tamper-evident.** A compromised host
   can rewrite the log; for tamper-evidence, ship entries off-host.

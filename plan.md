@@ -821,22 +821,24 @@ Why Go over Python:
 
 **Phase 1 does NOT include:** subagent backends, HTTP backends, subprocess backends, redaction filters, OpenAPI spec, `pf_fault`, `pf_ps`.
 
-### Phase 2 — Subagents + More Backends
+### Phase 2 — Subagents + More Backends (shipped in 0.3.0)
 
-1. `internal/backend/subagent/subagent.go` — `SubagentBackend` interface
-2. `internal/backend/subagent/cli.go` — CLI subagent (`exec.CommandContext`, capture stdout)
-3. `internal/backend/subagent/http.go` — HTTP subagent (POST, poll/wait)
-4. `internal/tool/deep_retrieve.go` — `pf_fault` handler: spawn subagent, wait, return result
-5. `internal/tool/list_agents.go` — `pf_ps` handler: list configured agents
-6. `internal/backend/subprocess.go` — Generic subprocess backend (e.g., ripgrep)
-7. `internal/backend/http.go` — Generic HTTP backend (e.g., LCM API)
-8. `configs/openclaw.yaml` — Full production config
-9. Timeout handling with `context.WithTimeout`, `Process.Kill` on expiry, partial result capture
-10. Tests for each new backend + tool
-11. Update `docs/api-doc.md` with `pf_fault` and `pf_ps`
-12. Update `docs/config-doc.md` with new backend types
-13. Update `CLAUDE.md` directory tree and file TLDRs
-14. Version bump + CHANGELOG
+1. ~~`internal/backend/subagent/subagent.go`~~ → `internal/backend/subagent.go`: `SubagentBackend` interface + `AgentInfo`.
+2. ~~`internal/backend/subagent/cli.go`~~ → `internal/backend/subagent_cli.go`: CLI subagent with tokenized argv (no shell), timeout-kill, partial stdout capture.
+3. ~~`internal/backend/subagent/http.go`~~ → `internal/backend/subagent_http.go`: HTTP subagent with bearer auth + JSON body template + dotted `response_path`.
+4. `internal/tool/deep_retrieve.go` — `pf_fault` pure handler; surfaces timeouts as `timed_out: true` + `partial_result` rather than raising an error.
+5. `internal/tool/list_agents.go` — `pf_ps` pure handler.
+6. `internal/backend/subprocess.go` — generic subprocess backend. Parse modes: `ripgrep_json`, `grep`, `plain`.
+7. `internal/backend/http.go` — generic HTTP search backend.
+8. **`configs/openclaw.yaml`** — deferred to Phase 3 as it depends on deployment details (LCM API shape, writable paths, etc.); not required to exercise the Phase-2 wire surface.
+9. Timeouts flow through `context.WithTimeout` at the backend entry point; `exec.CommandContext` kills the child on expiry, HTTP uses the request context.
+10. Tests for every new backend + tool (unit tests for parsers, httptest-backed tests for HTTP variants, stubSubagent tests for pf_fault).
+11. `docs/api-doc.md` — `pf_fault` + `pf_ps` sections, updated CLI examples.
+12. `docs/config-doc.md` — new backend type sections (subprocess / http / subagent-cli / subagent-http).
+13. `CLAUDE.md` — directory tree refreshed, tool-naming table updated.
+14. Version bump to `0.3.0` + CHANGELOG.
+15. **CLI subcommands.** `pagefault fault <query…>` and `pagefault ps` round out the tool surface so local debugging works without the HTTP server.
+16. `internal/server`: `ErrAgentNotFound` → 404, `ErrSubagentTimeout` → 504 in the errorStatus map; REST routes for the two new tools behind the same auth + filter stack.
 
 ### Phase 3 — Polish + Production
 

@@ -406,6 +406,171 @@ func TestLoadDispatcherForCLI_RedirectsStdoutAudit(t *testing.T) {
 	require.NotContains(t, out, "caller_id", "audit line must not leak onto stdout")
 }
 
+// ─────────────────── fault (pf_fault) ───────────────────
+
+// writeTestConfigWithSubagent is like writeTestConfig but also declares
+// a subagent-cli backend whose "echo" command lets the CLI exercise
+// pf_fault / pf_ps end-to-end without pulling in any external tool.
+func writeTestConfigWithSubagent(t *testing.T, dir string) string {
+	t.Helper()
+	dataDir := filepath.Join(dir, "data")
+	require.NoError(t, os.MkdirAll(dataDir, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(dataDir, "README.md"), []byte("# hello\n"), 0o600))
+
+	yaml := "" +
+		"server:\n" +
+		"  host: \"127.0.0.1\"\n" +
+		"  port: 8444\n" +
+		"auth:\n" +
+		"  mode: \"none\"\n" +
+		"backends:\n" +
+		"  - name: fs\n" +
+		"    type: filesystem\n" +
+		"    root: \"" + dataDir + "\"\n" +
+		"    include: [\"**/*.md\"]\n" +
+		"    uri_scheme: \"memory\"\n" +
+		"    sandbox: true\n" +
+		"  - name: sa\n" +
+		"    type: subagent-cli\n" +
+		"    command: \"echo {agent_id}:{task}\"\n" +
+		"    timeout: 5\n" +
+		"    agents:\n" +
+		"      - id: alpha\n" +
+		"        description: \"primary\"\n" +
+		"      - id: beta\n" +
+		"        description: \"secondary\"\n" +
+		"contexts:\n" +
+		"  - name: demo\n" +
+		"    sources:\n" +
+		"      - backend: fs\n" +
+		"        uri: \"memory://README.md\"\n" +
+		"    max_size: 4000\n" +
+		"tools:\n" +
+		"  pf_maps: true\n" +
+		"  pf_load: true\n" +
+		"  pf_scan: true\n" +
+		"  pf_peek: true\n" +
+		"  pf_fault: true\n" +
+		"  pf_ps: true\n" +
+		"filters:\n" +
+		"  enabled: false\n" +
+		"audit:\n" +
+		"  enabled: false\n"
+
+	cfgPath := filepath.Join(dir, "pagefault.yaml")
+	require.NoError(t, os.WriteFile(cfgPath, []byte(yaml), 0o600))
+	return cfgPath
+}
+
+func TestRunFault_Text(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := writeTestConfigWithSubagent(t, dir)
+
+	out := captureStdout(t, func() {
+		require.NoError(t, runFault([]string{
+			"--config", cfgPath,
+			"--agent", "alpha",
+			"--timeout", "5",
+			"hello", "world",
+		}))
+	})
+	// echo command renders "{agent_id}:{task}" → "alpha:hello world".
+	assert.Contains(t, out, "alpha:hello world")
+}
+
+func TestRunFault_JSON(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := writeTestConfigWithSubagent(t, dir)
+
+	out := captureStdout(t, func() {
+		require.NoError(t, runFault([]string{
+			"--config", cfgPath, "--json", "question",
+		}))
+	})
+	var decoded tool.DeepRetrieveOutput
+	require.NoError(t, json.Unmarshal([]byte(out), &decoded))
+	assert.Equal(t, "alpha:question", decoded.Answer)
+	assert.Equal(t, "alpha", decoded.Agent)
+	assert.Equal(t, "sa", decoded.Backend)
+	assert.False(t, decoded.TimedOut)
+}
+
+func TestRunFault_ExplicitAgent(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := writeTestConfigWithSubagent(t, dir)
+
+	out := captureStdout(t, func() {
+		require.NoError(t, runFault([]string{
+			"--config", cfgPath,
+			"--agent", "beta",
+			"--json",
+			"ping",
+		}))
+	})
+	var decoded tool.DeepRetrieveOutput
+	require.NoError(t, json.Unmarshal([]byte(out), &decoded))
+	assert.Equal(t, "beta:ping", decoded.Answer)
+	assert.Equal(t, "beta", decoded.Agent)
+}
+
+func TestRunFault_MissingQuery(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := writeTestConfigWithSubagent(t, dir)
+
+	err := runFault([]string{"--config", cfgPath})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "usage:")
+}
+
+func TestRunFault_NoSubagentConfigured(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := writeTestConfig(t, dir) // no subagent backend
+
+	err := runFault([]string{"--config", cfgPath, "hi"})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "agent not found")
+}
+
+// ─────────────────── ps (pf_ps) ───────────────────
+
+func TestRunPs_Text(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := writeTestConfigWithSubagent(t, dir)
+
+	out := captureStdout(t, func() {
+		require.NoError(t, runPs([]string{"--config", cfgPath}))
+	})
+	assert.Contains(t, out, "ID")
+	assert.Contains(t, out, "BACKEND")
+	assert.Contains(t, out, "alpha")
+	assert.Contains(t, out, "beta")
+	assert.Contains(t, out, "sa")
+}
+
+func TestRunPs_JSON(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := writeTestConfigWithSubagent(t, dir)
+
+	out := captureStdout(t, func() {
+		require.NoError(t, runPs([]string{"--config", cfgPath, "--json"}))
+	})
+	var decoded tool.ListAgentsOutput
+	require.NoError(t, json.Unmarshal([]byte(out), &decoded))
+	require.Len(t, decoded.Agents, 2)
+	assert.Equal(t, "alpha", decoded.Agents[0].ID)
+	assert.Equal(t, "sa", decoded.Agents[0].Backend)
+}
+
+func TestRunPs_Empty(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := writeTestConfig(t, dir)
+
+	out := captureStdout(t, func() {
+		require.NoError(t, runPs([]string{"--config", cfgPath}))
+	})
+	assert.Contains(t, out, "no subagents configured")
+}
+
 // ─────────────────── singleLine helper ───────────────────
 
 func TestSingleLine(t *testing.T) {

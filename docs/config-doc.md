@@ -18,7 +18,9 @@ filters:  { ... }   # optional filter pipeline
 audit:    { ... }   # audit logging
 ```
 
-A minimal working config is in `configs/minimal.yaml`.
+A minimal working config is in `configs/minimal.yaml` (filesystem
+backend only). For a tour of every backend type with inline docs, see
+`configs/example.yaml`.
 
 ---
 
@@ -75,7 +77,9 @@ Tokens are managed with `pagefault token create / ls / revoke`.
 ## `backends`
 
 At least one backend is required. Each entry has a unique `name` and a
-`type`. Phase 1 supports only `type: filesystem`.
+`type`. Phase 1 ships `filesystem`; Phase 2 adds `subprocess`, `http`,
+`subagent-cli`, and `subagent-http`. See each type-specific section
+below for its required fields.
 
 ```yaml
 backends:
@@ -106,14 +110,143 @@ backends:
 
 **Backends do not expose writes in Phase 1.** Write support is Phase 4.
 
-### Planned types (future phases)
+### `subprocess` backend
 
-| Type             | Phase | Notes |
-|------------------|-------|-------|
-| `subprocess`     | 2     | Shell command template (e.g., `rg --json ...`). |
-| `http`           | 2     | Generic HTTP API backend. |
-| `subagent-cli`   | 2     | Spawn an agent via a CLI command. |
-| `subagent-http`  | 2     | Spawn an agent via an HTTP API. |
+Runs an external command to answer `Search` requests. Canonical use:
+ripgrep. `Read` is not supported — point a filesystem backend at the
+same roots if you need content too.
+
+```yaml
+- name: rg
+  type: subprocess
+  command: "rg --json -i -n --max-count 20 {query} {roots}"
+  roots:
+    - "/home/jet/.openclaw/workspace/memory"
+    - "/home/jet/.openclaw/self-improving"
+  timeout: 10
+  parse: "ripgrep_json"
+```
+
+| Field     | Type     | Required | Default    | Notes |
+|-----------|----------|----------|------------|-------|
+| `name`    | string   | yes      | —          | Backend name. |
+| `type`    | string   | yes      | —          | Must be `subprocess`. |
+| `command` | string   | yes      | —          | Tokenized command template. Each token is a separate argv element — **no shell interpretation**, so `{query}` cannot break out of its slot. Placeholders: `{query}`, `{roots}`. A bare `{roots}` token is spliced in as multiple argv elements. |
+| `roots`   | string[] | no       | —          | Directories passed into `{roots}`. |
+| `timeout` | int      | no       | `10`       | Seconds before the command is killed. |
+| `parse`   | string   | no       | `plain`    | Stdout parser: `ripgrep_json` (ripgrep `--json`), `grep` (`path:lineno:content`), or `plain` (one snippet per line, no URI). |
+
+The backend treats `exit 1` as "no matches" (matches grep/ripgrep
+conventions) and returns an empty result. Any other non-zero exit, or a
+timeout, surfaces as `ErrBackendUnavailable` (HTTP 502).
+
+### `http` backend
+
+Generic HTTP search backend. Issues a single HTTP request per
+`Search` call, extracts a result array from the JSON response, and
+converts each entry into a `SearchResult`.
+
+```yaml
+- name: lcm
+  type: http
+  base_url: "http://127.0.0.1:6443"
+  auth:
+    mode: "bearer"
+    token: "${OPENCLAW_GATEWAY_TOKEN}"
+  search:
+    method: "POST"
+    path: "/api/lcm/search"
+    body_template: '{"query": "{query}", "limit": {limit}}'
+    response_path: "results"
+  timeout: 15
+```
+
+| Field                    | Type   | Required | Default | Notes |
+|--------------------------|--------|----------|---------|-------|
+| `name`                   | string | yes      | —       | Backend name. |
+| `type`                   | string | yes      | —       | Must be `http`. |
+| `base_url`               | string | yes      | —       | Root URL. Trailing slash is stripped. |
+| `auth.mode`              | string | no       | none    | `bearer` to send an `Authorization: Bearer …` header. |
+| `auth.token`             | string | required for bearer | —  | Bearer token. `${ENV}` substitution happens at config-load time. |
+| `search.method`          | string | no       | `POST`  | HTTP method. |
+| `search.path`            | string | yes      | —       | Appended to `base_url`. |
+| `search.headers`         | map    | no       | —       | Extra request headers. |
+| `search.body_template`   | string | no       | —       | Request body with `{query}` and `{limit}` placeholders. `{query}` is JSON-escaped. If empty, no body is sent. |
+| `search.response_path`   | string | no       | —       | Dotted path to the array in the response JSON (e.g. `results` or `data.items`). `$.`-prefix is tolerated. Empty means "response is the array itself". |
+| `timeout`                | int    | no       | `15`    | Seconds before the request is cancelled. |
+
+Each array element in the response is coerced into a `SearchResult`.
+Recognised keys (all optional): `uri`, `snippet`, `score`, `metadata`.
+Unknown keys are ignored.
+
+`Read` is not supported on generic HTTP backends.
+
+### `subagent-cli` backend
+
+Spawns an external agent process for `pf_fault`. The subagent is
+responsible for doing its own retrieval; pagefault just runs the
+command and waits for stdout.
+
+```yaml
+- name: openclaw
+  type: subagent-cli
+  command: "openclaw agent run --agent {agent_id} --task {task} --timeout {timeout}"
+  timeout: 300
+  agents:
+    - id: wocha
+      description: "Dev agent with Feishu, LCM, workspace, and coding tools"
+    - id: main
+      description: "Primary personal agent with full tool access"
+```
+
+| Field        | Type     | Required | Default | Notes |
+|--------------|----------|----------|---------|-------|
+| `name`       | string   | yes      | —       | Backend name. |
+| `type`       | string   | yes      | —       | Must be `subagent-cli`. |
+| `command`    | string   | yes      | —       | Tokenized command template. Placeholders: `{agent_id}`, `{task}`, `{timeout}`. Same non-shell tokenization as `subprocess`. |
+| `timeout`    | int      | no       | `300`   | Default seconds before the child is killed. Overridden per call by `pf_fault.timeout_seconds`. |
+| `agents`     | [object] | yes      | —       | At least one. Each has an `id` (required) and `description` (optional). The first entry is the default when `pf_fault.agent` is empty. |
+
+On deadline, the process is killed; any stdout captured so far is
+returned as `partial_result` with `timed_out: true`.
+
+### `subagent-http` backend
+
+Same role as `subagent-cli` but spawns the agent via HTTP. Useful when
+agents live behind a gateway.
+
+```yaml
+- name: openclaw-http
+  type: subagent-http
+  base_url: "https://localhost:6443/api"
+  auth:
+    mode: "bearer"
+    token: "${OPENCLAW_GATEWAY_TOKEN}"
+  spawn:
+    method: "POST"
+    path: "/agents/{agent_id}/run"
+    body_template: '{"task": "{task}", "timeout": {timeout}}'
+    response_path: "result"
+  timeout: 300
+  agents:
+    - id: wocha
+      description: "Dev agent with Feishu, LCM, workspace, and coding tools"
+```
+
+| Field                  | Type     | Required | Default | Notes |
+|------------------------|----------|----------|---------|-------|
+| `name`                 | string   | yes      | —       | Backend name. |
+| `type`                 | string   | yes      | —       | Must be `subagent-http`. |
+| `base_url`             | string   | yes      | —       | Root URL. |
+| `auth.mode`            | string   | no       | none    | `bearer` supported. |
+| `auth.token`           | string   | required for bearer | — | Bearer token (supports `${ENV}`). |
+| `spawn.method`         | string   | no       | `POST`  | HTTP method. |
+| `spawn.path`           | string   | yes      | —       | Appended to `base_url`. `{agent_id}` in the path is substituted. |
+| `spawn.headers`        | map      | no       | —       | Extra request headers. |
+| `spawn.body_template`  | string   | no       | —       | Body template with `{agent_id}`, `{task}`, `{timeout}`. `{task}` is JSON-escaped. |
+| `spawn.response_path`  | string   | no       | —       | Dotted path to the agent's response string. Non-string leaves are re-encoded as JSON. Empty means "the whole response body is the answer". |
+| `timeout`              | int      | no       | `300`   | Default seconds. Overridden per call. |
+| `agents`               | [object] | yes      | —       | At least one. Each has `id` and `description`. |
 
 ---
 
@@ -162,10 +295,15 @@ tools:
   pf_load:  true    # get_context: load a region
   pf_scan:  true    # search across backends
   pf_peek:  true    # read a resource by URI
-  pf_fault: false   # deep_retrieve — Phase 2, ignored in Phase 1
-  pf_ps:    false   # list_agents  — Phase 2, ignored in Phase 1
-  pf_poke:  false   # write        — Phase 4, ignored in Phase 1
+  pf_fault: true    # deep_retrieve — Phase 2, requires a SubagentBackend
+  pf_ps:    true    # list_agents  — Phase 2, lists configured subagents
+  pf_poke:  false   # write        — Phase 4, not yet implemented
 ```
+
+`pf_fault` and `pf_ps` are only useful when at least one
+`subagent-cli` or `subagent-http` backend is configured. They can still
+be enabled without one — `pf_ps` returns an empty agent list and
+`pf_fault` returns `404 agent not found`.
 
 ---
 

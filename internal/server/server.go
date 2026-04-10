@@ -99,8 +99,9 @@ func New(cfg *config.Config, d *dispatcher.ToolDispatcher, authP auth.AuthProvid
 
 		// REST transport: one handler per enabled tool. The wire names
 		// follow the page-fault scheme (pf_maps, pf_load, pf_scan,
-		// pf_peek); the handler Go names retain their generic form for
-		// developer clarity — see CLAUDE.md for the mapping.
+		// pf_peek, pf_fault, pf_ps); the handler Go names retain their
+		// generic form for developer clarity — see CLAUDE.md for the
+		// mapping.
 		pr.Route("/api", func(ar chi.Router) {
 			if d.ToolEnabled("pf_maps") {
 				ar.Post("/pf_maps", restHandler(d, tool.HandleListContexts))
@@ -113,6 +114,12 @@ func New(cfg *config.Config, d *dispatcher.ToolDispatcher, authP auth.AuthProvid
 			}
 			if d.ToolEnabled("pf_peek") {
 				ar.Post("/pf_peek", restHandler(d, tool.HandleRead))
+			}
+			if d.ToolEnabled("pf_fault") {
+				ar.Post("/pf_fault", restHandler(d, tool.HandleDeepRetrieve))
+			}
+			if d.ToolEnabled("pf_ps") {
+				ar.Post("/pf_ps", restHandler(d, tool.HandleListAgents))
 			}
 		})
 	})
@@ -150,6 +157,8 @@ func (s *Server) handleRoot(w http.ResponseWriter, _ *http.Request) {
 	_, _ = io.WriteString(w, "  POST /api/pf_load        — load a region by name\n")
 	_, _ = io.WriteString(w, "  POST /api/pf_scan        — scan backends for content\n")
 	_, _ = io.WriteString(w, "  POST /api/pf_peek        — peek at a resource by URI\n")
+	_, _ = io.WriteString(w, "  POST /api/pf_fault       — spawn a subagent to answer a query\n")
+	_, _ = io.WriteString(w, "  POST /api/pf_ps          — list configured subagents\n")
 }
 
 // ───────────────── REST handler adapter ─────────────────
@@ -190,10 +199,13 @@ func errorStatus(err error) int {
 		return http.StatusForbidden
 	case errors.Is(err, model.ErrResourceNotFound),
 		errors.Is(err, model.ErrContextNotFound),
-		errors.Is(err, model.ErrBackendNotFound):
+		errors.Is(err, model.ErrBackendNotFound),
+		errors.Is(err, model.ErrAgentNotFound):
 		return http.StatusNotFound
 	case errors.Is(err, model.ErrBackendUnavailable):
 		return http.StatusBadGateway
+	case errors.Is(err, model.ErrSubagentTimeout):
+		return http.StatusGatewayTimeout
 	default:
 		return http.StatusInternalServerError
 	}

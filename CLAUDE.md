@@ -36,7 +36,7 @@ bash scripts/smoke.sh  # End-to-end smoke test (builds, runs, curls every endpoi
 pagefault/
 ├── CLAUDE.md                             # This file — agent dev guide
 ├── CHANGELOG.md                          # Version history
-├── VERSION                               # Current version (single line: 0.1.0)
+├── VERSION                               # Current version (single line: 0.3.0)
 ├── README.md                             # Quick-start guide
 ├── Makefile                              # build/test/lint/run/clean/smoke targets
 ├── plan.md                               # Full spec, source of truth
@@ -47,12 +47,12 @@ pagefault/
 ├── cmd/
 │   └── pagefault/
 │       ├── main.go                       # CLI entry, top-level dispatch + --version
-│       ├── serve.go                      # `serve` subcommand: config → dispatcher → http.Server
-│       ├── serve_test.go                 # buildDispatcher tests (minimal + unsupported backend)
+│       ├── serve.go                      # `serve` subcommand: config → dispatcher → http.Server (wires every backend type)
+│       ├── serve_test.go                 # buildDispatcher tests (minimal, unsupported, full Phase-2 stack)
 │       ├── token.go                      # `token create/ls/revoke` subcommands
 │       ├── token_test.go                 # Token CLI: lifecycle, slugify, maskToken, list/resolve
-│       ├── tools.go                      # `maps`/`load`/`scan`/`peek` — CLI form of the pf_* tools
-│       └── tools_test.go                 # Tool CLI tests: text/JSON/env/cwd fallback/no-filter/audit redirect
+│       ├── tools.go                      # `maps`/`load`/`scan`/`peek`/`fault`/`ps` — CLI form of the pf_* tools
+│       └── tools_test.go                 # Tool CLI tests: text/JSON/env/cwd fallback/no-filter/audit redirect/fault/ps
 │
 ├── internal/
 │   ├── config/
@@ -66,6 +66,17 @@ pagefault/
 │   │   ├── backend.go                    # Backend interface + Resource/SearchResult/ResourceInfo
 │   │   ├── filesystem.go                 # FilesystemBackend: glob, sandbox, auto-tag, search
 │   │   ├── filesystem_test.go            # Filesystem backend tests (21 cases)
+│   │   ├── http_helpers.go               # Shared template/JSON-path helpers (renderTemplate/walkPath/…)
+│   │   ├── http_helpers_test.go          # Helper unit tests (walkPath edge cases, extractResponse variants)
+│   │   ├── subagent.go                   # SubagentBackend interface + AgentInfo
+│   │   ├── subagent_cli.go               # CLI-spawned subagent (exec.CommandContext + argv template)
+│   │   ├── subagent_cli_test.go          # Tokenizer + spawn/timeout/default-agent tests
+│   │   ├── subagent_http.go              # HTTP-spawned subagent (POST + response_path extraction)
+│   │   ├── subagent_http_test.go         # httptest-backed tests: auth, body template, timeout
+│   │   ├── subprocess.go                 # Generic subprocess search backend (rg/grep/plain parse)
+│   │   ├── subprocess_test.go            # Parser + exit-code + command-not-found tests
+│   │   ├── http.go                       # Generic HTTP search backend (body template, response_path)
+│   │   ├── http_test.go                  # httptest-backed happy-path + error cases
 │   │   └── testdata/
 │   │       └── sample/
 │   │           ├── README.md             # Sample file for include/search tests
@@ -87,7 +98,8 @@ pagefault/
 │   │
 │   ├── dispatcher/
 │   │   ├── dispatcher.go                 # ToolDispatcher: routes tool calls, filter+audit pipeline
-│   │   └── dispatcher_test.go            # Dispatcher tests with mock backend
+│   │   ├── dispatcher_test.go            # Dispatcher tests with mock backend
+│   │   └── subagent_test.go              # ListAgents + DeepRetrieve tests (mockSubagent)
 │   │
 │   ├── tool/
 │   │   ├── tool.go                       # Shared helpers: toolResultJSON, toolResultError
@@ -95,8 +107,11 @@ pagefault/
 │   │   ├── get_context.go                # HandleGetContext pure function (wire: pf_load)
 │   │   ├── search.go                     # HandleSearch pure function (wire: pf_scan)
 │   │   ├── read.go                       # HandleRead pure function (wire: pf_peek)
+│   │   ├── deep_retrieve.go              # HandleDeepRetrieve pure function (wire: pf_fault)
+│   │   ├── list_agents.go                # HandleListAgents pure function (wire: pf_ps)
 │   │   ├── mcp.go                        # RegisterMCP: wires pure handlers to mcp-go
 │   │   ├── tool_test.go                  # Pure handler tests
+│   │   ├── deep_retrieve_test.go         # pf_fault handler tests (stubSubagent)
 │   │   └── mcp_test.go                   # MCP registration + toolResult helper tests
 │   │
 │   └── server/
@@ -104,10 +119,11 @@ pagefault/
 │       └── server_test.go                # Integration tests via httptest (incl. MCP smoke)
 │
 ├── configs/
-│   └── minimal.yaml                      # Smallest working config (no auth, demo data)
+│   ├── minimal.yaml                      # Smallest working config (filesystem only, no auth)
+│   └── example.yaml                      # Tour of every backend type with inline docs
 │
 ├── docs/
-│   ├── api-doc.md                        # Phase-1 tool reference
+│   ├── api-doc.md                        # Tool reference (Phase 1–2)
 │   ├── config-doc.md                     # Full YAML config reference
 │   ├── architecture.md                   # Architecture deep dive
 │   └── security.md                       # Threat model, auth, filters, audit
@@ -138,7 +154,7 @@ Client → chi router → auth middleware → tool handler → dispatcher
 
 **Key abstractions:**
 
-- **Backend** — data source plugin interface (`internal/backend/backend.go`). Phase 1 ships the filesystem backend. Phases 2+ add subprocess, HTTP, and subagent backends.
+- **Backend** — data source plugin interface (`internal/backend/backend.go`). Ships five types: `filesystem` (Phase 1), `subprocess`, `http`, `subagent-cli`, `subagent-http` (Phase 2). `SubagentBackend` extends `Backend` with `Spawn`/`ListAgents` for `pf_fault` and `pf_ps`.
 - **Context** — named, pre-composed bundle of backend resources (YAML-defined).
 - **Filter** — optional path/tag/redaction filter. Can be fully disabled.
 - **Auth** — bearer token, trusted header, or none.
@@ -160,8 +176,8 @@ for developer clarity; the CLI uses bare verbs because the outer
 | `pf_load`              | `load`              | `HandleGetContext`       | `get_context.go`           | 1     |
 | `pf_scan`              | `scan`              | `HandleSearch`           | `search.go`                | 1     |
 | `pf_peek`              | `peek`              | `HandleRead`             | `read.go`                  | 1     |
-| `pf_fault`             | `fault` *           | `HandleDeepRetrieve` *   | `deep_retrieve.go` *       | 2     |
-| `pf_ps`                | `ps` *              | `HandleListAgents` *     | `list_agents.go` *         | 2     |
+| `pf_fault`             | `fault`             | `HandleDeepRetrieve`     | `deep_retrieve.go`         | 2     |
+| `pf_ps`                | `ps`                | `HandleListAgents`       | `list_agents.go`           | 2     |
 | `pf_poke`              | `poke` *            | `HandleWrite` *          | `write.go` *               | 4     |
 
 (*) Planned — not implemented yet.

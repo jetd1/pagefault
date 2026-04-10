@@ -12,13 +12,12 @@ import (
 	"github.com/jet/pagefault/internal/dispatcher"
 )
 
-// RegisterMCP registers every enabled Phase-1 tool on the given MCP server.
-// The caller provides a helper to extract the pagefault Caller from the
-// request context — the dispatcher uses this for filters and audit.
+// RegisterMCP registers every enabled tool on the given MCP server. The
+// dispatcher uses the per-request Caller for filters and audit.
 //
-// Phase-1 wire names: pf_maps, pf_load, pf_scan, pf_peek. Internal Go names
-// retain their generic form (HandleListContexts, etc.) — see CLAUDE.md for
-// the wire-name ↔ code-name mapping.
+// Wire names: pf_maps, pf_load, pf_scan, pf_peek (Phase 1); pf_fault,
+// pf_ps (Phase 2). Internal Go names retain their generic form
+// (HandleListContexts, etc.) — see CLAUDE.md for the wire ↔ code map.
 func RegisterMCP(srv *mcpserver.MCPServer, d *dispatcher.ToolDispatcher) {
 	if d.ToolEnabled("pf_maps") {
 		registerListContexts(srv, d)
@@ -31,6 +30,12 @@ func RegisterMCP(srv *mcpserver.MCPServer, d *dispatcher.ToolDispatcher) {
 	}
 	if d.ToolEnabled("pf_peek") {
 		registerRead(srv, d)
+	}
+	if d.ToolEnabled("pf_fault") {
+		registerDeepRetrieve(srv, d)
+	}
+	if d.ToolEnabled("pf_ps") {
+		registerListAgents(srv, d)
 	}
 }
 
@@ -131,6 +136,52 @@ func registerRead(srv *mcpserver.MCPServer, d *dispatcher.ToolDispatcher) {
 		}
 		caller := auth.CallerFromContext(ctx)
 		out, err := HandleRead(ctx, d, in, caller)
+		if err != nil {
+			return toolResultError(err), nil
+		}
+		return toolResultJSON(out)
+	})
+}
+
+// registerDeepRetrieve wires the pf_fault tool.
+func registerDeepRetrieve(srv *mcpserver.MCPServer, d *dispatcher.ToolDispatcher) {
+	t := mcppkg.NewTool("pf_fault",
+		mcppkg.WithDescription("Trigger a page fault — spawn a subagent to perform deep retrieval over configured memory. This is the heaviest tool: the agent has its own tools and reasons about what's relevant. Use when pf_scan / pf_peek miss."),
+		mcppkg.WithString("query",
+			mcppkg.Description("Natural-language query: what to find or understand"),
+			mcppkg.Required(),
+		),
+		mcppkg.WithString("agent",
+			mcppkg.Description("Subagent id to spawn (see pf_ps). If empty, the first configured agent is used."),
+		),
+		mcppkg.WithNumber("timeout_seconds",
+			mcppkg.Description("Max seconds to wait for the agent. Default 120."),
+		),
+	)
+	srv.AddTool(t, func(ctx context.Context, req mcppkg.CallToolRequest) (*mcppkg.CallToolResult, error) {
+		args := req.GetArguments()
+		in := DeepRetrieveInput{
+			Query:          asString(args["query"]),
+			Agent:          asString(args["agent"]),
+			TimeoutSeconds: asInt(args["timeout_seconds"]),
+		}
+		caller := auth.CallerFromContext(ctx)
+		out, err := HandleDeepRetrieve(ctx, d, in, caller)
+		if err != nil {
+			return toolResultError(err), nil
+		}
+		return toolResultJSON(out)
+	})
+}
+
+// registerListAgents wires the pf_ps tool.
+func registerListAgents(srv *mcpserver.MCPServer, d *dispatcher.ToolDispatcher) {
+	t := mcppkg.NewTool("pf_ps",
+		mcppkg.WithDescription("List configured subagents that pf_fault can spawn, ps-style. Returns each agent's id, description, and host backend."),
+	)
+	srv.AddTool(t, func(ctx context.Context, _ mcppkg.CallToolRequest) (*mcppkg.CallToolResult, error) {
+		caller := auth.CallerFromContext(ctx)
+		out, err := HandleListAgents(ctx, d, ListAgentsInput{}, caller)
 		if err != nil {
 			return toolResultError(err), nil
 		}

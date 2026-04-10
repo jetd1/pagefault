@@ -332,6 +332,96 @@ func runPeek(args []string) error {
 	return nil
 }
 
+// ─────────────────── fault (pf_fault) ───────────────────
+
+// runFault implements `pagefault fault <query>` — the CLI face of
+// pf_fault. It spawns a subagent to perform deep retrieval and prints
+// the answer (or the partial result + a notice on timeout).
+func runFault(args []string) error {
+	fs := flag.NewFlagSet("fault", flag.ContinueOnError)
+	configPath, noFilter, asJSON := registerCommonFlags(fs)
+	agent := fs.String("agent", "", "subagent id to spawn (see `pagefault ps`; empty picks the first configured)")
+	timeoutSec := fs.Int("timeout", 120, "max seconds to wait for the agent")
+	if err := parseInterspersed(fs, args); err != nil {
+		return err
+	}
+	if fs.NArg() < 1 {
+		return errors.New("usage: pagefault fault <query...> [--config PATH] [--agent ID] [--timeout N] [--no-filter] [--json]")
+	}
+	query := strings.Join(fs.Args(), " ")
+
+	d, closer, err := loadDispatcherForCLI(*configPath, *noFilter)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = closer() }()
+
+	out, err := tool.HandleDeepRetrieve(context.Background(), d, tool.DeepRetrieveInput{
+		Query:          query,
+		Agent:          *agent,
+		TimeoutSeconds: *timeoutSec,
+	}, cliCaller)
+	if err != nil {
+		return err
+	}
+
+	if *asJSON {
+		return printJSON(out)
+	}
+
+	if out.TimedOut {
+		fmt.Fprintf(os.Stderr, "(timed out after %.1fs — showing partial result)\n", out.ElapsedSeconds)
+		fmt.Print(out.PartialResult)
+		if !strings.HasSuffix(out.PartialResult, "\n") {
+			fmt.Println()
+		}
+		return nil
+	}
+	fmt.Print(out.Answer)
+	if !strings.HasSuffix(out.Answer, "\n") {
+		fmt.Println()
+	}
+	fmt.Fprintf(os.Stderr, "\n(%s/%s, %.1fs)\n", out.Backend, out.Agent, out.ElapsedSeconds)
+	return nil
+}
+
+// ─────────────────── ps (pf_ps) ───────────────────
+
+// runPs implements `pagefault ps` — the CLI face of pf_ps. It lists
+// every subagent exposed by every configured SubagentBackend.
+func runPs(args []string) error {
+	fs := flag.NewFlagSet("ps", flag.ContinueOnError)
+	configPath, noFilter, asJSON := registerCommonFlags(fs)
+	if err := parseInterspersed(fs, args); err != nil {
+		return err
+	}
+
+	d, closer, err := loadDispatcherForCLI(*configPath, *noFilter)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = closer() }()
+
+	out, err := tool.HandleListAgents(context.Background(), d, tool.ListAgentsInput{}, cliCaller)
+	if err != nil {
+		return err
+	}
+
+	if *asJSON {
+		return printJSON(out)
+	}
+	if len(out.Agents) == 0 {
+		fmt.Println("(no subagents configured)")
+		return nil
+	}
+	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "ID\tBACKEND\tDESCRIPTION")
+	for _, a := range out.Agents {
+		fmt.Fprintf(tw, "%s\t%s\t%s\n", a.ID, a.Backend, a.Description)
+	}
+	return tw.Flush()
+}
+
 // ─────────────────── helpers ───────────────────
 
 // printJSON writes v to stdout as indented JSON. Used for --json output

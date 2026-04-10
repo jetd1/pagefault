@@ -1,4 +1,4 @@
-# pagefault — API Reference (Phase 1)
+# pagefault — API Reference (Phase 1–2)
 
 pagefault exposes its tools over two transports:
 
@@ -14,18 +14,19 @@ identical.
 ## Tool naming
 
 pagefault tools use a `pf_` prefix and borrow vocabulary from Unix memory
-management / kernel debugging. The short Phase-1 table:
+management / kernel debugging. The Phase-1 and Phase-2 tools:
 
-| Wire name  | What it does                                    | Metaphor                         |
-|------------|-------------------------------------------------|----------------------------------|
-| `pf_maps`  | List pre-composed memory regions (contexts)     | `/proc/<pid>/maps`               |
-| `pf_load`  | Load a region into working memory               | Page swap-in                     |
-| `pf_scan`  | Scan backends for content matching a query     | `kswapd`-style page scan         |
-| `pf_peek`  | Read a specific resource (optionally sliced)    | Debugger `PEEKDATA`              |
+| Wire name  | What it does                                    | Metaphor                   | Phase |
+|------------|-------------------------------------------------|----------------------------|-------|
+| `pf_maps`  | List pre-composed memory regions (contexts)     | `/proc/<pid>/maps`         | 1     |
+| `pf_load`  | Load a region into working memory               | Page swap-in               | 1     |
+| `pf_scan`  | Scan backends for content matching a query      | `kswapd`-style page scan   | 1     |
+| `pf_peek`  | Read a specific resource (optionally sliced)    | Debugger `PEEKDATA`        | 1     |
+| `pf_fault` | Spawn a subagent for deep retrieval              | Real page fault handler    | 2     |
+| `pf_ps`    | List configured subagents                        | `ps(1)`                    | 2     |
 
-Later phases add `pf_fault` (deep retrieval — triggers a real subagent),
-`pf_ps` (list configured subagents), and `pf_poke` (writeback, paired with
-`pf_peek`). See `plan.md` for the full roadmap.
+Phase 4 will add `pf_poke` (writeback, paired with `pf_peek`). See
+`plan.md` for the full roadmap.
 
 ## CLI
 
@@ -39,9 +40,11 @@ pagefault maps                 — list configured memory regions
 pagefault load <name>          — load an assembled region to stdout
 pagefault scan <query...>      — scan backends for a query
 pagefault peek <uri>           — read a resource by URI
+pagefault fault <query...>     — spawn a subagent for deep retrieval
+pagefault ps                   — list configured subagents
 ```
 
-**Common flags** (accepted by all four):
+**Common flags** (accepted by every tool subcommand):
 
 | Flag              | Default  | Notes                                                      |
 |-------------------|----------|------------------------------------------------------------|
@@ -54,6 +57,8 @@ pagefault peek <uri>           — read a resource by URI
 - `load`: `--format markdown|json` (overrides the context's configured format)
 - `scan`: `--limit N` (default 10), `--backends a,b` (comma-separated names to restrict to)
 - `peek`: `--from N`, `--to N` (1-indexed, inclusive line range)
+- `fault`: `--agent <id>` (which subagent to spawn; default is the first configured), `--timeout N` (seconds; default 120)
+- `ps`: *(no extra flags)*
 
 **Config lookup order:**
 
@@ -93,6 +98,13 @@ pagefault scan "memory leak" --config pagefault.yaml --backends fs --json \
 
 # Read lines 10-20 of a file
 pagefault peek memory://notes/2026-04-10.md --config pagefault.yaml --from 10 --to 20
+
+# List configured subagents
+pagefault ps --config pagefault.yaml
+
+# Spawn an agent for deep retrieval
+pagefault fault "what did I decide about auth last month?" \
+  --config pagefault.yaml --agent wocha --timeout 180
 
 # Environment-variable config (no --config flag needed)
 export PAGEFAULT_CONFIG=~/.config/pagefault/pagefault.yaml
@@ -273,6 +285,79 @@ scheme or resource not found).
 
 ---
 
+## `pf_fault`
+
+The real page fault. Spawns a subagent (a full external process with its
+own tool access) to carry out a natural-language retrieval task and
+returns the agent's final response. Use when `pf_scan` / `pf_peek` miss
+and you need something smarter than substring matching.
+
+**Endpoint:** `POST /api/pf_fault`
+
+**Request:**
+
+| Field             | Type   | Required | Default | Notes                                                                 |
+|-------------------|--------|----------|---------|-----------------------------------------------------------------------|
+| `query`           | string | yes      | —       | Natural-language query: what to find, understand, or synthesize.     |
+| `agent`           | string | no       | first   | Subagent id to spawn (see `pf_ps`). Empty picks the first configured. |
+| `timeout_seconds` | int    | no       | 120     | Max seconds to wait for the agent. Also used as the kill deadline.    |
+
+**Response (success):**
+
+```json
+{
+  "answer": "The agent's synthesized response...",
+  "agent": "wocha",
+  "backend": "openclaw",
+  "elapsed_seconds": 47.3
+}
+```
+
+**Response (timeout):** timeouts are NOT HTTP errors — the structured
+response carries a `timed_out` flag and any partial output the backend
+captured before the kill:
+
+```json
+{
+  "agent": "wocha",
+  "backend": "openclaw",
+  "elapsed_seconds": 120.0,
+  "timed_out": true,
+  "partial_result": "...text captured before the deadline, if any..."
+}
+```
+
+**Errors:** 400 (empty query), 404 (unknown agent / no subagent backend
+configured), 500 (backend spawn error).
+
+---
+
+## `pf_ps`
+
+List every subagent exposed by every configured `SubagentBackend`. Zero
+cost — agents are read from config, no process/network I/O.
+
+**Endpoint:** `POST /api/pf_ps`
+
+**Request body:** none (empty `{}` is accepted)
+
+**Response:**
+
+```json
+{
+  "agents": [
+    {"id": "wocha", "description": "Dev agent with Feishu, LCM, workspace, and coding tools", "backend": "openclaw"},
+    {"id": "main",  "description": "Primary personal agent with full tool access",             "backend": "openclaw"}
+  ]
+}
+```
+
+Each entry's `backend` is the name of the `SubagentBackend` that hosts
+the agent. Multiple backends may expose agents with the same id — always
+disambiguate via `backend` when that happens.
+
+---
+
 ## Health
 
 `GET /health` — returns overall status plus per-backend status. No auth
@@ -281,17 +366,14 @@ required.
 ```json
 {
   "status": "ok",
-  "version": "0.1.0",
-  "backends": {"fs": "ok"}
+  "version": "0.3.0",
+  "backends": {"fs": "ok", "openclaw": "ok"}
 }
 ```
 
 ## Planned (future phases)
 
-These tools are defined in `plan.md` but **not implemented in Phase 1**:
+These tools are defined in `plan.md` but **not yet implemented**:
 
-- `pf_fault` — the real page fault. Spawns a subagent to do comprehensive
-  retrieval from backing store (Phase 2).
-- `pf_ps` — list configured subagents (Phase 2), `ps`-style.
 - `pf_poke` — direct append + agent writeback, the write counterpart to
   `pf_peek` (Phase 4).

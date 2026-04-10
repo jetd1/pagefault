@@ -8,6 +8,7 @@ package dispatcher
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -388,6 +389,160 @@ func (d *ToolDispatcher) backendForURI(uri string) (backend.Backend, error) {
 		return nil, fmt.Errorf("%w: no backend for scheme %q", model.ErrBackendNotFound, scheme)
 	}
 	return b, nil
+}
+
+// ───────────────────── list_agents (pf_ps) ─────────────────────
+
+// AgentSummary is the lightweight shape used by ListAgents. Each entry
+// identifies one agent plus the backend that exposes it — clients need
+// the backend name to disambiguate when two backends configure the same
+// agent id (rare but possible).
+type AgentSummary struct {
+	ID          string `json:"id"`
+	Description string `json:"description,omitempty"`
+	Backend     string `json:"backend"`
+}
+
+// ListAgents returns every agent exposed by every registered
+// SubagentBackend, preserving backend-registration order.
+func (d *ToolDispatcher) ListAgents(ctx context.Context, caller model.Caller) ([]AgentSummary, error) {
+	start := time.Now()
+
+	var out []AgentSummary
+	for _, b := range d.backendsOrdered {
+		sb, ok := b.(backend.SubagentBackend)
+		if !ok {
+			continue
+		}
+		for _, a := range sb.ListAgents() {
+			out = append(out, AgentSummary{
+				ID:          a.ID,
+				Description: a.Description,
+				Backend:     b.Name(),
+			})
+		}
+	}
+	d.auditLog.Log(audit.NewEntry(caller, "pf_ps", nil, start, len(out), nil))
+	return out, nil
+}
+
+// ───────────────────── deep_retrieve (pf_fault) ─────────────────────
+
+// DeepRetrieveResult is the structured response for a pf_fault call.
+// Either Answer (success) or PartialResult (timeout) may be populated.
+type DeepRetrieveResult struct {
+	Answer         string  `json:"answer,omitempty"`
+	Agent          string  `json:"agent"`
+	Backend        string  `json:"backend"`
+	ElapsedSeconds float64 `json:"elapsed_seconds"`
+	TimedOut       bool    `json:"timed_out,omitempty"`
+	PartialResult  string  `json:"partial_result,omitempty"`
+}
+
+// DeepRetrieve spawns a subagent to answer the query and returns the
+// agent's response. agentID may be empty (use the first subagent
+// backend's default). timeout overrides the backend's configured default
+// when non-zero.
+//
+// On timeout, DeepRetrieve returns a successful result with TimedOut=true
+// and the partial stdout in PartialResult. Other errors (unknown agent,
+// backend failure) propagate via the error return.
+func (d *ToolDispatcher) DeepRetrieve(ctx context.Context, query string, agentID string, timeout time.Duration, caller model.Caller) (*DeepRetrieveResult, error) {
+	start := time.Now()
+
+	var result *DeepRetrieveResult
+	var err error
+	defer func() {
+		size := 0
+		if result != nil {
+			size = len(result.Answer) + len(result.PartialResult)
+		}
+		d.auditLog.Log(audit.NewEntry(caller, "pf_fault",
+			map[string]any{"query": query, "agent": agentID, "timeout_s": int(timeout.Seconds())},
+			start, size, err))
+	}()
+
+	if query == "" {
+		err = fmt.Errorf("%w: empty query", model.ErrInvalidRequest)
+		return nil, err
+	}
+
+	target, agentName, ferr := d.findSubagent(agentID)
+	if ferr != nil {
+		err = ferr
+		return nil, err
+	}
+
+	// Spawn runs synchronously; the backend respects our timeout.
+	answer, spawnErr := target.Spawn(ctx, agentName, query, timeout)
+	elapsed := time.Since(start).Seconds()
+
+	r := &DeepRetrieveResult{
+		Agent:          agentName,
+		Backend:        target.Name(),
+		ElapsedSeconds: elapsed,
+	}
+
+	if errors.Is(spawnErr, model.ErrSubagentTimeout) {
+		r.TimedOut = true
+		r.PartialResult = answer
+		result = r
+		// Not an error from the caller's perspective — the structured
+		// result carries the timeout indicator. Surface the sentinel in
+		// the audit log instead.
+		slog.Warn("deep_retrieve: subagent timed out",
+			"agent", agentName, "backend", target.Name(),
+			"elapsed_s", elapsed, "caller", caller.ID)
+		return r, nil
+	}
+	if spawnErr != nil {
+		err = spawnErr
+		return nil, err
+	}
+
+	r.Answer = answer
+	result = r
+	return r, nil
+}
+
+// findSubagent locates a SubagentBackend that exposes the requested
+// agent id. An empty id returns the first subagent backend's default
+// agent. If no SubagentBackend is configured at all, ErrAgentNotFound is
+// returned with a descriptive message.
+func (d *ToolDispatcher) findSubagent(agentID string) (backend.SubagentBackend, string, error) {
+	var firstSub backend.SubagentBackend
+	for _, b := range d.backendsOrdered {
+		sb, ok := b.(backend.SubagentBackend)
+		if !ok {
+			continue
+		}
+		if firstSub == nil {
+			firstSub = sb
+		}
+		if agentID == "" {
+			continue
+		}
+		for _, a := range sb.ListAgents() {
+			if a.ID == agentID {
+				return sb, agentID, nil
+			}
+		}
+	}
+
+	if firstSub == nil {
+		return nil, "", fmt.Errorf("%w: no subagent backend configured", model.ErrAgentNotFound)
+	}
+	if agentID != "" {
+		return nil, "", fmt.Errorf("%w: %q", model.ErrAgentNotFound, agentID)
+	}
+	// Empty id → pick the first configured agent of the first subagent
+	// backend. Every SubagentBackend constructor guarantees at least one
+	// agent.
+	agents := firstSub.ListAgents()
+	if len(agents) == 0 {
+		return nil, "", fmt.Errorf("%w: backend %q has no agents", model.ErrAgentNotFound, firstSub.Name())
+	}
+	return firstSub, agents[0].ID, nil
 }
 
 // Close releases dispatcher-owned resources (primarily the audit logger).

@@ -103,6 +103,83 @@ type FilesystemBackendConfig struct {
 	Sandbox   bool                `yaml:"sandbox"`
 }
 
+// SubprocessBackendConfig configures a generic subprocess-search backend
+// (e.g., ripgrep). The backend runs Command with {query} substituted
+// (shell-escaped) and {roots} substituted as space-joined Roots, parses
+// stdout according to Parse, and returns SearchResults.
+type SubprocessBackendConfig struct {
+	Name    string   `yaml:"name" validate:"required"`
+	Type    string   `yaml:"type" validate:"required,eq=subprocess"`
+	Command string   `yaml:"command" validate:"required"`
+	Roots   []string `yaml:"roots,omitempty"`
+	Timeout int      `yaml:"timeout,omitempty"` // seconds; default 10
+	// Parse is the stdout format: "ripgrep_json" | "plain" (line per match).
+	// Default is "plain".
+	Parse string `yaml:"parse,omitempty"`
+}
+
+// HTTPBackendAuth configures per-backend auth for an HTTP backend. Kept
+// simple in Phase 2 — bearer tokens only. ${ENV} substitution is done by
+// the root Config loader before this struct is decoded.
+type HTTPBackendAuth struct {
+	Mode  string `yaml:"mode,omitempty"`  // "none" | "bearer"
+	Token string `yaml:"token,omitempty"` // Bearer token value
+}
+
+// HTTPBackendRequest is the request template used by an HTTPBackend for
+// both search and (future) read calls.
+type HTTPBackendRequest struct {
+	Method       string            `yaml:"method,omitempty"` // default "POST"
+	Path         string            `yaml:"path,omitempty"`
+	Headers      map[string]string `yaml:"headers,omitempty"`
+	BodyTemplate string            `yaml:"body_template,omitempty"`
+	// ResponsePath is a dotted JSON path that extracts the result array
+	// from the response body (e.g., "results" or "data.items"). If empty,
+	// the whole body is expected to be a JSON array.
+	ResponsePath string `yaml:"response_path,omitempty"`
+}
+
+// HTTPBackendConfig configures a generic HTTP search backend.
+type HTTPBackendConfig struct {
+	Name    string             `yaml:"name" validate:"required"`
+	Type    string             `yaml:"type" validate:"required,eq=http"`
+	BaseURL string             `yaml:"base_url" validate:"required"`
+	Auth    HTTPBackendAuth    `yaml:"auth,omitempty"`
+	Search  HTTPBackendRequest `yaml:"search,omitempty"`
+	Timeout int                `yaml:"timeout,omitempty"` // seconds; default 15
+}
+
+// SubagentCLIBackendConfig configures a CLI subagent backend. The backend
+// shells out using Command with {agent_id}, {task}, and {timeout}
+// substituted at spawn time; the first argument is taken from the command
+// template's first whitespace-delimited token.
+type SubagentCLIBackendConfig struct {
+	Name    string      `yaml:"name" validate:"required"`
+	Type    string      `yaml:"type" validate:"required,eq=subagent-cli"`
+	Command string      `yaml:"command" validate:"required"`
+	Timeout int         `yaml:"timeout,omitempty"` // seconds; default 300
+	Agents  []AgentSpec `yaml:"agents" validate:"required,min=1,dive"`
+}
+
+// SubagentHTTPBackendConfig configures an HTTP subagent backend. Spawn
+// POSTs to {base_url}{spawn.path} with the configured body template.
+type SubagentHTTPBackendConfig struct {
+	Name    string             `yaml:"name" validate:"required"`
+	Type    string             `yaml:"type" validate:"required,eq=subagent-http"`
+	BaseURL string             `yaml:"base_url" validate:"required"`
+	Auth    HTTPBackendAuth    `yaml:"auth,omitempty"`
+	Spawn   HTTPBackendRequest `yaml:"spawn" validate:"required"`
+	Timeout int                `yaml:"timeout,omitempty"` // seconds; default 300
+	Agents  []AgentSpec        `yaml:"agents" validate:"required,min=1,dive"`
+}
+
+// AgentSpec describes a single agent exposed by a subagent backend. Used
+// for both CLI and HTTP variants.
+type AgentSpec struct {
+	ID          string `yaml:"id" validate:"required"`
+	Description string `yaml:"description,omitempty"`
+}
+
 // ContextConfig defines a named bundle of backend sources.
 type ContextConfig struct {
 	Name        string          `yaml:"name" validate:"required"`
@@ -291,4 +368,72 @@ func DecodeFilesystemBackend(bc BackendConfig) (*FilesystemBackendConfig, error)
 		return nil, fmt.Errorf("config: backend %q: %w: %s", bc.Name, ErrValidation, err.Error())
 	}
 	return &fs, nil
+}
+
+// DecodeSubprocessBackend extracts a SubprocessBackendConfig from a generic
+// BackendConfig.
+func DecodeSubprocessBackend(bc BackendConfig) (*SubprocessBackendConfig, error) {
+	if bc.Type != "subprocess" {
+		return nil, fmt.Errorf("config: backend %q: expected type subprocess, got %q", bc.Name, bc.Type)
+	}
+	var sp SubprocessBackendConfig
+	if err := bc.Raw.Decode(&sp); err != nil {
+		return nil, fmt.Errorf("config: backend %q: decode subprocess: %w", bc.Name, err)
+	}
+	v := validator.New(validator.WithRequiredStructEnabled())
+	if err := v.Struct(&sp); err != nil {
+		return nil, fmt.Errorf("config: backend %q: %w: %s", bc.Name, ErrValidation, err.Error())
+	}
+	return &sp, nil
+}
+
+// DecodeHTTPBackend extracts an HTTPBackendConfig from a generic
+// BackendConfig.
+func DecodeHTTPBackend(bc BackendConfig) (*HTTPBackendConfig, error) {
+	if bc.Type != "http" {
+		return nil, fmt.Errorf("config: backend %q: expected type http, got %q", bc.Name, bc.Type)
+	}
+	var h HTTPBackendConfig
+	if err := bc.Raw.Decode(&h); err != nil {
+		return nil, fmt.Errorf("config: backend %q: decode http: %w", bc.Name, err)
+	}
+	v := validator.New(validator.WithRequiredStructEnabled())
+	if err := v.Struct(&h); err != nil {
+		return nil, fmt.Errorf("config: backend %q: %w: %s", bc.Name, ErrValidation, err.Error())
+	}
+	return &h, nil
+}
+
+// DecodeSubagentCLIBackend extracts a SubagentCLIBackendConfig from a
+// generic BackendConfig.
+func DecodeSubagentCLIBackend(bc BackendConfig) (*SubagentCLIBackendConfig, error) {
+	if bc.Type != "subagent-cli" {
+		return nil, fmt.Errorf("config: backend %q: expected type subagent-cli, got %q", bc.Name, bc.Type)
+	}
+	var s SubagentCLIBackendConfig
+	if err := bc.Raw.Decode(&s); err != nil {
+		return nil, fmt.Errorf("config: backend %q: decode subagent-cli: %w", bc.Name, err)
+	}
+	v := validator.New(validator.WithRequiredStructEnabled())
+	if err := v.Struct(&s); err != nil {
+		return nil, fmt.Errorf("config: backend %q: %w: %s", bc.Name, ErrValidation, err.Error())
+	}
+	return &s, nil
+}
+
+// DecodeSubagentHTTPBackend extracts a SubagentHTTPBackendConfig from a
+// generic BackendConfig.
+func DecodeSubagentHTTPBackend(bc BackendConfig) (*SubagentHTTPBackendConfig, error) {
+	if bc.Type != "subagent-http" {
+		return nil, fmt.Errorf("config: backend %q: expected type subagent-http, got %q", bc.Name, bc.Type)
+	}
+	var s SubagentHTTPBackendConfig
+	if err := bc.Raw.Decode(&s); err != nil {
+		return nil, fmt.Errorf("config: backend %q: decode subagent-http: %w", bc.Name, err)
+	}
+	v := validator.New(validator.WithRequiredStructEnabled())
+	if err := v.Struct(&s); err != nil {
+		return nil, fmt.Errorf("config: backend %q: %w: %s", bc.Name, ErrValidation, err.Error())
+	}
+	return &s, nil
 }

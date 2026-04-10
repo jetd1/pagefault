@@ -207,3 +207,245 @@ func TestDecodeFilesystemBackend_WrongType(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "expected type filesystem")
 }
+
+// parseSingleBackend is a test helper that parses a minimal config
+// containing a single non-filesystem backend defined by the caller's
+// YAML snippet. The helper adds the server/auth/filesystem scaffolding
+// needed to satisfy the top-level validator and returns the extra
+// backend at index 1 (index 0 is the scaffold `fs` backend).
+func parseSingleBackend(t *testing.T, snippet string) BackendConfig {
+	t.Helper()
+	yaml := `
+server:
+  host: "127.0.0.1"
+  port: 8444
+auth:
+  mode: "none"
+backends:
+  - name: fs
+    type: filesystem
+    root: "/tmp"
+    include: ["**/*.md"]
+    uri_scheme: "memory"
+    sandbox: true
+` + snippet
+	cfg, err := Parse([]byte(yaml))
+	require.NoError(t, err)
+	require.Len(t, cfg.Backends, 2, "snippet must contribute exactly one extra backend")
+	return cfg.Backends[1]
+}
+
+// ───────────── DecodeSubprocessBackend ─────────────
+
+func TestDecodeSubprocessBackend_HappyPath(t *testing.T) {
+	bc := parseSingleBackend(t, `
+  - name: rg
+    type: subprocess
+    command: "rg --json -n {query} {roots}"
+    roots:
+      - "/home/jet/notes"
+    timeout: 7
+    parse: "ripgrep_json"
+`)
+	got, err := DecodeSubprocessBackend(bc)
+	require.NoError(t, err)
+	assert.Equal(t, "rg", got.Name)
+	assert.Equal(t, "rg --json -n {query} {roots}", got.Command)
+	assert.Equal(t, []string{"/home/jet/notes"}, got.Roots)
+	assert.Equal(t, 7, got.Timeout)
+	assert.Equal(t, "ripgrep_json", got.Parse)
+}
+
+func TestDecodeSubprocessBackend_WrongType(t *testing.T) {
+	bc := BackendConfig{Name: "x", Type: "filesystem"}
+	_, err := DecodeSubprocessBackend(bc)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "expected type subprocess")
+}
+
+func TestDecodeSubprocessBackend_MissingCommand(t *testing.T) {
+	bc := parseSingleBackend(t, `
+  - name: rg
+    type: subprocess
+    timeout: 5
+`)
+	_, err := DecodeSubprocessBackend(bc)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrValidation)
+	assert.Contains(t, err.Error(), "Command")
+}
+
+// ───────────── DecodeHTTPBackend ─────────────
+
+func TestDecodeHTTPBackend_HappyPath(t *testing.T) {
+	bc := parseSingleBackend(t, `
+  - name: lcm
+    type: http
+    base_url: "http://127.0.0.1:6443"
+    auth:
+      mode: "bearer"
+      token: "abc"
+    search:
+      method: "POST"
+      path: "/api/lcm/search"
+      body_template: '{"q":"{query}"}'
+      response_path: "results"
+    timeout: 12
+`)
+	got, err := DecodeHTTPBackend(bc)
+	require.NoError(t, err)
+	assert.Equal(t, "lcm", got.Name)
+	assert.Equal(t, "http://127.0.0.1:6443", got.BaseURL)
+	assert.Equal(t, "bearer", got.Auth.Mode)
+	assert.Equal(t, "abc", got.Auth.Token)
+	assert.Equal(t, "POST", got.Search.Method)
+	assert.Equal(t, "/api/lcm/search", got.Search.Path)
+	assert.Equal(t, "results", got.Search.ResponsePath)
+	assert.Equal(t, 12, got.Timeout)
+}
+
+func TestDecodeHTTPBackend_WrongType(t *testing.T) {
+	bc := BackendConfig{Name: "x", Type: "filesystem"}
+	_, err := DecodeHTTPBackend(bc)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "expected type http")
+}
+
+func TestDecodeHTTPBackend_MissingBaseURL(t *testing.T) {
+	bc := parseSingleBackend(t, `
+  - name: lcm
+    type: http
+    search:
+      path: "/s"
+`)
+	_, err := DecodeHTTPBackend(bc)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrValidation)
+	assert.Contains(t, err.Error(), "BaseURL")
+}
+
+// ───────────── DecodeSubagentCLIBackend ─────────────
+
+func TestDecodeSubagentCLIBackend_HappyPath(t *testing.T) {
+	bc := parseSingleBackend(t, `
+  - name: openclaw
+    type: subagent-cli
+    command: "openclaw run --agent {agent_id} --task {task}"
+    timeout: 300
+    agents:
+      - id: wocha
+        description: "dev agent"
+      - id: main
+        description: "primary"
+`)
+	got, err := DecodeSubagentCLIBackend(bc)
+	require.NoError(t, err)
+	assert.Equal(t, "openclaw", got.Name)
+	assert.Equal(t, 300, got.Timeout)
+	require.Len(t, got.Agents, 2)
+	assert.Equal(t, "wocha", got.Agents[0].ID)
+	assert.Equal(t, "dev agent", got.Agents[0].Description)
+	assert.Equal(t, "main", got.Agents[1].ID)
+}
+
+func TestDecodeSubagentCLIBackend_WrongType(t *testing.T) {
+	bc := BackendConfig{Name: "x", Type: "subagent-http"}
+	_, err := DecodeSubagentCLIBackend(bc)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "expected type subagent-cli")
+}
+
+func TestDecodeSubagentCLIBackend_MissingAgents(t *testing.T) {
+	bc := parseSingleBackend(t, `
+  - name: openclaw
+    type: subagent-cli
+    command: "echo hi"
+`)
+	_, err := DecodeSubagentCLIBackend(bc)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrValidation)
+	assert.Contains(t, err.Error(), "Agents")
+}
+
+func TestDecodeSubagentCLIBackend_MissingCommand(t *testing.T) {
+	bc := parseSingleBackend(t, `
+  - name: openclaw
+    type: subagent-cli
+    agents:
+      - id: alpha
+`)
+	_, err := DecodeSubagentCLIBackend(bc)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrValidation)
+	assert.Contains(t, err.Error(), "Command")
+}
+
+// ───────────── DecodeSubagentHTTPBackend ─────────────
+
+func TestDecodeSubagentHTTPBackend_HappyPath(t *testing.T) {
+	bc := parseSingleBackend(t, `
+  - name: oc-http
+    type: subagent-http
+    base_url: "https://localhost:6443/api"
+    auth:
+      mode: "bearer"
+      token: "tok"
+    spawn:
+      method: "POST"
+      path: "/agents/{agent_id}/run"
+      body_template: '{"task":"{task}"}'
+      response_path: "result"
+    timeout: 180
+    agents:
+      - id: wocha
+        description: "dev agent"
+`)
+	got, err := DecodeSubagentHTTPBackend(bc)
+	require.NoError(t, err)
+	assert.Equal(t, "oc-http", got.Name)
+	assert.Equal(t, "https://localhost:6443/api", got.BaseURL)
+	assert.Equal(t, "bearer", got.Auth.Mode)
+	assert.Equal(t, "tok", got.Auth.Token)
+	assert.Equal(t, "POST", got.Spawn.Method)
+	assert.Equal(t, "/agents/{agent_id}/run", got.Spawn.Path)
+	assert.Equal(t, "result", got.Spawn.ResponsePath)
+	assert.Equal(t, 180, got.Timeout)
+	require.Len(t, got.Agents, 1)
+	assert.Equal(t, "wocha", got.Agents[0].ID)
+}
+
+func TestDecodeSubagentHTTPBackend_WrongType(t *testing.T) {
+	bc := BackendConfig{Name: "x", Type: "subagent-cli"}
+	_, err := DecodeSubagentHTTPBackend(bc)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "expected type subagent-http")
+}
+
+func TestDecodeSubagentHTTPBackend_MissingBaseURL(t *testing.T) {
+	bc := parseSingleBackend(t, `
+  - name: oc
+    type: subagent-http
+    spawn:
+      path: "/run"
+    agents:
+      - id: alpha
+`)
+	_, err := DecodeSubagentHTTPBackend(bc)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrValidation)
+	assert.Contains(t, err.Error(), "BaseURL")
+}
+
+func TestDecodeSubagentHTTPBackend_MissingAgents(t *testing.T) {
+	bc := parseSingleBackend(t, `
+  - name: oc
+    type: subagent-http
+    base_url: "http://x"
+    spawn:
+      path: "/run"
+`)
+	_, err := DecodeSubagentHTTPBackend(bc)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrValidation)
+	assert.Contains(t, err.Error(), "Agents")
+}

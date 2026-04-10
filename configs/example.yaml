@@ -1,0 +1,147 @@
+# pagefault — example configuration covering every backend type.
+#
+# This config is a tour, not a minimum. It demonstrates all five backend
+# types (filesystem, subprocess, http, subagent-cli, subagent-http) so
+# you can see how each one is declared. For the smallest runnable
+# config, see configs/minimal.yaml.
+#
+# As shipped, only the `fs` and `sa` backends are active — the other
+# three are commented out because they need external dependencies
+# (ripgrep, a running HTTP API, an agent runtime). Uncomment and edit
+# them to match your environment.
+#
+# Run with:
+#   pagefault serve --config configs/example.yaml
+#
+# Then try:
+#   curl -s localhost:8444/api/pf_maps -X POST | jq
+#   curl -s localhost:8444/api/pf_ps   -X POST | jq
+#   curl -s localhost:8444/api/pf_fault -X POST \
+#     -H 'Content-Type: application/json' \
+#     -d '{"query":"hello"}' | jq
+
+server:
+  host: "127.0.0.1"
+  port: 8444
+
+auth:
+  mode: "none"   # for a live deployment, use "bearer" + a tokens file
+
+# ── Backends ────────────────────────────────────
+
+backends:
+  # (1) Filesystem — the Phase-1 workhorse. Serves markdown files from
+  # a directory tree, with include/exclude globs, auto-tagging, and a
+  # sandbox against symlink escapes.
+  - name: fs
+    type: filesystem
+    root: "./demo-data"
+    include: ["**/*.md"]
+    exclude: []
+    uri_scheme: "memory"
+    sandbox: true
+    auto_tag:
+      "**/*.md": ["demo", "markdown"]
+
+  # (2) Subagent (CLI) — spawns an external process for pf_fault. The
+  # echo template below is a no-op stand-in so you can exercise pf_ps
+  # and pf_fault without installing anything: `pagefault fault hello`
+  # will return "alpha:hello". Swap in a real agent runner (openclaw,
+  # claude-code, a custom shell script, etc.) for anything useful.
+  - name: sa
+    type: subagent-cli
+    command: "echo {agent_id}:{task}"
+    timeout: 60
+    agents:
+      - id: alpha
+        description: "example echo agent — first configured, used as the default"
+      - id: beta
+        description: "example echo agent — pick via --agent beta"
+
+  # (3) Subprocess — generic "run a command, parse stdout" backend.
+  # Canonical use: ripgrep for fast indexed search across a corpus.
+  # Uncomment and adjust `roots` to your workspace. `parse: ripgrep_json`
+  # consumes ripgrep's `--json` output; alternatives are `grep` for
+  # classic `path:lineno:content` or `plain` (one snippet per line).
+  #
+  # - name: rg
+  #   type: subprocess
+  #   command: "rg --json -i -n --max-count 20 {query} {roots}"
+  #   roots:
+  #     - "./demo-data"
+  #   timeout: 10
+  #   parse: "ripgrep_json"
+
+  # (4) HTTP — generic "POST a search and decode the response" backend.
+  # Useful for wiring pagefault against a remote search/index API
+  # (LCM, Elastic, a custom endpoint). {query} is JSON-escaped and
+  # {limit} is interpolated; `response_path` walks the JSON body to
+  # find the array of hits. Each hit may expose `uri`, `snippet`,
+  # `score`, and `metadata`.
+  #
+  # - name: lcm
+  #   type: http
+  #   base_url: "http://127.0.0.1:6443"
+  #   auth:
+  #     mode: "bearer"
+  #     token: "${LCM_TOKEN}"   # ${ENV} substitution happens at load time
+  #   search:
+  #     method: "POST"
+  #     path: "/api/lcm/search"
+  #     body_template: '{"query": "{query}", "limit": {limit}}'
+  #     response_path: "results"
+  #   timeout: 15
+
+  # (5) Subagent (HTTP) — spawns an agent via HTTP for pf_fault.
+  # Useful when agents live behind a gateway. {agent_id} can appear in
+  # the path or body; {task} is JSON-escaped before substitution.
+  #
+  # - name: sa-http
+  #   type: subagent-http
+  #   base_url: "https://localhost:6443/api"
+  #   auth:
+  #     mode: "bearer"
+  #     token: "${AGENT_GATEWAY_TOKEN}"
+  #   spawn:
+  #     method: "POST"
+  #     path: "/agents/{agent_id}/run"
+  #     body_template: '{"task": "{task}", "timeout": {timeout}}'
+  #     response_path: "result"
+  #   timeout: 300
+  #   agents:
+  #     - id: wocha
+  #       description: "Dev agent with full tool access"
+
+# ── Contexts ────────────────────────────────────
+
+contexts:
+  - name: demo
+    description: "Demo context — the README from ./demo-data"
+    sources:
+      - backend: fs
+        uri: "memory://README.md"
+    format: markdown
+    max_size: 4000
+
+# ── Tools ───────────────────────────────────────
+
+tools:
+  pf_maps:  true
+  pf_load:  true
+  pf_scan:  true
+  pf_peek:  true
+  pf_fault: true    # needs at least one subagent backend; sa above satisfies this
+  pf_ps:    true
+  # pf_poke: false  # Phase 4, not yet implemented
+
+# ── Filters ─────────────────────────────────────
+
+filters:
+  enabled: false    # flip to true and add path/tag rules in a real deployment
+
+# ── Audit ───────────────────────────────────────
+
+audit:
+  enabled: true
+  mode: "stdout"    # CLI invocations auto-rewrite stdout → stderr so
+                    # `pagefault load demo --json | jq .` stays clean.

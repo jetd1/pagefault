@@ -119,7 +119,7 @@ type Backend interface {
 }
 ```
 
-Phase-1 ships **FilesystemBackend** only. Its responsibilities:
+**FilesystemBackend** (Phase 1). Responsibilities:
 
 - Map URIs (`memory://foo.md`) to filesystem paths under the configured root
 - Enforce an include/exclude glob filter (doublestar syntax)
@@ -130,6 +130,45 @@ Phase-1 ships **FilesystemBackend** only. Its responsibilities:
 Search is naive substring matching (case-insensitive, first match per file).
 It is fast enough for thousands of small markdown files; a future phase can
 add an index-backed backend type.
+
+**Phase-2 backends** (shipped in 0.3.0):
+
+- **SubprocessBackend** — runs an external command (canonical case:
+  ripgrep) and parses stdout. Parse modes: `ripgrep_json`, `grep`
+  (`path:lineno:content`), `plain`. Read is unsupported (use a
+  filesystem backend alongside it if you need content). Exit code 1 is
+  treated as "no matches" rather than an error.
+- **HTTPBackend** — generic HTTP search backend. Issues a single HTTP
+  request per `Search`, extracts a result array with a dotted
+  `response_path`, and converts each element into a `SearchResult`.
+- **SubagentCLIBackend** / **SubagentHTTPBackend** — implement
+  `SubagentBackend`, which extends `Backend` with
+  `Spawn(ctx, agentID, task, timeout)` and `ListAgents()`. `pf_fault`
+  calls `Spawn`; `pf_ps` calls `ListAgents` across every configured
+  `SubagentBackend`.
+
+All backend constructors live in `cmd/pagefault/serve.go`'s
+`buildDispatcher`, which is the single switch on `bc.Type` that wires
+backends from YAML into the dispatcher.
+
+### Subagent trust model
+
+Subagents are external processes (or remote HTTP endpoints) that
+pagefault *cannot* sandbox. The security perimeter of pagefault ends
+at `SubagentBackend.Spawn` — everything the agent does after that
+runs with the operator's privileges, not pagefault's. Concretely:
+
+- The filter pipeline does *not* apply to what an agent reads or
+  writes; it only applies to `pf_fault`'s *request* (the query and
+  agent id), not to the agent's subsequent workspace access.
+- Agents supplied by `subagent-cli` inherit the pagefault process's
+  environment and file descriptors. Operators should pick a command
+  template that runs in an appropriate sandbox if that matters.
+- Agents supplied by `subagent-http` are trusted to enforce their own
+  access control; pagefault just forwards the task.
+- Timeouts are enforced by pagefault (`exec.CommandContext` kills the
+  child; the HTTP client cancels the request) but a misbehaving agent
+  can still complete side effects before the deadline fires.
 
 ## Auth layer
 
@@ -213,7 +252,7 @@ the config — see `docs/config-doc.md`.
 
 See `plan.md` §10 for the full roadmap. Short version:
 
-- **Phase 2:** subagent / subprocess / http backends, `pf_fault` (deep retrieval), `pf_ps` (list agents)
+- **Phase 2 (shipped in 0.3.0):** subagent / subprocess / http backends, `pf_fault` (deep retrieval), `pf_ps` (list agents), plus matching CLI subcommands.
 - **Phase 3:** redaction filter, OpenAPI spec, CORS, rate limiting
 - **Phase 4:** write support (direct append + agent writeback)
 - **Phase 5:** OAuth2, caching, streaming, metrics

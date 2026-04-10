@@ -7,6 +7,89 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+## 0.3.1 (2026-04-10)
+
+Review-response patch for 0.3.0. No wire-surface or behavior changes —
+only tests, refactoring, and documentation.
+
+### Added
+- **`configs/example.yaml`** — documented reference config showing all
+  five backend types (filesystem, subprocess, http, subagent-cli,
+  subagent-http). Ships runnable (uses echo-based subagent-cli) with
+  subprocess / http / subagent-http commented out so operators can
+  uncomment and edit. README + `docs/config-doc.md` updated to point
+  at it.
+- **Direct unit tests for every `Decode*Backend` helper in
+  `internal/config`**: `TestDecodeSubprocessBackend_*`,
+  `TestDecodeHTTPBackend_*`, `TestDecodeSubagentCLIBackend_*`,
+  `TestDecodeSubagentHTTPBackend_*` (happy path, wrong type, missing
+  required fields). Coverage for `internal/config` bounced from
+  54.6% → 87.6%.
+- **`internal/backend/http_helpers_test.go`** — focused unit tests for
+  the shared helpers, including `extractResponse` which was only
+  exercised indirectly before (empty-path raw path, string/number/
+  object leaves, missing paths, malformed JSON, `$.` prefix).
+
+### Changed
+- **Shared HTTP helpers extracted to `internal/backend/http_helpers.go`.**
+  `renderTemplate`, `jsonEscape`, `walkPath`, and `extractResponse`
+  were declared in `subagent_http.go` but used by both
+  `subagent_http.go` and `http.go`, which made ownership fuzzy.
+  They now live in a dedicated file so neither consumer is "reaching
+  across" its peer. `subagent_http.go`'s `encoding/json` import was
+  dropped along the way.
+
+## 0.3.0 (2026-04-10)
+
+### Added
+- **Phase 2 subagents and new backend types.** Four new backends land at
+  once, along with the tools that use them:
+  - `subagent-cli` — spawns a CLI agent via `exec.CommandContext`, with
+    `{agent_id}` / `{task}` / `{timeout}` placeholders, tokenized argv
+    (no shell), per-call timeouts that kill the process on expiry, and
+    partial-stdout capture on timeout.
+  - `subagent-http` — POSTs to a configured endpoint, JSON body
+    template, bearer auth, dotted `response_path` extraction, per-call
+    timeout via `http.Request` context.
+  - `subprocess` — generic command-runs-a-query backend. Parse modes:
+    `ripgrep_json`, `grep` (`path:lineno:content`), `plain`. Treats
+    `exit 1` as "no matches" instead of an error.
+  - `http` — generic HTTP search backend. POST/GET, body template,
+    `response_path`, per-request-object results with `uri`/`snippet`/
+    `score`/`metadata`.
+- **`pf_fault` tool.** The real page fault: a tool that spawns a
+  subagent to answer a natural-language query. Spec in `docs/api-doc.md`
+  §pf_fault — query + agent + timeout_seconds in, answer/partial
+  result + elapsed + timed_out flag out. Timeouts surface as a
+  successful response with `timed_out: true` so clients can inspect the
+  partial result without special error handling.
+- **`pf_ps` tool.** Lists every agent exposed by every configured
+  `SubagentBackend` (id, description, backend name), ps-style.
+- **CLI subcommands.** `pagefault fault <query…>` (flags: `--agent`,
+  `--timeout`) and `pagefault ps` round out the CLI surface to match
+  the wire tools. Same dispatcher, same filter + audit path as REST/MCP.
+- `internal/model`: two new sentinel errors — `ErrAgentNotFound` and
+  `ErrSubagentTimeout`. The server maps them to `404 Not Found` and
+  `504 Gateway Timeout` respectively.
+- `internal/backend.SubagentBackend` interface: extends `Backend` with
+  `Spawn(ctx, agentID, task, timeout) (string, error)` and
+  `ListAgents() []AgentInfo`.
+- `dispatcher.ListAgents` and `dispatcher.DeepRetrieve` methods, plus
+  `dispatcher.findSubagent` which picks the first configured backend
+  when no agent id is specified and scans every backend otherwise.
+
+### Changed
+- `buildDispatcher` in `cmd/pagefault/serve.go` now wires the four new
+  backend types. Only `filesystem`, `subprocess`, `http`,
+  `subagent-cli`, `subagent-http` are recognised — unknown types fail
+  with a helpful error listing the valid names.
+- `internal/server`: `errorStatus` maps `ErrAgentNotFound` → 404 and
+  `ErrSubagentTimeout` → 504. REST routes `/api/pf_fault` and
+  `/api/pf_ps` added behind the same auth + filter stack as the
+  Phase-1 tools.
+- `internal/tool/mcp.go`: registers the two new MCP tools
+  (`pf_fault`, `pf_ps`) via `registerDeepRetrieve` / `registerListAgents`.
+
 ## 0.2.0 (2026-04-10)
 
 ### Added

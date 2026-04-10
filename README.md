@@ -46,8 +46,10 @@ the full reference.
 ## Creating a production config
 
 ```bash
-# 1. Copy the minimal config as a starting point
-cp configs/minimal.yaml pagefault.yaml
+# 1. Start from a template:
+#    - configs/minimal.yaml  — the smallest runnable config (filesystem only)
+#    - configs/example.yaml  — a tour of every backend type, with inline docs
+cp configs/example.yaml pagefault.yaml
 
 # 2. Enable bearer auth and point it at a tokens file
 # (see docs/config-doc.md for every field)
@@ -78,6 +80,35 @@ bash scripts/smoke.sh   # end-to-end smoke test
 
 ## Recent Changes
 
+### 0.3.1 — 2026-04-10
+
+- **`configs/example.yaml`** added — a documented tour of every backend
+  type (filesystem, subprocess, http, subagent-cli, subagent-http) with
+  three of them commented out so new users can uncomment what they need.
+- **Config test coverage rebound.** `internal/config` went from 54.6%
+  → 87.6% after direct unit tests were added for every
+  `Decode*Backend` helper (happy path, wrong type, missing required
+  fields).
+- **Shared HTTP helpers moved to `internal/backend/http_helpers.go`.**
+  `renderTemplate`, `jsonEscape`, `walkPath`, `extractResponse` are
+  now owned by their own file instead of sitting in `subagent_http.go`
+  and being called from `http.go`. No behavior change.
+
+### 0.3.0 — 2026-04-10
+
+- **Phase 2 lands.** Four new backend types: `subagent-cli`,
+  `subagent-http`, `subprocess` (ripgrep-style search), and generic
+  `http`. Each is wired into `buildDispatcher` and unit-tested.
+- **`pf_fault`** — the real page fault. Spawns a subagent to do a
+  natural-language retrieval over configured memory, with per-call
+  timeouts, partial-result capture, and a structured `timed_out` flag
+  instead of an error on deadline.
+- **`pf_ps`** — lists configured subagents ps-style (id, description,
+  host backend).
+- **New CLI subcommands.** `pagefault fault <query…> [--agent] [--timeout]`
+  and `pagefault ps` — same dispatcher, same audit/filter path as the
+  HTTP and MCP transports.
+
 ### 0.2.0 — 2026-04-10
 
 - **Tool rename (breaking).** Wire surface now uses `pf_*` names:
@@ -90,8 +121,6 @@ bash scripts/smoke.sh   # end-to-end smoke test
 - **`pf_load` skipped-source visibility.** Sources dropped by filters or
   backend errors are returned in `skipped_sources` with a reason, and
   logged at WARN. UTF-8 truncation now walks back to a rune boundary.
-- **`docs/security.md`** added (threat model, filter/audit notes, known
-  limitations, deployment checklist) — previously missing from the spec.
 
 ### 0.1.0 — 2026-04-10
 

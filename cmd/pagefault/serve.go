@@ -128,10 +128,48 @@ func buildDispatcher(cfg *config.Config) (*dispatcher.ToolDispatcher, func() err
 				return nil, nil, err
 			}
 			backends = append(backends, be)
+		case "subprocess":
+			spCfg, err := config.DecodeSubprocessBackend(bc)
+			if err != nil {
+				return nil, nil, err
+			}
+			be, err := backend.NewSubprocessBackend(spCfg)
+			if err != nil {
+				return nil, nil, err
+			}
+			backends = append(backends, be)
+		case "http":
+			hCfg, err := config.DecodeHTTPBackend(bc)
+			if err != nil {
+				return nil, nil, err
+			}
+			be, err := backend.NewHTTPBackend(hCfg)
+			if err != nil {
+				return nil, nil, err
+			}
+			backends = append(backends, be)
+		case "subagent-cli":
+			saCfg, err := config.DecodeSubagentCLIBackend(bc)
+			if err != nil {
+				return nil, nil, err
+			}
+			be, err := backend.NewSubagentCLIBackend(saCfg)
+			if err != nil {
+				return nil, nil, err
+			}
+			backends = append(backends, be)
+		case "subagent-http":
+			saCfg, err := config.DecodeSubagentHTTPBackend(bc)
+			if err != nil {
+				return nil, nil, err
+			}
+			be, err := backend.NewSubagentHTTPBackend(saCfg)
+			if err != nil {
+				return nil, nil, err
+			}
+			backends = append(backends, be)
 		default:
-			// Phase 1 only supports filesystem. Other types will be added
-			// in Phase 2 (subprocess, http, subagent).
-			return nil, nil, fmt.Errorf("backend %q: unsupported type %q (only 'filesystem' is available in Phase 1)", bc.Name, bc.Type)
+			return nil, nil, fmt.Errorf("backend %q: unsupported type %q (expected one of: filesystem, subprocess, http, subagent-cli, subagent-http)", bc.Name, bc.Type)
 		}
 	}
 
