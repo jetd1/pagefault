@@ -7,6 +7,345 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+## 0.6.0 (2026-04-11)
+
+Real-deployment feedback pass, three waves. Running pagefault behind
+live clients surfaced a cluster of agent-facing friction points that
+the 0.5.x wire shape and terse tool descriptions did not cover:
+
+1. **Claude Desktop could not connect.** It speaks MCP over legacy
+   SSE and pagefault's `/mcp` endpoint was streamable-http only,
+   forcing users into an `npx supergateway` bridge.
+2. **Cold agents did not know *when* to reach for `pf_*` tools.**
+   Nothing in the MCP handshake told them; adoption was
+   inconsistent across sessions.
+3. **Subagents behaved like generic Q&A bots.** A live `pf_fault`
+   run for "what did I note about oleander" returned a
+   world-knowledge toxicity sheet, because nothing told the
+   subagent its job was memory retrieval — so it answered from
+   training data.
+4. **Per-parameter tool descriptions were too terse.** Agents did
+   not know how to construct a good query, URI, or content payload.
+5. **`pf_fault` had no time-window hook.** "What did I do last
+   week" needed a way to scope the subagent's search.
+6. **Agent selection was invisible.** A multi-agent setup
+   (`wocha` = work, `cha` = personal) surfaced in `pf_ps` with
+   clear routing descriptions, but `pf_fault`'s `agent` parameter
+   documented "leave empty to use the first configured agent" —
+   so the calling agent silently defaulted to whichever was listed
+   first and missed the richer source. A second trace run showed
+   the calling agent skipping `pf_ps` entirely, spawning `wocha`
+   by accident, and only realising afterwards that `cha` would
+   have had richer daily-notes data.
+7. **Timeout guidance was actively harmful.** The old
+   `timeout_seconds` description suggested "lower to 30-60 for
+   simple recalls", but real `pf_fault` runs in the trace took
+   22-29s just to return their first token — a 30s deadline
+   would truncate nearly every run.
+
+All addressed here without breaking any existing wire shape.
+The Spawn interface gains a `SpawnRequest` struct so future knobs
+can land without churning every call site again.
+
+### Added
+- **Native MCP legacy-SSE transport.** `GET /sse` opens a persistent
+  `text/event-stream`, emits an `endpoint` event carrying a
+  sessionId, and streams JSON-RPC responses back as `message` events;
+  `POST /message?sessionId=...` accepts the paired message POSTs and
+  202-Accepts before dispatching through the same `MCPServer` the
+  `/mcp` route uses. Both transports share the same tool set, auth
+  chain, rate limiter, and instructions — the only difference is the
+  wire framing. Claude Desktop now connects natively; the
+  `supergateway` workaround is no longer needed.
+  - New `internal/server` wiring: `sseSrv := mcpserver.NewSSEServer(
+    mcpSrv, …)`, mounted inside the existing auth group so bearer
+    tokens flow through on both the SSE GET and the message POST.
+  - `server.public_url`, when set, feeds mcp-go's `WithBaseURL` so
+    the `endpoint` event emits an absolute URL — safer behind
+    reverse proxies where relative resolution could land a client
+    on the wrong host. Empty `public_url` keeps the old
+    root-relative behaviour.
+- **Opt-out `server.mcp.sse_enabled` toggle** (default `true`).
+  Operators who only serve streamable-http clients can set it to
+  `false` to drop the `/sse` + `/message` routes and shrink the
+  public surface. The `TestServer_SSE_DisabledReturns404` test
+  guards the toggle so a future refactor cannot accidentally
+  re-mount the routes.
+- **Server-level MCP instructions** via
+  `mcpserver.WithInstructions()`. Most MCP clients (Claude Desktop,
+  Claude Code, etc.) surface this string in the agent's system
+  prompt, which makes it the single most reliable lever for
+  teaching agents when pagefault's tools are the right move. Ships
+  as a prescriptive default in the new
+  `internal/tool/instructions.go` — it lists the signal phrases
+  that should trigger a `pf_scan` / `pf_peek` / `pf_poke` call,
+  prescribes the `pf_ps` → `pf_fault` flow for multi-agent setups,
+  and carries explicit "do NOT call these tools for world-knowledge
+  questions or current-repo code" guardrails so an eager agent
+  does not spam `pf_scan` for every message.
+- **`server.mcp.instructions` config override.** Setting a non-empty
+  string in the YAML replaces the built-in default verbatim, so an
+  operator can layer on installation-specific guidance like
+  "daily notes live under `memory://daily/`, project docs under
+  `memory://projects/`" without editing source.
+- **Server-side subagent prompt templates.** Subagent backends
+  (`subagent-cli` and `subagent-http`) now wrap the raw caller
+  content with a resolved prompt template *before* substituting
+  into their command / body template. The precedence chain is:
+  per-agent override on `AgentSpec` → per-backend default on
+  `Subagent*BackendConfig` → built-in constant for the purpose.
+  This is the fix for the "wocha returned a generic toxicity
+  sheet" failure mode — the built-in retrieval template
+  explicitly tells the agent "you are a memory-retrieval agent,
+  search the user's memory sources, do not fall back to world
+  knowledge".
+  - New `internal/backend/prompt.go` with `SpawnRequest`,
+    `SpawnPurpose`, `ResolvePromptTemplate`, `WrapTask`, and the
+    two default templates (`DefaultRetrievePromptTemplate` /
+    `DefaultWritePromptTemplate`).
+  - Retrieval template enumerates the memory sources a subagent
+    should try (MEMORY.md, managed directories, qmd, sqlite /
+    lossless-lcm, etc.) and explicitly forbids inventing content
+    or falling back to training data.
+  - Write template (for `pf_poke` mode:agent) frames the agent as
+    a placement specialist — read the existing layout, match the
+    naming convention, extend an existing file when themes
+    overlap, report the path(s) written.
+  - Templates support `{task}`, `{time_range}`, `{target}`, and
+    `{agent_id}` placeholders. Unknown placeholders pass through
+    unchanged.
+  - Per-agent overrides via `AgentSpec.retrieve_prompt_template` /
+    `AgentSpec.write_prompt_template` — same backend can host a
+    strict retrieval agent and a freer summarisation agent
+    without separate backend entries.
+- **`pf_fault` time range.** New `time_range_start` /
+  `time_range_end` optional free-form string parameters on the
+  MCP, REST, and CLI surfaces (CLI: `--after` / `--before` —
+  deliberately not `--from`/`--to` because peek already uses
+  those for line numbers). Pagefault does not parse the values;
+  they pass through to the subagent via the prompt template's
+  `{time_range}` placeholder, formatted as `{start} to {end}` /
+  `from {start} onwards` / `up to {end}` depending on which
+  fields are populated. The subagent interprets the string in
+  its own context, so any human-readable form works
+  (ISO 8601, "last Tuesday", "Q1 2026").
+- **Dispatcher `DeepRetrieveOptions` and `DelegateWrite`.**
+  Dispatcher gains a `DeepRetrieveOptions` struct for
+  `DeepRetrieve` (currently just `TimeRange`) and a new
+  `DelegateWrite(content, agentID, timeout, caller, opts)` entry
+  point for `pf_poke` mode:agent. `HandleWrite.handleWriteAgent`
+  no longer tunnels through `DeepRetrieve` — a direct write call
+  means the subagent gets `SpawnPurposeWrite` and therefore the
+  write-framed prompt template, which is the whole reason this
+  split exists.
+
+### Changed
+- `ServerConfig` grows a `MCP MCPConfig` sub-struct with
+  `SSEEnabled *bool` and `Instructions string`. The pointer lets us
+  distinguish "unset, use the default (true)" from "explicitly
+  false", mirroring the pattern already used in `ToolsConfig`.
+- `/` landing page advertises `/sse` and `/message` — but only when
+  `sse_enabled` is actually on, so the root output reflects the
+  real routing table.
+- **`backend.SubagentBackend.Spawn` signature.** Was
+  `Spawn(ctx, agentID, task, timeout)`; is now
+  `Spawn(ctx, SpawnRequest)`. The struct carries purpose, time
+  range, target, agent id, task, and timeout — future additions
+  (caller context, tool-call budgets, tracing ids) can land
+  without another signature change. **Breaking** for anyone who
+  wrote a custom `SubagentBackend`, but there are no such
+  external callers yet so the cost is internal churn only (mock
+  subagents + call sites).
+- **`SubagentCLIBackendConfig` / `SubagentHTTPBackendConfig`
+  grow template fields.** New `retrieve_prompt_template` /
+  `write_prompt_template` strings, both optional. Empty means
+  "use the built-in default". Same fields added to `AgentSpec`
+  as per-agent overrides.
+- **Per-parameter tool descriptions rewritten across every
+  `pf_*` tool.** Descriptions now include *how to construct* a
+  good value with examples — e.g. `pf_scan.query` explains that
+  pagefault backends are keyword/substring engines and gives
+  2-6-token phrasing guidance; `pf_peek.uri` warns against
+  reconstructing URIs instead of copying from a `pf_scan` hit;
+  `pf_fault.query` tells the agent it does NOT need to
+  rephrase into "search for X" because the server-side prompt
+  template already does that. This is the fix for "agent
+  doesn't know what to pass" from the deployment review.
+- **Agent-selection guidance (from the second trace).**
+  `pf_fault.agent` and `pf_poke.agent` descriptions now
+  prescribe the `pf_ps` → pick-by-description flow as
+  mandatory whenever more than one subagent is configured,
+  rather than offering the silent "first configured agent"
+  fallback as the default. `pf_ps`'s tool description leads
+  with its routing role ("call this **before** `pf_fault` /
+  `pf_poke` mode:agent whenever more than one agent is
+  configured"). `DefaultInstructions` grows a matching bullet
+  in the per-tool guide and a new "Multi-agent routing" note
+  that spells out the "check pf_ps, compare the agent
+  descriptions against the user's question, pick the best
+  match" sequence. The fallback still exists (single-agent
+  configs keep working without a `pf_ps` round-trip) but the
+  documentation no longer treats it as the default choice.
+- **Timeout-floor guidance (from the second trace).**
+  `pf_fault.timeout_seconds` and `pf_poke.timeout_seconds`
+  descriptions rewritten to establish a 120s floor with
+  context on observed deep-retrieval latency (typically
+  20-40s just for the subagent to start replying, 60s+ for
+  anything that fans out across multiple memory sources).
+  The old "lower to 30-60 for simple recalls" guidance
+  actively caused truncated runs in the real trace and has
+  been removed; the new wording nudges the opposite
+  direction (raise to 180-300 for hard lookups, never go
+  below 120). The default stays at 120s, matching the
+  constant in `deep_retrieve.go`.
+- **Proactive discovery: chat-history framing and
+  cross-language signal phrases (from the third trace).**
+  A third trace caught Claude answering zh-CN queries like
+  "我三月在干嘛" and "我最近和你聊了什么餐馆" from its own
+  context window and replying "I don't remember" — because
+  the 0.6.0 `DefaultInstructions` (a) did not mention that
+  pagefault commonly stores past conversations (via
+  lossless-lcm and similar), (b) had no rule against false
+  "no memory" answers, and (c) only had English signal
+  phrases. `internal/tool/instructions.go` was rewritten:
+  - Intro now explicitly names the past-conversation
+    archive as a first-class citizen of pagefault's store,
+    with lossless-lcm / transcripts / embedding indices
+    as concrete examples.
+  - New **Core rule** section near the top forbids the
+    "I don't remember" / "我不记得" / "no record" answers
+    without first calling `pf_scan` or `pf_fault`.
+  - Signal-phrase list split into **English** and
+    **Chinese** subsections covering the same query
+    shapes ("我[时间]在干嘛", "我最近和你聊了什么[X]",
+    etc.) so zh-CN users' questions pattern-match the
+    instructions.
+  - New **Temporal references matter** callout: any
+    question combining a past-time marker ("last week",
+    "三月", "最近", "上周") with a first-person verb
+    should route to pagefault by default.
+  - The existing multi-agent routing, tool-picking guide,
+    and practical guidance sections survive unchanged.
+  - `pf_scan`'s entry in the tool-picking guide now
+    includes a note that empty results on a
+    sentence-shaped query are expected (pf_scan is a
+    grep, not semantic search) and the correct response
+    is to fall through to pf_fault rather than give up.
+  - New `docs/config-doc.md` subsection "Instructions
+    override: worked example" gives a concrete YAML
+    snippet operators can copy for installation-specific
+    framing (naming real backends, routing queries to
+    specific agents by name), and explicitly documents
+    that the override is a full replace of the default
+    rather than a layer.
+  Nothing in the above changes the wire shape — it is all
+  text in the MCP `initialize` response.
+- `handleWriteAgent` dropped `composeAgentWriteTask` — the
+  prose-wrapping hack that inlined target + caller label into
+  the task string. The write prompt template now carries that
+  framing, so the task passed to Spawn is the raw content
+  verbatim and the wrapping is applied consistently whether the
+  agent was invoked via pf_fault or pf_poke.
+
+### Tests
+- `TestServer_SSE_Handshake` — GET /sse returns
+  `text/event-stream` and the first event is an `endpoint` event
+  with a `sessionId=` query parameter.
+- `TestServer_SSE_InitializeRoundtrip` — full three-step flow:
+  open SSE, parse endpoint event, POST initialize to the message
+  URL, read the response back from the stream. Asserts the
+  instructions string flows through to the initialize result so
+  both features are tested end-to-end together.
+- `TestServer_SSE_DisabledReturns404` — explicit
+  `sse_enabled: false` removes the route and streamable-http still
+  works (i.e. disabling SSE does not cross-wound `/mcp`).
+- `TestServer_SSE_Disabled_RootLandingHidesIt` — the `/` landing
+  page only lists `/sse` + `/message` when the transport is live.
+- `TestServer_MCP_InstructionsInInitialize` — streamable-http
+  `initialize` response contains the distinctive phrase from
+  `DefaultInstructions`.
+- `TestServer_MCP_InstructionsOverride` — config-supplied
+  instructions replace the default (and the default text does not
+  leak through).
+- `TestDefaultInstructionsNotEmpty` — belt-and-braces guard against
+  someone blanking the constant in a refactor. Companions guard
+  the review-cycle fixes:
+  `TestDefaultInstructions_MultiAgentRouting` asserts the default
+  text mentions `pf_ps`, has a "Multi-agent" section, warns against
+  the "first configured" fallback, and pins the 120s timeout floor.
+  `TestDefaultInstructions_ChatHistoryFraming` asserts the intro
+  mentions past conversations AND names at least one concrete
+  chat-archive mechanism (lossless-lcm / transcripts / embedding).
+  `TestDefaultInstructions_NoFalseNoMemoryClaim` asserts the
+  "don't say 'I don't remember' without checking" rule is present
+  and lives under a prominent section heading. And
+  `TestDefaultInstructions_CrossLanguageSignalPhrases` asserts the
+  default contains at least one zh signal phrase, still contains
+  at least one English signal phrase, and has a "Temporal"
+  references section.
+- `internal/backend/prompt_test.go` — nine new tests covering:
+  default templates non-empty + distinct + contain the key
+  framing phrases, `ResolvePromptTemplate` three-layer
+  precedence, `WrapTask` placeholder substitution + empty-
+  time-range line collapse + unknown-placeholder passthrough +
+  empty-template task echo, `agentPromptOverride` purpose
+  routing, and an end-to-end echo test that proves the built-in
+  retrieval template reaches the subprocess when no override
+  is configured.
+- `internal/dispatcher/subagent_test.go` — new
+  `TestDispatcher_DeepRetrieve_TimeRangePassthrough`,
+  `TestDispatcher_DelegateWrite`,
+  `TestDispatcher_DelegateWrite_EmptyContent`. All existing
+  `DeepRetrieve` tests updated for the new signature and
+  assert on `lastReq.Purpose == SpawnPurposeRetrieve`.
+- `internal/tool/deep_retrieve_test.go` — new
+  `TestHandleDeepRetrieve_TimeRangePassthrough` table-driven
+  test covering all four start/end combinations plus the
+  whitespace-only edge case. `stubSubagent` records the full
+  `SpawnRequest` so other tests can assert on `lastReq.Purpose`
+  as well.
+- `internal/tool/write_test.go` — `TestHandleWrite_AgentHappyPath`
+  now asserts `lastReq.Task == content` (no prose wrapping),
+  `lastReq.Target == "daily"`, and
+  `lastReq.Purpose == SpawnPurposeWrite`. Removed the
+  `composeAgentWriteTask` tests because that helper no longer
+  exists.
+- `internal/backend/subagent_{cli,http}_test.go` — every test
+  updated for the new `SpawnRequest` signature; narrow plumbing
+  tests use a new `passthroughTmpl = "{task}"` constant so they
+  assert on bare echoed output rather than the default
+  retrieval framing.
+- `cmd/pagefault/tools_test.go` — the subagent test config
+  fixture now sets `retrieve_prompt_template: "{task}"` and
+  `write_prompt_template: "{task}"` so the CLI echo tests still
+  assert against the bare task string. Without this they would
+  assert against ~20 lines of default template framing, which
+  is not the behaviour under test.
+
+### Docs
+- `docs/config-doc.md` gains a full `server.mcp` section with a
+  client ↔ transport cheat-sheet, and a new subsection on
+  subagent backend `retrieve_prompt_template` /
+  `write_prompt_template` / per-agent overrides (with the
+  placeholder list and precedence diagram).
+- `docs/api-doc.md` expands its intro to cover all three
+  transports (streamable-http, SSE, REST), adds a "Server-level
+  instructions" section explaining what agents see on
+  `initialize`, documents the `time_range_start` /
+  `time_range_end` fields on `pf_fault`, and carries matching
+  "always call pf_ps first in multi-agent setups" and "120s
+  minimum timeout" notes on both `pf_fault` and `pf_poke`
+  mode:agent.
+- `README.md` — Claude Desktop snippet switched from
+  streamable-http to SSE with a historical note about the
+  pre-0.6.0 supergateway workaround; Recent Changes rewritten
+  to cover the unified 0.6.0 release.
+- `plan.md` §5.5 `pf_fault` gains the time-range fields; §5.7
+  `pf_poke` mode:agent notes the write template. §3 principle 6
+  updated to mention the template mechanism.
+- `CLAUDE.md` directory tree adds `internal/backend/prompt.go`,
+  `prompt_test.go`, and `internal/tool/instructions.go`.
+
 ## 0.5.1 (2026-04-11)
 
 Post-0.5.0 review pass. One real bug (`max_entry_size` was enforced

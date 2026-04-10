@@ -1,15 +1,68 @@
 # pagefault — API Reference (Phase 1–4)
 
-pagefault exposes its tools over two transports:
+pagefault exposes its tools over three transports:
 
-- **MCP** (streamable-http): `POST /mcp`. For Claude-family clients. Tools are
-  registered via mcp-go and return JSON payloads wrapped in a single text
-  content block.
-- **REST**: `POST /api/{tool_name}`. For curl, ChatGPT Custom GPTs, or any
-  other HTTP client. Request body is JSON; response body is JSON.
+- **MCP (streamable-http):** `POST /mcp`. The modern MCP transport —
+  point Claude Code and similar streamable-http clients here.
+- **MCP (legacy SSE):** `GET /sse` + `POST /message`. Opt-out (toggle
+  via `server.mcp.sse_enabled`). Mounted by default so Claude Desktop
+  and other SSE-only clients work without an external bridge.
+- **REST:** `POST /api/{tool_name}`. For curl, ChatGPT Custom GPTs, or
+  any other plain HTTP client. Request body is JSON; response body is
+  JSON wrapped in the standard error envelope on failure.
 
-Both transports dispatch to the same handler, so the inputs and outputs are
-identical.
+Both MCP transports share a single `MCPServer` under the hood, so tools
+are registered once and the instructions advertised in the `initialize`
+response are identical regardless of which transport the client speaks.
+All three transports dispatch to the same pure `HandleX` functions, so
+filter, audit, and error semantics are consistent across the surface.
+
+> **When to pick which:** streamable-http is newer and preferred where
+> supported; SSE is the older MCP wire format that Claude Desktop still
+> requires as of 2026-04. REST is a compatibility layer for clients
+> that do not speak MCP at all. See `docs/config-doc.md` → `server.mcp`
+> for the full client cheat-sheet.
+
+## Server-level instructions
+
+pagefault emits a server-level instructions string in its MCP
+`initialize` response (via mcp-go's `WithInstructions`). MCP clients
+typically surface this text in the agent's system prompt, so it is the
+single most reliable lever for teaching agents *when* to reach for
+`pf_*` tools vs their built-ins. The built-in default (see
+`internal/tool/instructions.go`) covers:
+
+- **Framing:** pagefault stores daily notes, journals, project
+  documents, past decisions, AND a searchable archive of past
+  conversations (via lossless-lcm, transcripts, or embedding indices).
+  Agents need to know the chat-history claim to route "what did we
+  talk about" questions correctly.
+- **Core rule:** agents MUST NOT answer "I don't remember" /
+  "我不记得" / "no record of that" without first calling `pf_scan` or
+  `pf_fault`. This is the highest-leverage lever against the
+  failure mode where Claude answers from its in-context window and
+  gives up when the answer is not there.
+- **Signal phrases** (English **and** Chinese) for lookups,
+  past-conversation recall, and write operations. The Chinese
+  phrases exist because real deployment traces showed zh-CN queries
+  like "我三月在干嘛" missing the English-only signal list entirely.
+- **Temporal-reference routing:** any question combining a past-time
+  marker with a first-person verb is a pagefault question by default.
+- **Do-not-use guardrails** (world knowledge, current-repo code,
+  topical reference lookups dressed up as memory questions).
+- **Tool-picking guide** (when to reach for which `pf_*` tool).
+- **Multi-agent routing:** when `pf_ps` reports more than one agent,
+  agents MUST call `pf_ps` first and pick by description rather than
+  defaulting to the first configured agent.
+- **Timeout floor guidance:** `pf_fault.timeout_seconds` and
+  `pf_poke.timeout_seconds` must never drop below 120.
+
+Override via `server.mcp.instructions` in the YAML config when you
+want installation-specific framing (naming your real backends,
+prescribing agent selection by name, etc.) — note that the override
+is a **full replace** of the default, not a layer, so custom
+overrides lose the built-in guardrails unless they re-implement
+them. See `docs/config-doc.md` → `server.mcp` for a worked example.
 
 ## Tool naming
 
@@ -59,9 +112,9 @@ pagefault poke [--mode direct|agent] [--uri URI] <content...>
 - `load`: `--format markdown|markdown-with-metadata|json` (overrides the context's configured format)
 - `scan`: `--limit N` (default 10), `--backends a,b` (comma-separated names to restrict to)
 - `peek`: `--from N`, `--to N` (1-indexed, inclusive line range)
-- `fault`: `--agent <id>` (which subagent to spawn; default is the first configured), `--timeout N` (seconds; default 120)
+- `fault`: `--agent <id>` (which subagent to spawn; in multi-agent setups, run `pagefault ps` first and pick by description — the "first configured" fallback is only safe for single-agent setups), `--timeout N` (seconds; **120 is a floor, not an average** — real deep-retrieval runs take 20-40s to first token and can exceed a minute, so raise to 180-300 for hard lookups and never drop below 120), `--after <date>` (optional earliest date/time hint passed to the subagent; free-form), `--before <date>` (optional latest date/time hint)
 - `ps`: *(no extra flags)*
-- `poke`: `--mode direct|agent` (default `direct`), `--uri <uri>` (required for `direct`), `--format entry|raw` (default `entry`), `--agent <id>` (mode:agent only), `--target <hint>` (mode:agent only; default `auto`), `--timeout N` (mode:agent only; seconds; default 120). Content is taken from positional args, or from stdin if no positional args are provided — so `echo "fixed auth bug" | pagefault poke --mode direct --uri memory://notes/today.md` works.
+- `poke`: `--mode direct|agent` (default `direct`), `--uri <uri>` (required for `direct`), `--format entry|raw` (default `entry`), `--agent <id>` (mode:agent only; same "run `pagefault ps` first in multi-agent setups" rule as `fault`), `--target <hint>` (mode:agent only; default `auto`), `--timeout N` (mode:agent only; seconds; **120 is a floor** — write-agents read the existing memory layout before placing content so real runs hit 30-60s+, raise to 180-300 for heavy writes, never drop below 120). Content is taken from positional args, or from stdin if no positional args are provided — so `echo "fixed auth bug" | pagefault poke --mode direct --uri memory://notes/today.md` works.
 
 **Config lookup order:**
 
@@ -242,9 +295,22 @@ URI, and reason.
 
 ## `pf_scan`
 
-Scans configured backends for content matching a query and returns ranked
-results. Phase-1's filesystem backend uses case-insensitive substring
-matching and returns the first match per file.
+Scans configured backends for content matching a query and returns
+ranked results. **pf_scan is a grep, not a semantic search**: the
+filesystem backend uses case-insensitive substring matching on the
+raw query string, the subprocess backend forwards the query to
+`rg`/`grep`, and the HTTP backend posts it to whatever endpoint the
+operator wired up (keyword-only unless that endpoint is itself a
+semantic search). Subagent backends' `Search()` is a no-op — they
+only contribute to `pf_fault`.
+
+The practical upshot: a sentence-shaped natural-language query
+("what did I do on April 6") will usually return empty because no
+file literally contains that phrase. For sentence-shaped queries,
+skip pf_scan and go straight to `pf_fault`, which spawns a real
+agent that can reason over the sources. `pf_scan` is the right tool
+for short distinctive tokens (names, dates, filenames): "wocha
+timeout", "2026-04-06", "auth middleware".
 
 **Endpoint:** `POST /api/pf_scan`
 
@@ -328,15 +394,31 @@ own tool access) to carry out a natural-language retrieval task and
 returns the agent's final response. Use when `pf_scan` / `pf_peek` miss
 and you need something smarter than substring matching.
 
+**Server-side prompt framing.** Pagefault wraps the caller's raw
+`query` with a prompt template *before* passing it to the subagent
+backend — the subagent sees "you are a memory-retrieval agent, search
+the user's memory, do not fall back to your own training data",
+followed by the caller's query. This is the fix for the 0.6-and-earlier
+behaviour where a fresh subagent treated `pf_fault` as a generic Q&A
+entry point and answered from its own world knowledge instead of the
+user's memory. Operators can override the template per-backend or
+per-agent via the `retrieve_prompt_template` config fields; see
+`docs/config-doc.md` → "Subagent prompt templates". The net effect on
+callers is that you should pass a plain user question as the `query`
+— do NOT rephrase it as "search my memory for X"; the template
+already does that.
+
 **Endpoint:** `POST /api/pf_fault`
 
 **Request:**
 
-| Field             | Type   | Required | Default | Notes                                                                 |
-|-------------------|--------|----------|---------|-----------------------------------------------------------------------|
-| `query`           | string | yes      | —       | Natural-language query: what to find, understand, or synthesize.     |
-| `agent`           | string | no       | first   | Subagent id to spawn (see `pf_ps`). Empty picks the first configured. |
-| `timeout_seconds` | int    | no       | 120     | Max seconds to wait for the agent. Also used as the kill deadline.    |
+| Field              | Type   | Required | Default | Notes                                                                 |
+|--------------------|--------|----------|---------|-----------------------------------------------------------------------|
+| `query`            | string | yes      | —       | The user's question in natural language. Include concrete entity names, topics, and dates. Do not rephrase as "search for X" — the server-side prompt template already frames the subagent as a memory retriever. |
+| `agent`            | string | no       | first   | Subagent id to spawn. **When more than one agent is configured, call `pf_ps` first and pick by description** — the "first configured" fallback silently picks the wrong scope (e.g. a work agent for a personal question). Only omit in single-agent setups. |
+| `timeout_seconds`  | int    | no       | 120     | Max seconds to wait for the agent before returning a partial result. **120 is a floor**, not an average — real deep-retrieval runs typically take 20-40s to produce their first token and can exceed a minute when fanning out across multiple sources. Raise to 180-300 for hard lookups; never go below 120. On timeout the response is `200 OK` with `timed_out: true`. |
+| `time_range_start` | string | no       | —       | Optional free-form earliest date/time. Pagefault does not parse the value; it is formatted into a hint line and passed through to the subagent via the prompt template's `{time_range}` placeholder. Any human-readable form works (ISO 8601, "last Tuesday", "Q1 2026"). |
+| `time_range_end`   | string | no       | —       | Optional free-form latest date/time. Same rules. Combine with `time_range_start` for a window, or set only one for "from X onwards" / "up to Y". |
 
 **Response (success):**
 
@@ -373,6 +455,15 @@ configured), 500 (backend spawn error).
 List every subagent exposed by every configured `SubagentBackend`. Zero
 cost — agents are read from config, no process/network I/O.
 
+**Call this before `pf_fault` and `pf_poke` mode:agent whenever more
+than one agent is configured.** The descriptions are how you route a
+query to the right agent (work vs personal, short-term vs long-term,
+journal vs project, etc.). The "first configured agent" fallback on
+`pf_fault.agent` and `pf_poke.agent` exists for single-agent configs;
+relying on it in a multi-agent setup silently routes to the wrong
+scope. If the user's question straddles scopes, make two `pf_fault`
+calls and merge the results.
+
 **Endpoint:** `POST /api/pf_ps`
 
 **Request body:** none (empty `{}` is accepted)
@@ -382,11 +473,16 @@ cost — agents are read from config, no process/network I/O.
 ```json
 {
   "agents": [
-    {"id": "wocha", "description": "Dev agent with Feishu, LCM, workspace, and coding tools", "backend": "openclaw"},
-    {"id": "main",  "description": "Primary personal agent with full tool access",             "backend": "openclaw"}
+    {"id": "wocha", "description": "Work agent — Feishu, LCM, infra, meetings, project notes. Use for work/company questions.", "backend": "openclaw"},
+    {"id": "cha",   "description": "Personal agent — daily life, journal, Bonbon/cats, travel, health. Use for personal questions.", "backend": "openclaw"}
   ]
 }
 ```
+
+These descriptions are how a calling agent decides *which* of the
+configured subagents to spawn. Make yours specific — vague
+descriptions like "the default agent" are how you get wrong-scope
+routing ("summarise my medical history" going to the work agent).
 
 Each entry's `backend` is the name of the `SubagentBackend` that hosts
 the agent. Multiple backends may expose agents with the same id — always
@@ -404,7 +500,7 @@ on status codes; orchestrators should read the envelope's top-level
 ```json
 {
   "status": "ok",
-  "version": "0.4.0",
+  "version": "0.6.0",
   "backends": {
     "fs":       {"status": "ok"},
     "openclaw": {"status": "ok"}
@@ -459,10 +555,14 @@ Two modes:
   enforces its own `write_paths` allowlist, `write_mode` policy
   (append-only vs. any mutation), and `max_entry_size` cap.
 - **`agent`** — pagefault spawns a subagent (the same machinery
-  `pf_fault` uses) and hands it a natural-language instruction: "A
-  remote agent wants to record X — read the relevant memory files,
-  decide where to write it, and append." Trust is delegated to the
-  subagent, which has its own workspace access.
+  `pf_fault` uses) and delegates placement. The server wraps the raw
+  `content` with the backend's write prompt template
+  (`DefaultWritePromptTemplate` by default, overridable via
+  `write_prompt_template` in config) before dispatching, so the
+  subagent sees "you are a memory-write agent, inspect the existing
+  layout and persist the content below" rather than a bare string.
+  Trust is delegated to the subagent from there — pagefault does not
+  re-validate the writes it performs.
 
 **Endpoint:** `POST /api/pf_poke`
 
@@ -474,9 +574,9 @@ Two modes:
 | `mode`            | string | yes                | —         | `"direct"` or `"agent"`.                                                                                            |
 | `uri`             | string | yes (mode:direct)  | —         | Target URI for direct append (e.g. `memory://notes/2026-04-11.md`).                                                 |
 | `format`          | string | no (mode:direct)   | `entry`   | `"entry"` wraps the content as a timestamped markdown block; `"raw"` appends bytes unchanged (requires `write_mode: "any"`). |
-| `agent`           | string | no (mode:agent)    | first     | Subagent id (see `pf_ps`). Empty picks the first configured.                                                         |
+| `agent`           | string | no (mode:agent)    | first     | Subagent id. **When more than one agent is configured, call `pf_ps` first and pick by description** — placement matters here: writing a personal journal entry through a work-scoped agent produces the wrong file layout. Only omit in single-agent setups. |
 | `target`          | string | no (mode:agent)    | `auto`    | Free-form hint for the subagent (`"auto"`, `"daily"`, `"long-term"`, or any custom string).                        |
-| `timeout_seconds` | int    | no (mode:agent)    | 120       | Per-call deadline for the subagent spawn.                                                                           |
+| `timeout_seconds` | int    | no (mode:agent)    | 120       | Per-call deadline for the subagent spawn. **120 is a floor**, not an average — a write-agent reads the existing memory layout before placing content, so real runs take 30-60+s end-to-end. Raise to 180-300 for heavy writes; never go below 120. On timeout the response is `200 OK` with `timed_out: true`. |
 
 **Response (mode:direct):**
 
@@ -513,7 +613,7 @@ Timeouts on mode:agent are flattened into a success envelope with
 the deadline surfaced as `result` — same pattern as `pf_fault`.
 
 The OpenAPI schema also advertises a `targets_written` field
-(array of URIs the subagent reports writing). As of 0.5.1 pagefault
+(array of URIs the subagent reports writing). As of 0.6.0 pagefault
 has no structured way to extract this from the subagent's reply, so
 the field is **reserved but always absent**. Clients that need to
 know which files were touched must parse the free-form `result`

@@ -1,12 +1,16 @@
 // Package server wires pagefault's dispatcher, auth, and tool handlers into
-// an HTTP server that exposes both an MCP transport (at /mcp) and a REST
-// transport (at /api/{tool_name}).
+// an HTTP server that exposes both an MCP transport (at /mcp, plus the
+// legacy-SSE pair at /sse + /message) and a REST transport (at
+// /api/{tool_name}).
 //
 // The server is a thin adapter layer — all real work happens in the
 // dispatcher and tool packages. This file is responsible for:
 //
 //   - Building a chi router with the correct middleware stack
 //   - Mounting the mcp-go streamable-http handler on /mcp
+//   - Mounting the mcp-go legacy-SSE handler on /sse + /message
+//     (for Claude Desktop and other SSE-only clients — the two
+//     transports share the same MCPServer and tool set)
 //   - Mounting per-tool REST handlers on /api/{tool_name}
 //   - Reporting backend health on /health
 package server
@@ -44,6 +48,7 @@ type Server struct {
 	dispatcher *dispatcher.ToolDispatcher
 	authP      auth.AuthProvider
 	mcpSrv     *mcpserver.MCPServer
+	sseSrv     *mcpserver.SSEServer
 
 	Handler http.Handler
 }
@@ -61,10 +66,21 @@ func New(cfg *config.Config, d *dispatcher.ToolDispatcher, authP auth.AuthProvid
 		return nil, errors.New("server: nil auth provider")
 	}
 
+	// Resolve the instructions string now so both transports see the
+	// same value. Operators can override the built-in default via
+	// server.mcp.instructions in the YAML config; see
+	// internal/tool/instructions.go for the default text and the
+	// rationale.
+	instructions := cfg.Server.MCP.Instructions
+	if instructions == "" {
+		instructions = tool.DefaultInstructions
+	}
+
 	mcpSrv := mcpserver.NewMCPServer(
 		"pagefault",
 		Version,
 		mcpserver.WithToolCapabilities(true),
+		mcpserver.WithInstructions(instructions),
 	)
 	tool.RegisterMCP(mcpSrv, d)
 
@@ -72,11 +88,32 @@ func New(cfg *config.Config, d *dispatcher.ToolDispatcher, authP auth.AuthProvid
 		mcpserver.WithEndpointPath("/mcp"),
 	)
 
+	// SSE transport is opt-out. Claude Desktop (as of 2026-04) only
+	// speaks legacy-SSE, so we default to mounting /sse + /message
+	// alongside /mcp. Both transports share the same MCPServer, so
+	// the tool set, instructions, and auth chain are identical —
+	// the only difference is the wire framing.
+	var sseSrv *mcpserver.SSEServer
+	if cfg.Server.MCP.SSEEnabledOrDefault() {
+		sseOpts := []mcpserver.SSEOption{}
+		// WithBaseURL makes the endpoint event an absolute URL, which
+		// is safer behind reverse proxies where relative resolution
+		// might land the client on the wrong host. When public_url
+		// is empty we leave the endpoint event as a root-relative
+		// path and let the client resolve it against the URL it was
+		// pointed at — same behaviour as before this commit.
+		if cfg.Server.PublicURL != "" {
+			sseOpts = append(sseOpts, mcpserver.WithBaseURL(cfg.Server.PublicURL))
+		}
+		sseSrv = mcpserver.NewSSEServer(mcpSrv, sseOpts...)
+	}
+
 	s := &Server{
 		cfg:        cfg,
 		dispatcher: d,
 		authP:      authP,
 		mcpSrv:     mcpSrv,
+		sseSrv:     sseSrv,
 	}
 
 	r := chi.NewRouter()
@@ -99,10 +136,23 @@ func New(cfg *config.Config, d *dispatcher.ToolDispatcher, authP auth.AuthProvid
 		pr.Use(auth.Middleware(authP))
 		pr.Use(rateLimitMiddleware(cfg.Server.RateLimit))
 
-		// MCP transport. The streamable-http handler expects any method
-		// (POST/GET/DELETE) on the endpoint path.
+		// MCP transport (streamable-http). The mcp-go handler expects
+		// any method (POST/GET/DELETE) on the endpoint path.
 		pr.Handle("/mcp", streamable)
 		pr.Handle("/mcp/*", streamable)
+
+		// MCP transport (legacy SSE). Mounted only when enabled in
+		// config. The SSE handler answers GET with a persistent
+		// text/event-stream, sends an initial "endpoint" event that
+		// tells the client where to POST subsequent JSON-RPC
+		// messages, then streams responses back as message events.
+		// The message handler answers POST with 202 Accepted and
+		// routes the body through the shared MCPServer; the response
+		// comes back on the SSE stream opened by the paired GET.
+		if sseSrv != nil {
+			pr.Get("/sse", sseSrv.SSEHandler().ServeHTTP)
+			pr.Post("/message", sseSrv.MessageHandler().ServeHTTP)
+		}
 
 		// REST transport: one handler per enabled tool. The wire names
 		// follow the page-fault scheme (pf_maps, pf_load, pf_scan,
@@ -204,7 +254,11 @@ func (s *Server) handleRoot(w http.ResponseWriter, _ *http.Request) {
 	_, _ = io.WriteString(w, "Endpoints:\n")
 	_, _ = io.WriteString(w, "  GET  /health             — health probe\n")
 	_, _ = io.WriteString(w, "  GET  /api/openapi.json   — live OpenAPI 3.1 spec (public)\n")
-	_, _ = io.WriteString(w, "  POST /mcp                — MCP streamable-http\n")
+	_, _ = io.WriteString(w, "  *    /mcp                — MCP streamable-http (Claude Code, etc.)\n")
+	if s.sseSrv != nil {
+		_, _ = io.WriteString(w, "  GET  /sse                — MCP legacy-SSE stream (Claude Desktop, etc.)\n")
+		_, _ = io.WriteString(w, "  POST /message            — MCP legacy-SSE message endpoint\n")
+	}
 	_, _ = io.WriteString(w, "  POST /api/pf_maps        — list memory regions (contexts)\n")
 	_, _ = io.WriteString(w, "  POST /api/pf_load        — load a region by name\n")
 	_, _ = io.WriteString(w, "  POST /api/pf_scan        — scan backends for content\n")

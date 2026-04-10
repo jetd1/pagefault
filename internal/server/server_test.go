@@ -1,14 +1,18 @@
 package server
 
 import (
+	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -20,6 +24,7 @@ import (
 	"github.com/jet/pagefault/internal/dispatcher"
 	"github.com/jet/pagefault/internal/filter"
 	"github.com/jet/pagefault/internal/model"
+	"github.com/jet/pagefault/internal/tool"
 )
 
 // newTestServer spins up a full pagefault Server with a filesystem backend
@@ -621,4 +626,447 @@ func TestServer_MCP_Initialize(t *testing.T) {
 	data, _ := io.ReadAll(resp.Body)
 	assert.Equal(t, http.StatusOK, resp.StatusCode, "initialize should 200, got body=%s", string(data))
 	assert.Contains(t, string(data), "result", "response should contain a JSON-RPC result field")
+}
+
+// TestServer_MCP_InstructionsInInitialize confirms the default
+// instructions text from internal/tool.DefaultInstructions is advertised
+// in the streamable-http initialize response. MCP clients like Claude
+// Desktop surface this in the agent's system prompt, so it is the
+// single most important lever for steering agents toward pf_* tools.
+func TestServer_MCP_InstructionsInInitialize(t *testing.T) {
+	ts, _ := newTestServer(t, "none", "")
+	body := doInitializeOverStreamable(t, ts)
+	// A distinctive phrase from DefaultInstructions — if this ever fails
+	// because the text was edited, update the assertion to match.
+	assert.Contains(t, body, "pagefault is the user's personal memory server")
+	assert.Contains(t, body, "pf_scan")
+}
+
+// TestServer_MCP_InstructionsOverride verifies that a non-empty
+// server.mcp.instructions config replaces the built-in default verbatim.
+func TestServer_MCP_InstructionsOverride(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "hello.md"), []byte("hi"), 0o600))
+	fsCfg := &config.FilesystemBackendConfig{
+		Name: "fs", Type: "filesystem", Root: dir,
+		Include: []string{"**/*.md"}, URIScheme: "memory", Sandbox: true,
+	}
+	fsBackend, err := backend.NewFilesystemBackend(fsCfg)
+	require.NoError(t, err)
+	d, err := dispatcher.New(dispatcher.Options{
+		Backends: []backend.Backend{fsBackend},
+		Filter:   filter.NewCompositeFilter(),
+		Audit:    audit.NopLogger{},
+	})
+	require.NoError(t, err)
+
+	cfg := &config.Config{
+		Server: config.ServerConfig{
+			Host: "127.0.0.1", Port: 0,
+			MCP: config.MCPConfig{Instructions: "custom-instructions-sentinel-xyz"},
+		},
+		Auth: config.AuthConfig{Mode: "none"},
+	}
+	p, err := auth.NewProvider(cfg.Auth)
+	require.NoError(t, err)
+	srv, err := New(cfg, d, p)
+	require.NoError(t, err)
+	ts := httptest.NewServer(srv.Handler)
+	t.Cleanup(ts.Close)
+
+	body := doInitializeOverStreamable(t, ts)
+	assert.Contains(t, body, "custom-instructions-sentinel-xyz")
+	// The default text must not leak through when an override is set.
+	assert.NotContains(t, body, "pagefault is the user's personal memory server")
+}
+
+// doInitializeOverStreamable issues an MCP initialize request against
+// /mcp and returns the response body as a string. Streamable-http
+// responses are already in SSE framing, so the body contains the
+// JSON-RPC envelope in a `data:` line — contains-checks are reliable.
+func doInitializeOverStreamable(t *testing.T, ts *httptest.Server) string {
+	t.Helper()
+	initReq := map[string]any{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  "initialize",
+		"params": map[string]any{
+			"protocolVersion": "2024-11-05",
+			"capabilities":    map[string]any{},
+			"clientInfo":      map[string]any{"name": "test", "version": "0"},
+		},
+	}
+	b, _ := json.Marshal(initReq)
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/mcp", bytes.NewReader(b))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/event-stream")
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	data, _ := io.ReadAll(resp.Body)
+	require.Equal(t, http.StatusOK, resp.StatusCode, "body=%s", string(data))
+	return string(data)
+}
+
+// ───────────────── MCP legacy-SSE transport ─────────────────
+
+// TestServer_SSE_Handshake verifies that GET /sse returns a persistent
+// SSE stream whose first event is the "endpoint" event carrying a
+// sessionId query parameter. This is the bit Claude Desktop and other
+// SSE-only clients expect before they start POSTing messages.
+func TestServer_SSE_Handshake(t *testing.T) {
+	ts, _ := newTestServer(t, "none", "")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, ts.URL+"/sse", nil)
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Equal(t, "text/event-stream", resp.Header.Get("Content-Type"))
+
+	reader := bufio.NewReader(resp.Body)
+	event := readSSEEvent(t, reader)
+	assert.Contains(t, event, "event: endpoint",
+		"first SSE event must announce the message endpoint")
+	assert.Contains(t, event, "sessionId=",
+		"endpoint URL must include a sessionId parameter")
+}
+
+// TestServer_SSE_InitializeRoundtrip drives a full MCP initialize
+// handshake through the legacy-SSE transport:
+//
+//  1. GET /sse → receive the endpoint event with sessionId.
+//  2. POST /message?sessionId=... with the initialize request.
+//  3. Read the next SSE event → it is the initialize result.
+//
+// This is the flow Claude Desktop runs every time it connects, so a
+// regression here would break the primary reason the SSE transport
+// exists. We also assert the instructions string surfaces in the
+// result so the two features (SSE + instructions) are tested
+// end-to-end together.
+func TestServer_SSE_InitializeRoundtrip(t *testing.T) {
+	ts, _ := newTestServer(t, "none", "")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// Step 1 — open the SSE stream.
+	sseReq, _ := http.NewRequestWithContext(ctx, http.MethodGet, ts.URL+"/sse", nil)
+	sseResp, err := http.DefaultClient.Do(sseReq)
+	require.NoError(t, err)
+	defer sseResp.Body.Close()
+	require.Equal(t, http.StatusOK, sseResp.StatusCode)
+
+	reader := bufio.NewReader(sseResp.Body)
+
+	// Step 2 — parse the endpoint event, extract the message path.
+	endpoint := readSSEEvent(t, reader)
+	require.Contains(t, endpoint, "event: endpoint")
+	messagePath := extractSSEData(t, endpoint)
+	require.NotEmpty(t, messagePath, "endpoint event data must not be empty")
+	require.Contains(t, messagePath, "sessionId=")
+	// In the no-public_url case mcp-go emits a root-relative URL —
+	// prepend the httptest server URL to reach it.
+	if strings.HasPrefix(messagePath, "/") {
+		messagePath = ts.URL + messagePath
+	}
+
+	// Step 3 — POST the initialize request to the message endpoint.
+	initReq := map[string]any{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  "initialize",
+		"params": map[string]any{
+			"protocolVersion": "2024-11-05",
+			"capabilities":    map[string]any{},
+			"clientInfo":      map[string]any{"name": "sse-test", "version": "0"},
+		},
+	}
+	body, _ := json.Marshal(initReq)
+	postReq, _ := http.NewRequestWithContext(ctx, http.MethodPost, messagePath, bytes.NewReader(body))
+	postReq.Header.Set("Content-Type", "application/json")
+	postResp, err := http.DefaultClient.Do(postReq)
+	require.NoError(t, err)
+	defer postResp.Body.Close()
+	require.Equal(t, http.StatusAccepted, postResp.StatusCode,
+		"message endpoint should 202-Accept")
+
+	// Step 4 — read the next SSE event; it carries the JSON-RPC result.
+	respEvent := readSSEEvent(t, reader)
+	assert.Contains(t, respEvent, "event: message")
+	assert.Contains(t, respEvent, `"result"`)
+	// Instructions must flow through to the initialize result regardless
+	// of which transport the client used.
+	assert.Contains(t, respEvent, "pagefault is the user's personal memory server")
+}
+
+// TestServer_SSE_DisabledReturns404 verifies that explicitly setting
+// server.mcp.sse_enabled: false removes the /sse route entirely, so
+// operators who only want streamable-http can shrink the public
+// surface.
+func TestServer_SSE_DisabledReturns404(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "hello.md"), []byte("hi"), 0o600))
+	fsCfg := &config.FilesystemBackendConfig{
+		Name: "fs", Type: "filesystem", Root: dir,
+		Include: []string{"**/*.md"}, URIScheme: "memory", Sandbox: true,
+	}
+	fsBackend, err := backend.NewFilesystemBackend(fsCfg)
+	require.NoError(t, err)
+	d, err := dispatcher.New(dispatcher.Options{
+		Backends: []backend.Backend{fsBackend},
+		Filter:   filter.NewCompositeFilter(),
+		Audit:    audit.NopLogger{},
+	})
+	require.NoError(t, err)
+
+	disabled := false
+	cfg := &config.Config{
+		Server: config.ServerConfig{
+			Host: "127.0.0.1", Port: 0,
+			MCP: config.MCPConfig{SSEEnabled: &disabled},
+		},
+		Auth: config.AuthConfig{Mode: "none"},
+	}
+	p, err := auth.NewProvider(cfg.Auth)
+	require.NoError(t, err)
+	srv, err := New(cfg, d, p)
+	require.NoError(t, err)
+	ts := httptest.NewServer(srv.Handler)
+	defer ts.Close()
+
+	resp, _ := get(t, ts, "/sse", "")
+	assert.Equal(t, http.StatusNotFound, resp.StatusCode)
+
+	// /mcp should still be reachable — disabling SSE must not affect
+	// the streamable-http transport.
+	initBody := doInitializeOverStreamable(t, ts)
+	assert.Contains(t, initBody, "result")
+}
+
+// TestServer_SSE_Disabled_RootLandingHidesIt checks that / only mentions
+// /sse when the SSE transport is actually enabled.
+func TestServer_SSE_Disabled_RootLandingHidesIt(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "hello.md"), []byte("hi"), 0o600))
+	fsCfg := &config.FilesystemBackendConfig{
+		Name: "fs", Type: "filesystem", Root: dir,
+		Include: []string{"**/*.md"}, URIScheme: "memory", Sandbox: true,
+	}
+	fsBackend, err := backend.NewFilesystemBackend(fsCfg)
+	require.NoError(t, err)
+	d, err := dispatcher.New(dispatcher.Options{
+		Backends: []backend.Backend{fsBackend},
+		Filter:   filter.NewCompositeFilter(),
+		Audit:    audit.NopLogger{},
+	})
+	require.NoError(t, err)
+
+	disabled := false
+	cfg := &config.Config{
+		Server: config.ServerConfig{
+			Host: "127.0.0.1", Port: 0,
+			MCP: config.MCPConfig{SSEEnabled: &disabled},
+		},
+		Auth: config.AuthConfig{Mode: "none"},
+	}
+	p, err := auth.NewProvider(cfg.Auth)
+	require.NoError(t, err)
+	srv, err := New(cfg, d, p)
+	require.NoError(t, err)
+	ts := httptest.NewServer(srv.Handler)
+	defer ts.Close()
+
+	resp, body := get(t, ts, "/", "")
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.NotContains(t, string(body), "/sse")
+	assert.NotContains(t, string(body), "/message")
+}
+
+// TestDefaultInstructionsNotEmpty is a belt-and-braces guard that the
+// default instructions constant has not been accidentally blanked out,
+// which would silently fall back to mcp-go's empty default and leave
+// agents without any guidance on when to use pf_* tools.
+func TestDefaultInstructionsNotEmpty(t *testing.T) {
+	assert.NotEmpty(t, tool.DefaultInstructions,
+		"tool.DefaultInstructions must not be empty — agents rely on it")
+	assert.Contains(t, tool.DefaultInstructions, "pf_scan",
+		"default instructions should at minimum mention pf_scan")
+}
+
+// TestDefaultInstructions_MultiAgentRouting guards the fix for the
+// trace-observed friction where a calling agent skipped pf_ps and
+// defaulted pf_fault to the first configured subagent. The default
+// instructions must tell agents to call pf_ps first in multi-agent
+// setups — if a future edit drops that guidance, the fallback
+// silently re-introduces the wrong-scope-agent bug.
+func TestDefaultInstructions_MultiAgentRouting(t *testing.T) {
+	t.Run("mentions pf_ps as a routing step", func(t *testing.T) {
+		assert.Contains(t, tool.DefaultInstructions, "pf_ps",
+			"default instructions must mention pf_ps by name")
+	})
+	t.Run("has a multi-agent routing section", func(t *testing.T) {
+		assert.Contains(t, tool.DefaultInstructions, "Multi-agent",
+			"default instructions should have a Multi-agent routing section so agents know to call pf_ps before pf_fault/pf_poke")
+	})
+	t.Run("warns against the silent first-agent fallback", func(t *testing.T) {
+		// Any of these phrasings prove the point; require at least one.
+		text := tool.DefaultInstructions
+		hasFallbackWarning := strings.Contains(text, "do not rely") ||
+			strings.Contains(text, "do not default") ||
+			strings.Contains(text, "first configured")
+		assert.True(t, hasFallbackWarning,
+			"default instructions should warn against the \"first configured agent\" fallback")
+	})
+	t.Run("sets a timeout floor", func(t *testing.T) {
+		// Spell out the 120s floor somewhere in the text so an agent
+		// reading the system prompt sees the real-latency guidance.
+		assert.Contains(t, tool.DefaultInstructions, "120",
+			"default instructions should mention the 120s timeout floor")
+	})
+}
+
+// TestDefaultInstructions_ChatHistoryFraming guards the fix for the
+// trace-observed friction where agents did not reach for pagefault on
+// "what did we talk about" questions, because nothing told them
+// pagefault's backends commonly include past-conversation archives.
+// Without this framing, Claude defaults to searching its own context
+// window and says "I don't remember" when really the answer is one
+// pf_fault call away.
+func TestDefaultInstructions_ChatHistoryFraming(t *testing.T) {
+	text := tool.DefaultInstructions
+
+	t.Run("mentions past-conversation archives in the intro", func(t *testing.T) {
+		hasConversationFraming := strings.Contains(text, "past conversations") ||
+			strings.Contains(text, "past conversation") ||
+			strings.Contains(text, "chat history") ||
+			strings.Contains(text, "past chat")
+		assert.True(t, hasConversationFraming,
+			"default instructions should explicitly mention that pagefault stores past conversations / chat history — otherwise agents won't route 'what did we talk about' questions here")
+	})
+
+	t.Run("mentions a concrete chat-archive backend as an example", func(t *testing.T) {
+		// Naming a real backend (lossless-lcm, transcripts, embedding
+		// indices) grounds the claim. A vague "may include chat history"
+		// is less convincing than a concrete example.
+		hasConcreteExample := strings.Contains(text, "lossless-lcm") ||
+			strings.Contains(text, "transcripts") ||
+			strings.Contains(text, "embedding")
+		assert.True(t, hasConcreteExample,
+			"default instructions should name at least one concrete chat-archive mechanism so the claim feels grounded")
+	})
+}
+
+// TestDefaultInstructions_NoFalseNoMemoryClaim guards the hard rule
+// that agents must not claim "I don't remember" without first calling
+// pf_scan or pf_fault. This is the highest-leverage lever we have to
+// prevent the "Claude answers from in-context memory and gives up"
+// failure mode.
+func TestDefaultInstructions_NoFalseNoMemoryClaim(t *testing.T) {
+	text := tool.DefaultInstructions
+
+	t.Run("has an explicit do-not-say-no-memory rule", func(t *testing.T) {
+		// Match any of several plausible phrasings.
+		hasRule := strings.Contains(text, "I don't remember") ||
+			strings.Contains(text, "don't remember") ||
+			strings.Contains(text, "no record") ||
+			strings.Contains(text, "no memory")
+		assert.True(t, hasRule,
+			"default instructions should explicitly forbid the \"I don't remember\" answer without a pagefault check")
+	})
+
+	t.Run("routes the rule under a prominent section heading", func(t *testing.T) {
+		// A "## Core rule" or equivalent heading makes the rule hard to
+		// miss. Without a heading the text tends to get skimmed.
+		hasCoreRuleHeading := strings.Contains(text, "## Core rule") ||
+			strings.Contains(text, "## Core") ||
+			strings.Contains(text, "## Must") ||
+			strings.Contains(text, "## Never")
+		assert.True(t, hasCoreRuleHeading,
+			"default instructions should route the no-false-memory rule under a prominent section heading so agents don't skim past it")
+	})
+}
+
+// TestDefaultInstructions_CrossLanguageSignalPhrases guards the fix
+// for the trace-observed friction where Chinese queries like
+// "我三月在干嘛" / "我4月2号做了些什么" did not pattern-match any of
+// the English-only signal phrases in the original instructions, so
+// Claude never routed them to pagefault. At least one zh-CN signal
+// phrase must survive future edits to prove the cross-language
+// coverage is intentional and not accidental.
+func TestDefaultInstructions_CrossLanguageSignalPhrases(t *testing.T) {
+	text := tool.DefaultInstructions
+
+	t.Run("contains at least one zh signal phrase", func(t *testing.T) {
+		// Any of these prove coverage; we don't pin a specific phrase
+		// so the instructions can evolve without churning the test.
+		hasZhSignal := strings.Contains(text, "我三月在干嘛") ||
+			strings.Contains(text, "我做了什么") ||
+			strings.Contains(text, "我跟你说过") ||
+			strings.Contains(text, "我最近") ||
+			strings.Contains(text, "记一下") ||
+			strings.Contains(text, "我之前")
+		assert.True(t, hasZhSignal,
+			"default instructions should contain at least one Chinese signal phrase so zh-CN users' questions route to pagefault")
+	})
+
+	t.Run("contains at least one English signal phrase", func(t *testing.T) {
+		// Belt and braces — the English side is what the majority of
+		// sessions rely on.
+		hasEnSignal := strings.Contains(text, "What did I note") ||
+			strings.Contains(text, "what did we talk about") ||
+			strings.Contains(text, "where did I write")
+		assert.True(t, hasEnSignal,
+			"default instructions should still contain English signal phrases — the cross-language addition must not displace them")
+	})
+
+	t.Run("mentions temporal-reference routing", func(t *testing.T) {
+		// Any question with a past-time marker should route to
+		// pagefault; call that out explicitly.
+		assert.Contains(t, text, "Temporal",
+			"default instructions should have a Temporal references section so agents know past-time markers are a pagefault signal")
+	})
+}
+
+// readSSEEvent reads from an SSE stream until it sees a blank line
+// (the SSE event terminator) and returns the accumulated event text,
+// including trailing newline. An error or EOF fails the test — SSE
+// streams should never end mid-event in these tests.
+func readSSEEvent(t *testing.T, r *bufio.Reader) string {
+	t.Helper()
+	var sb strings.Builder
+	for {
+		line, err := r.ReadString('\n')
+		require.NoErrorf(t, err, "SSE read: %v", err)
+		sb.WriteString(line)
+		// An SSE event terminates with a blank line. mcp-go writes
+		// "\r\n\r\n" for the endpoint event and "\n\n" for subsequent
+		// ones, so accept either flavour.
+		if line == "\n" || line == "\r\n" {
+			return sb.String()
+		}
+	}
+}
+
+// extractSSEData pulls the `data: ...` payload out of an SSE event
+// string. Returns the trimmed data content (everything after "data: "
+// on that line, with trailing CRLF stripped).
+func extractSSEData(t *testing.T, event string) string {
+	t.Helper()
+	for _, line := range strings.Split(event, "\n") {
+		if after, ok := strings.CutPrefix(line, "data: "); ok {
+			return strings.TrimRight(after, "\r")
+		}
+		// mcp-go's keep-alive ping omits the space between "data:" and
+		// the payload, so accept the tighter form too.
+		if after, ok := strings.CutPrefix(line, "data:"); ok {
+			return strings.TrimRight(after, "\r")
+		}
+	}
+	t.Fatalf("no data: line in SSE event: %q", event)
+	return ""
 }

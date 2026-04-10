@@ -11,7 +11,7 @@
 //	pagefault load <name> [--config] [--format markdown|json] [--no-filter] [--json]
 //	pagefault scan <query...> [--config] [--limit N] [--backends a,b] [--no-filter] [--json]
 //	pagefault peek <uri>  [--config] [--from N] [--to N] [--no-filter] [--json]
-//	pagefault fault <query...> [--config] [--agent ID] [--timeout N] [--no-filter] [--json]
+//	pagefault fault <query...> [--config] [--agent ID] [--timeout N] [--after DATE] [--before DATE] [--no-filter] [--json]
 //	pagefault ps          [--config] [--no-filter] [--json]
 //	pagefault poke [--mode direct|agent] [--uri URI] [--format entry|raw] <content...>
 //

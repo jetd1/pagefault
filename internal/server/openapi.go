@@ -291,9 +291,11 @@ func openapiSchemas() map[string]any {
 		"DeepRetrieveInput": map[string]any{
 			"type": "object",
 			"properties": map[string]any{
-				"query":           stringProp("Natural-language task for the subagent"),
-				"agent":           stringProp("Agent id (default: first configured)"),
-				"timeout_seconds": intProp("Per-call timeout; default 120"),
+				"query":            stringProp("Natural-language task for the subagent — what to find or understand. Include concrete entity names, topics, and dates where the user supplied them."),
+				"agent":            stringProp("Agent id (default: first configured; see pf_ps for the list)"),
+				"timeout_seconds":  intProp("Per-call timeout in seconds; default 120. On timeout the response carries timed_out:true and whatever partial output the subagent produced."),
+				"time_range_start": stringProp("Optional free-form earliest date/time. Passed through to the subagent via the prompt template's {time_range} placeholder; pagefault does not parse the value."),
+				"time_range_end":   stringProp("Optional free-form latest date/time. Same rules as time_range_start."),
 			},
 			"required": []any{"query"},
 		},

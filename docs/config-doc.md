@@ -30,7 +30,7 @@ backend only). For a tour of every backend type with inline docs, see
 server:
   host: "127.0.0.1"     # required
   port: 8444            # required (1..65535)
-  public_url: "https://pagefault.example.com"  # optional — advertised by /api/openapi.json
+  public_url: "https://pagefault.example.com"  # optional — advertised by /api/openapi.json and prepended to SSE endpoint events
   cors:
     enabled: false
     allowed_origins: ["https://chat.openai.com"]
@@ -42,13 +42,16 @@ server:
     enabled: false
     rps: 10              # steady-state tokens per second per caller
     burst: 20            # bucket size per caller
+  mcp:
+    sse_enabled: true    # default — mount /sse + /message for Claude Desktop and other SSE clients
+    instructions: ""     # optional override — replaces the built-in default text
 ```
 
 | Field        | Type   | Default       | Notes |
 |--------------|--------|---------------|-------|
 | `host`       | string | `127.0.0.1`   | Bind address. |
 | `port`       | int    | `8444`        | Listen port. |
-| `public_url` | string | empty         | Advertised as the `servers[0].url` in `/api/openapi.json`. Falls back to `/` when unset. |
+| `public_url` | string | empty         | Advertised as the `servers[0].url` in `/api/openapi.json`. Also used as the `baseURL` passed to mcp-go's SSE server: when set, the SSE `endpoint` event emits an absolute URL (safer behind reverse proxies); when empty, it emits a root-relative path which the client resolves against the URL it was pointed at. |
 
 ### `server.cors`
 
@@ -86,6 +89,121 @@ A caller that exceeds its budget receives HTTP 429 with a
 ```json
 {"error": {"code": "rate_limited", "status": 429, "message": "rate limit exceeded"}}
 ```
+
+### `server.mcp`
+
+Controls the MCP transports and the initialize-time metadata advertised
+to connecting clients. Both the streamable-http transport (`/mcp`) and
+the legacy-SSE transport (`/sse` + `/message`) share the same underlying
+MCPServer, so tool registrations, auth, and rate limiting are identical
+across the two — this block just gates the SSE pair and lets operators
+replace the built-in instructions text.
+
+| Field          | Type   | Default  | Notes |
+|----------------|--------|----------|-------|
+| `sse_enabled`  | bool   | `true`   | Mounts `GET /sse` and `POST /message`. Keep the default on so Claude Desktop and other SSE-only clients work out of the box; set `false` if you only serve streamable-http clients and want to minimise the public surface. |
+| `instructions` | string | built-in | Overrides the server-level instructions string advertised in the MCP `initialize` response. Most MCP clients (Claude Desktop, Claude Code, etc.) surface this text in the agent's system prompt, which makes it the single most reliable lever for teaching agents *when* to reach for `pf_*` tools vs the built-ins. Empty means "use the built-in default from `internal/tool/instructions.go`", which is the recommended starting point — only override when you want to add installation-specific guidance (e.g. "daily notes live under `memory://daily/`, project docs under `memory://projects/`"). |
+
+**Why not just rely on tool descriptions?** Tool descriptions tell an
+agent *how* to call a tool once it has decided to; instructions tell
+the agent *when* a whole server is relevant in the first place. Both
+matter — pagefault ships reasonable defaults for each — but the
+instructions string is the one to edit when you want to nudge agent
+behaviour without touching source.
+
+**Transport selection cheat-sheet:**
+
+| Client                    | Transport         | Endpoint to point at                       |
+|---------------------------|-------------------|--------------------------------------------|
+| Claude Code               | streamable-http   | `https://<host>/mcp`                       |
+| Claude Desktop            | SSE               | `https://<host>/sse`                       |
+| ChatGPT Custom GPT        | REST (OpenAPI)    | `https://<host>/api/openapi.json`          |
+| curl / raw HTTP client    | REST              | `POST https://<host>/api/pf_<tool>`        |
+
+#### Instructions override: worked example
+
+`instructions` is a full **replace**, not a layer — a non-empty value
+displaces the built-in default verbatim. That means an operator who
+just wants to add one installation-specific sentence has two options:
+
+1. **Short custom replacement** — write a terse instructions block
+   that covers only your setup. Good when you run a tightly scoped
+   pagefault instance (single backend, single agent) and don't need
+   the full cross-language signal-phrase catalogue. Trade-off: you
+   lose the built-in multi-agent routing, timeout-floor, and
+   "don't claim no memory" guidance, so you have to re-add anything
+   you still want.
+
+2. **Copy-and-extend** — paste the default from
+   `internal/tool/instructions.go` into a YAML block scalar and add
+   your additions. More text to maintain, but preserves every
+   guardrail the default ships with.
+
+The most common real-world override adds **"where does MY chat
+history and memory live"** context on top of the default, because
+that's the single highest-leverage thing an agent in a multi-MCP
+session needs to know. A worked example:
+
+```yaml
+server:
+  mcp:
+    instructions: |
+      pagefault is the user's personal memory server on this
+      deployment. The pf_* tools read and write the user's:
+
+      - Daily notes under memory://daily/YYYY-MM-DD.md
+      - Project docs under memory://projects/<slug>/
+      - A lossless-compressed archive of every past chat session
+        with wocha (work) and cha (personal) — queryable via
+        pf_fault with agent="wocha" or agent="cha" respectively.
+
+      ## Core rule
+
+      If the user asks about their own past activity, past
+      decisions, or a past conversation, you MUST call a pf_*
+      tool before answering. Do not say "I don't remember" /
+      "我不记得" — your context is only this session, but the
+      archive covers everything else.
+
+      ## Routing
+
+      1. Concrete keyword / date / filename → pf_scan.
+      2. Natural-language question ("what did I do in March",
+         "我三月在干嘛") → pf_ps first to see wocha and cha,
+         then pf_fault with the right agent. For queries that
+         straddle work and personal, fan out to both and merge.
+      3. "Remember this" / "记一下" → pf_poke mode:agent,
+         routed through cha for personal notes or wocha for
+         work notes.
+
+      pf_fault.timeout_seconds must be >= 120 — real runs take
+      20-40s before the first token and can exceed a minute.
+
+      Do NOT call these tools for general world knowledge,
+      current-repo code questions, or anything answerable from
+      this session's context alone.
+```
+
+Two things this example does that the default cannot:
+
+- **Names the specific backends** (`wocha`, `cha`,
+  `memory://daily/YYYY-MM-DD.md`). The default is backend-agnostic
+  because it doesn't know what an operator wired up; a real
+  operator *does* know, and spelling it out routes queries faster.
+- **Prescribes concrete agent selection by name.** Rather than the
+  abstract "pick by description" guidance in the default, the
+  override says "wocha for work, cha for personal" directly. For a
+  multi-MCP session where attention is scarce, this kind of
+  concrete routing hint is the most reliable signal an agent can
+  get.
+
+If you don't want to maintain a full override but still want one
+concrete installation-specific note, the minimum viable version is
+a short block that **mentions your highest-value backend by name**
+so Claude knows it exists — e.g. "past chat history with wocha is
+searchable via pf_fault agent=wocha" as a single paragraph. Even
+that one line is enough to lift the zh-CN "我最近跟你聊了什么"
+case out of the "I don't remember" trap.
 
 ---
 
@@ -157,7 +275,7 @@ backends:
 | `sandbox`        | bool                | no       | `false`  | If true, reject any file whose resolved path (after symlink resolution) escapes `root`. |
 | `writable`       | bool                | no       | `false`  | Phase 4. Set to `true` to enable `pf_poke` against this backend. Every other write field below is ignored when this is false. |
 | `write_paths`    | string[]            | no       | `[]`     | Phase 4. Doublestar URI globs that accept writes. **Patterns must include the URI scheme** (e.g. `memory://memory/*.md`), unlike `include` which matches against relative paths — a scheme-less `notes/*.md` here silently matches nothing. Empty means "every URI that passes `include`", which is rarely what you want. |
-| `write_mode`     | string              | no       | `append` | Phase 4. `append` (default, safest) or `any`. As of 0.5.1 the only observable effect of `any` is unlocking `format: "raw"` on `pf_poke`; prepend and overwrite operations are reserved but not yet implemented. Validated at config load. |
+| `write_mode`     | string              | no       | `append` | Phase 4. `append` (default, safest) or `any`. Currently the only observable effect of `any` is unlocking `format: "raw"` on `pf_poke`; prepend and overwrite operations are reserved but not yet implemented. Validated at config load. |
 | `max_entry_size` | int                 | no       | `2000`   | Phase 4. Max bytes per `pf_poke` payload, measured on the **raw caller-supplied content** before entry-template wrapping (so `format: "entry"` and `format: "raw"` share one budget). Enforced by the tool layer, not the backend — see 0.5.1 fix notes. Zero is unused as a sentinel: `applyWriteDefaults` rewrites it to the 2000-byte safe default when `writable: true`, so an explicit `max_entry_size: 0` does not mean "unlimited". Set a very large number if you truly want no effective cap. |
 | `file_locking`   | string              | no       | `flock`  | Phase 4. `flock` takes a POSIX advisory lock (LOCK_EX) around each write, cooperating with other flock-aware writers on the same machine. `none` skips locking and relies on pagefault's per-writer mutex only — single-writer deployments only. |
 
@@ -266,29 +384,41 @@ Unknown keys are ignored.
 
 ### `subagent-cli` backend
 
-Spawns an external agent process for `pf_fault`. The subagent is
-responsible for doing its own retrieval; pagefault just runs the
-command and waits for stdout.
+Spawns an external agent process for `pf_fault` and `pf_poke`
+mode:agent. The subagent is responsible for doing its own retrieval;
+pagefault just runs the command and waits for stdout.
 
 ```yaml
 - name: openclaw
   type: subagent-cli
   command: "openclaw agent run --agent {agent_id} --task {task} --timeout {timeout}"
   timeout: 300
+  # Optional server-side prompt wrappers. See "Subagent prompt
+  # templates" below for the full mechanism.
+  # retrieve_prompt_template: |
+  #   You are wocha's memory retriever. ...
+  # write_prompt_template: |
+  #   You are wocha's memory writer. ...
   agents:
     - id: wocha
       description: "Dev agent with Feishu, LCM, workspace, and coding tools"
     - id: main
       description: "Primary personal agent with full tool access"
+      # Per-agent overrides (optional) — win over the backend
+      # defaults above.
+      # retrieve_prompt_template: "..."
+      # write_prompt_template: "..."
 ```
 
 | Field        | Type     | Required | Default | Notes |
 |--------------|----------|----------|---------|-------|
 | `name`       | string   | yes      | —       | Backend name. |
 | `type`       | string   | yes      | —       | Must be `subagent-cli`. |
-| `command`    | string   | yes      | —       | Tokenized command template. Placeholders: `{agent_id}`, `{task}`, `{timeout}`. Same non-shell tokenization as `subprocess`. |
+| `command`    | string   | yes      | —       | Tokenized command template. Placeholders: `{agent_id}`, `{task}`, `{timeout}`. Same non-shell tokenization as `subprocess`. `{task}` is substituted with the *prompt-wrapped* task, not the raw caller input — see the prompt template section below. |
 | `timeout`    | int      | no       | `300`   | Default seconds before the child is killed. Overridden per call by `pf_fault.timeout_seconds`. |
-| `agents`     | [object] | yes      | —       | At least one. Each has an `id` (required) and `description` (optional). The first entry is the default when `pf_fault.agent` is empty. |
+| `retrieve_prompt_template` | string | no | built-in default | Backend-wide prompt template for `pf_fault` calls. See the "Subagent prompt templates" subsection below for placeholders and rationale. Empty uses `internal/backend.DefaultRetrievePromptTemplate`. |
+| `write_prompt_template`    | string | no | built-in default | Backend-wide prompt template for `pf_poke` mode:agent calls. Empty uses `internal/backend.DefaultWritePromptTemplate`. |
+| `agents`     | [object] | yes      | —       | At least one. Each has `id` (required), `description`, and optional per-agent `retrieve_prompt_template` / `write_prompt_template` overrides that win over the backend-level fields above. If `pf_fault.agent` / `pf_poke.agent` is empty at call time, the first entry is used as a fallback — but calling agents are told (via the default MCP instructions) to call `pf_ps` first in multi-agent setups and pick by description, so **make each `description` specific enough to route on**. Vague descriptions like "the default agent" silently cause wrong-scope calls. |
 
 On deadline, the process is killed; any stdout captured so far is
 returned as `partial_result` with `timed_out: true`.
@@ -326,10 +456,81 @@ agents live behind a gateway.
 | `spawn.method`         | string   | no       | `POST`  | HTTP method. |
 | `spawn.path`           | string   | yes      | —       | Appended to `base_url`. `{agent_id}` in the path is substituted. |
 | `spawn.headers`        | map      | no       | —       | Extra request headers. |
-| `spawn.body_template`  | string   | no       | —       | Body template with `{agent_id}`, `{task}`, `{timeout}`. `{task}` is JSON-escaped. |
+| `spawn.body_template`  | string   | no       | —       | Body template with `{agent_id}`, `{task}`, `{timeout}`. `{task}` is substituted with the prompt-wrapped task (see below) *and then* JSON-escaped, so newlines and quotes in the default templates survive unchanged. |
 | `spawn.response_path`  | string   | no       | —       | Dotted path to the agent's response string. Non-string leaves are re-encoded as JSON. Empty means "the whole response body is the answer". |
 | `timeout`              | int      | no       | `300`   | Default seconds. Overridden per call. |
-| `agents`               | [object] | yes      | —       | At least one. Each has `id` and `description`. |
+| `retrieve_prompt_template` | string | no | built-in default | Same semantics as on the CLI backend — see "Subagent prompt templates" below. |
+| `write_prompt_template`    | string | no | built-in default | Same. |
+| `agents`               | [object] | yes      | —       | At least one. Each has `id`, `description`, and optional per-agent `retrieve_prompt_template` / `write_prompt_template` overrides. Same "make descriptions specific enough to route on" rule as the CLI backend above — the caller is told to call `pf_ps` first and pick by description in multi-agent setups. |
+
+### Subagent prompt templates
+
+A fresh subagent has no idea it is supposed to be a *memory*
+agent. Left alone, it will answer the raw query from its own
+training data — the real failure mode that showed up in deployment
+review where a pf_fault for "what did I note about oleander" came
+back as a general toxicity sheet instead of a chat-history recall.
+The fix is a server-side wrap applied inside `Spawn`: the raw
+caller content (the user's query for `pf_fault`, the content to
+persist for `pf_poke` mode:agent) is substituted into a prompt
+template that frames the agent's job explicitly, and only then
+passed through the backend's `command` / `body_template`.
+
+**Precedence (highest wins):**
+
+1. Per-agent override — `agents[i].retrieve_prompt_template`
+   / `agents[i].write_prompt_template`
+2. Per-backend default — `retrieve_prompt_template` /
+   `write_prompt_template` at the top of the backend entry
+3. Built-in default — `DefaultRetrievePromptTemplate` /
+   `DefaultWritePromptTemplate` in `internal/backend/prompt.go`
+
+**Placeholders inside a template:**
+
+| Placeholder     | Substituted with                                          | Available on |
+|-----------------|-----------------------------------------------------------|--------------|
+| `{task}`        | The raw caller content (query or write body)              | both         |
+| `{time_range}`  | Formatted time range line, or empty (see `pf_fault.time_range_start`/`time_range_end`) | retrieve     |
+| `{target}`      | Free-form placement hint from `pf_poke.target`            | write        |
+| `{agent_id}`    | Resolved agent id (after default fallback)                | both         |
+
+Unknown placeholders pass through unchanged, so typos in a
+custom template are visible to the subagent rather than silently
+dropping content.
+
+**The built-in defaults** live in
+`internal/backend/prompt.go` as exported constants. Key framing
+the retrieval default enforces:
+
+- "You are a memory-retrieval agent" (not generic Q&A)
+- "Your job is to SEARCH … not to generate new content, and not
+  to answer from your own training data or world knowledge"
+- An enumeration of memory sources to try (MEMORY.md, managed
+  memory directories like workspace/memory, embedded search
+  mechanisms like qmd, structured databases like lossless-lcm,
+  any other memory service in the environment)
+- "If you cannot find anything relevant, say so plainly and
+  stop — do not invent content to look helpful"
+
+The write default mirrors this as a *placement* agent:
+
+- "You are a memory-write agent … persist the content below
+  into the user's memory at the most appropriate location"
+- Instructions to inspect the existing layout, follow naming
+  conventions, prefer extending existing files over creating
+  new ones
+- Reports the file path(s) and a one-line summary when done
+
+**When to override.** Keep the built-in defaults unless (a) you
+run multiple agents with meaningfully different scopes — one
+strict daily-journal-only agent plus one freer long-term-notes
+agent, say — where a per-agent override is clearer than the
+`target` hint; or (b) your memory layout has installation-
+specific sources the default enumeration does not mention (e.g.
+"my notes live in a custom Obsidian vault at ~/brain"). In that
+case, fork the default template and extend the "use every
+memory source" bullet list. Do not strip the "do not fall back
+to world knowledge" framing — that is the whole point.
 
 ---
 

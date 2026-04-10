@@ -36,6 +36,36 @@ type ServerConfig struct {
 	PublicURL string          `yaml:"public_url,omitempty"`
 	CORS      CORSConfig      `yaml:"cors,omitempty"`
 	RateLimit RateLimitConfig `yaml:"rate_limit,omitempty"`
+	MCP       MCPConfig       `yaml:"mcp,omitempty"`
+}
+
+// MCPConfig configures the MCP transports and initialize-time
+// metadata. Both transports are served from the same MCPServer (and
+// therefore the same tool registrations); this struct just gates the
+// legacy-SSE pair and lets operators override the instructions text.
+type MCPConfig struct {
+	// SSEEnabled toggles the legacy-SSE transport (GET /sse + POST
+	// /message) alongside the streamable-http transport at /mcp.
+	// Nil (unset) defaults to true so Claude Desktop and other
+	// SSE-only clients work out of the box — set false to disable
+	// if you only serve streamable-http clients.
+	SSEEnabled *bool `yaml:"sse_enabled,omitempty"`
+	// Instructions overrides the server-level instructions string
+	// advertised in the MCP initialize response. Most clients
+	// surface this in the agent's system prompt, so it is the
+	// canonical place to teach an agent when to reach for pf_*
+	// tools vs the built-ins. Empty means "use the built-in default
+	// from internal/tool.DefaultInstructions".
+	Instructions string `yaml:"instructions,omitempty"`
+}
+
+// SSEEnabledOrDefault returns whether the SSE transport should be
+// mounted, defaulting to true when the field is unset.
+func (m MCPConfig) SSEEnabledOrDefault() bool {
+	if m.SSEEnabled == nil {
+		return true
+	}
+	return *m.SSEEnabled
 }
 
 // CORSConfig configures Cross-Origin Resource Sharing headers for the REST
@@ -214,16 +244,36 @@ type HTTPBackendConfig struct {
 // shells out using Command with {agent_id}, {task}, and {timeout}
 // substituted at spawn time; the first argument is taken from the command
 // template's first whitespace-delimited token.
+//
+// The two PromptTemplate fields frame raw caller content (query for
+// pf_fault, content for pf_poke mode:agent) before it is substituted
+// into Command. Leaving them empty uses the built-in defaults from
+// internal/backend/prompt.go, which are prescriptive about memory
+// retrieval / memory placement — the common failure mode is a
+// subagent that drifts into generic Q&A because nothing framed the
+// task. Per-agent overrides on AgentSpec take precedence.
 type SubagentCLIBackendConfig struct {
 	Name    string      `yaml:"name" validate:"required"`
 	Type    string      `yaml:"type" validate:"required,eq=subagent-cli"`
 	Command string      `yaml:"command" validate:"required"`
 	Timeout int         `yaml:"timeout,omitempty"` // seconds; default 300
 	Agents  []AgentSpec `yaml:"agents" validate:"required,min=1,dive"`
+
+	// RetrievePromptTemplate wraps the task for pf_fault calls.
+	// Placeholders: {task}, {time_range}, {agent_id}. Empty means
+	// "use the built-in default".
+	RetrievePromptTemplate string `yaml:"retrieve_prompt_template,omitempty"`
+	// WritePromptTemplate wraps the task for pf_poke mode:agent
+	// calls. Placeholders: {task}, {target}, {agent_id}. Empty
+	// means "use the built-in default".
+	WritePromptTemplate string `yaml:"write_prompt_template,omitempty"`
 }
 
 // SubagentHTTPBackendConfig configures an HTTP subagent backend. Spawn
 // POSTs to {base_url}{spawn.path} with the configured body template.
+//
+// RetrievePromptTemplate / WritePromptTemplate work the same way as
+// on the CLI backend — see SubagentCLIBackendConfig for semantics.
 type SubagentHTTPBackendConfig struct {
 	Name    string             `yaml:"name" validate:"required"`
 	Type    string             `yaml:"type" validate:"required,eq=subagent-http"`
@@ -232,13 +282,36 @@ type SubagentHTTPBackendConfig struct {
 	Spawn   HTTPBackendRequest `yaml:"spawn" validate:"required"`
 	Timeout int                `yaml:"timeout,omitempty"` // seconds; default 300
 	Agents  []AgentSpec        `yaml:"agents" validate:"required,min=1,dive"`
+
+	// RetrievePromptTemplate wraps the task for pf_fault calls.
+	// Placeholders: {task}, {time_range}, {agent_id}. Empty means
+	// "use the built-in default".
+	RetrievePromptTemplate string `yaml:"retrieve_prompt_template,omitempty"`
+	// WritePromptTemplate wraps the task for pf_poke mode:agent
+	// calls. Placeholders: {task}, {target}, {agent_id}. Empty
+	// means "use the built-in default".
+	WritePromptTemplate string `yaml:"write_prompt_template,omitempty"`
 }
 
-// AgentSpec describes a single agent exposed by a subagent backend. Used
-// for both CLI and HTTP variants.
+// AgentSpec describes a single agent exposed by a subagent backend.
+// Used for both CLI and HTTP variants. The two PromptTemplate fields
+// are per-agent overrides — when set, they take precedence over the
+// backend-level defaults in the containing Subagent*BackendConfig.
+// This lets one backend host a mix of agent personas (a strict
+// memory-retrieval agent alongside a freer summarisation agent, say)
+// without needing a separate backend entry per persona.
 type AgentSpec struct {
 	ID          string `yaml:"id" validate:"required"`
 	Description string `yaml:"description,omitempty"`
+
+	// RetrievePromptTemplate overrides the backend's retrieve
+	// template for this agent. Empty means "fall back to the
+	// backend-level retrieve template, then to the built-in
+	// default".
+	RetrievePromptTemplate string `yaml:"retrieve_prompt_template,omitempty"`
+	// WritePromptTemplate overrides the backend's write template
+	// for this agent. Same fallback chain.
+	WritePromptTemplate string `yaml:"write_prompt_template,omitempty"`
 }
 
 // ContextConfig defines a named bundle of backend sources.

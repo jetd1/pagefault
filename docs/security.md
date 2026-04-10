@@ -50,19 +50,24 @@ Tokens are managed by the `pagefault token` subcommand — `create`, `ls`,
 - The tokens file is written atomically (temp file + rename) and should be
   mode `0600`.
 
-Auth middleware is applied to every authenticated route, including the MCP
-transport at `/mcp` and `/mcp/*`. Callers that fail auth receive `401` with
-a `WWW-Authenticate` header; trusted-header auth returns `403` if the source
-IP is not in `trusted_proxies`.
+Auth middleware is applied to every authenticated route, including both
+MCP transports: streamable-http at `/mcp` and `/mcp/*`, and legacy SSE
+at `GET /sse` + `POST /message?sessionId=...`. Callers that fail auth
+receive `401` with a `WWW-Authenticate` header; trusted-header auth
+returns `403` if the source IP is not in `trusted_proxies`.
 
-> **Note on MCP sessions.** mcp-go's streamable-http transport uses long
-> lived session IDs. The chi middleware re-runs on every HTTP request
-> (including the post-initialize tool calls), so bearer tokens are validated
-> on every hop — the session ID alone is not a substitute for auth. If you
-> find a client that opens a session once and never re-sends its
-> `Authorization` header, that is a client bug and you should report it.
-> Audit log entries will show the caller as `anonymous` if the token is
-> missing, which is a useful signal.
+> **Note on MCP sessions.** mcp-go's streamable-http transport and its
+> legacy SSE transport both use long-lived session IDs. The chi
+> middleware re-runs on every HTTP request — the initial `GET /sse` open,
+> every `POST /message?sessionId=…`, every `POST /mcp` tool call — so
+> bearer tokens are validated on every hop and the session ID alone is
+> not a substitute for auth. Claude Desktop sends the `Authorization`
+> header on both the initial SSE GET and subsequent message POSTs, so
+> bearer auth works end-to-end on the SSE transport without any special
+> accommodation. If you find a client that opens a session once and
+> never re-sends its `Authorization` header, that is a client bug and
+> you should report it. Audit log entries will show the caller as
+> `anonymous` if the token is missing, which is a useful signal.
 
 ## Sandbox & path traversal
 
@@ -353,6 +358,17 @@ Guardrails pagefault *cannot* enforce (operator responsibility):
 - **Resource exhaustion.** A caller who can spawn subagents can drive
   load on the subagent's runtime. Rate-limit `pf_fault` at a proxy if
   that matters.
+
+> **Subagent prompt templates are a behaviour lever, not a security
+> lever.** The `retrieve_prompt_template` / `write_prompt_template`
+> wrapping (see `docs/config-doc.md` → "Subagent prompt templates")
+> exists to frame a fresh agent as a memory retriever / placer so it
+> does not fall back to generic Q&A mode — but a malicious or
+> compromised subagent is free to ignore the framing. Do not treat
+> the template as a sandbox, an input validator, or a jailbreak
+> mitigation. Trust flows the same way it would without the
+> template: `pf_fault` callers are still *users of the configured
+> subagent* with whatever privileges that agent holds.
 
 Bottom line: treat `pf_fault` callers as *users of the configured
 subagent*, not as sandboxed memory clients. If you wouldn't let them

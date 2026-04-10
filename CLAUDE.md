@@ -69,9 +69,11 @@ pagefault/
 │   │   ├── filesystem_write_test.go      # Filesystem backend write-path tests (Phase 4)
 │   │   ├── http_helpers.go               # Shared template/JSON-path helpers (renderTemplate/walkPath/…)
 │   │   ├── http_helpers_test.go          # Helper unit tests (walkPath edge cases, extractResponse variants)
-│   │   ├── subagent.go                   # SubagentBackend interface + AgentInfo
+│   │   ├── subagent.go                   # SubagentBackend interface + AgentInfo + SpawnRequest
+│   │   ├── prompt.go                     # SpawnRequest / SpawnPurpose, default retrieve+write prompt templates, ResolvePromptTemplate + WrapTask
+│   │   ├── prompt_test.go                # Template precedence, placeholder substitution, end-to-end default-template echo
 │   │   ├── subagent_cli.go               # CLI-spawned subagent (exec.CommandContext + argv template)
-│   │   ├── subagent_cli_test.go          # Tokenizer + spawn/timeout/default-agent tests
+│   │   ├── subagent_cli_test.go          # Tokenizer + spawn/timeout/default-agent tests (passthroughTmpl-based plumbing tests)
 │   │   ├── subagent_http.go              # HTTP-spawned subagent (POST + response_path extraction)
 │   │   ├── subagent_http_test.go         # httptest-backed tests: auth, body template, timeout
 │   │   ├── subprocess.go                 # Generic subprocess search backend (rg/grep/plain parse)
@@ -118,14 +120,15 @@ pagefault/
 │   │   ├── list_agents.go                # HandleListAgents pure function (wire: pf_ps)
 │   │   ├── write.go                      # HandleWrite pure function (wire: pf_poke) — Phase 4
 │   │   ├── mcp.go                        # RegisterMCP: wires pure handlers to mcp-go
+│   │   ├── instructions.go               # DefaultInstructions — server-level MCP initialize text
 │   │   ├── tool_test.go                  # Pure handler tests
 │   │   ├── deep_retrieve_test.go         # pf_fault handler tests (stubSubagent)
 │   │   ├── write_test.go                 # pf_poke direct/agent handler tests — Phase 4
 │   │   └── mcp_test.go                   # MCP registration + toolResult helper tests (incl. pf_poke)
 │   │
 │   └── server/
-│       ├── server.go                     # chi router, MCP mount, REST adapter, /health, structured error envelope
-│       ├── server_test.go                # Integration tests via httptest (incl. MCP smoke, OpenAPI, health probe)
+│       ├── server.go                     # chi router, MCP streamable-http + SSE mounts, REST adapter, /health, structured error envelope
+│       ├── server_test.go                # Integration tests via httptest (incl. MCP smoke, SSE handshake + roundtrip, instructions, OpenAPI, health probe)
 │       ├── openapi.go                    # /api/openapi.json spec builder (OpenAPI 3.1.0, live from dispatcher + config)
 │       ├── cors.go                       # CORS middleware (opt-in, per server.cors config)
 │       ├── cors_test.go                  # Preflight + allowed/denied origin tests
@@ -168,13 +171,15 @@ Client → chi router → auth middleware → tool handler → dispatcher
 
 **Key abstractions:**
 
-- **Backend** — data source plugin interface (`internal/backend/backend.go`). Ships five types: `filesystem` (Phase 1, Phase-4 write support), `subprocess`, `http`, `subagent-cli`, `subagent-http` (Phase 2). `SubagentBackend` extends `Backend` with `Spawn`/`ListAgents` for `pf_fault` and `pf_ps`. `WritableBackend` is an optional Phase-4 extension implemented by `FilesystemBackend` when `writable: true`.
+- **Backend** — data source plugin interface (`internal/backend/backend.go`). Ships five types: `filesystem` (Phase 1, Phase-4 write support), `subprocess`, `http`, `subagent-cli`, `subagent-http` (Phase 2). `SubagentBackend` extends `Backend` with `Spawn(ctx, SpawnRequest)` / `ListAgents` for `pf_fault` and `pf_ps`. `WritableBackend` is an optional Phase-4 extension implemented by `FilesystemBackend` when `writable: true`.
+- **SpawnRequest / prompt templates** — `internal/backend/prompt.go` defines the `SpawnRequest` struct (agent id, task, purpose, time range, target, timeout), the `SpawnPurpose` enum (`retrieve` / `write`), the two default templates, and `ResolvePromptTemplate` + `WrapTask`. Every subagent backend wraps the raw caller content with a resolved template **before** substituting into its command / body template, so fresh subagents are framed as memory retrievers/placers rather than generic Q&A. Three-layer override precedence: per-agent → per-backend → built-in default.
 - **Context** — named, pre-composed bundle of backend resources (YAML-defined).
 - **Filter** — optional path/tag/redaction filter. Can be fully disabled. Phase-4 added `AllowWriteURI` for the write path.
 - **Auth** — bearer token, trusted header, or none.
-- **Dispatcher** — central tool router. Holds backends + contexts + filters + audit logger.
+- **Dispatcher** — central tool router. Holds backends + contexts + filters + audit logger. Exposes `ListContexts`, `GetContext`, `Search`, `Read`, `DeepRetrieve`, `ListAgents`, `Write`, and `DelegateWrite` (Phase-4 write-side twin of `DeepRetrieve` that spawns a subagent with `Purpose=write` so the write-framed prompt template is picked).
 - **Writer** — `internal/write.FilesystemWriter` is the flock-serialised atomic-append primitive behind `pf_poke` mode:direct.
 - **Tools** — pure `HandleX` functions (`internal/tool/*.go`); the server package wraps them for REST and `tool.RegisterMCP` wraps them for mcp-go.
+- **Instructions** — `internal/tool/instructions.go` holds `DefaultInstructions`, the server-level text advertised in the MCP `initialize` response (via `mcpserver.WithInstructions`). Operators override via `server.mcp.instructions` in YAML. This is the highest-leverage lever for teaching cold agents when to reach for `pf_*` tools vs their built-ins; it covers chat-history framing, a core "don't claim no memory" rule, cross-language signal phrases, multi-agent routing, and a 120s timeout floor. Edit with care — the server-wide test suite pins several phrases in place.
 
 ## Tool Naming
 

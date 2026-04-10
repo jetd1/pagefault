@@ -96,19 +96,32 @@ func TestNewSubagentCLIBackend_Validation(t *testing.T) {
 	})
 }
 
+// passthroughTmpl is a minimal {task} template used by tests that
+// care about the plumbing (argv substitution, timeout, agent
+// selection) rather than the default prompt-wrap framing. Without
+// it, every Spawn output would start with the full
+// DefaultRetrievePromptTemplate and every assertion would have to
+// grep for the echoed task inside the wrapped text.
+const passthroughTmpl = "{task}"
+
 func TestSubagentCLIBackend_Spawn_Echo(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("echo semantics differ on Windows")
 	}
 	b, err := NewSubagentCLIBackend(&config.SubagentCLIBackendConfig{
 		Name: "sa", Type: "subagent-cli",
-		Command: "echo {agent_id}:{task}",
-		Timeout: 10,
-		Agents:  []config.AgentSpec{{ID: "alpha"}},
+		Command:                "echo {agent_id}:{task}",
+		Timeout:                10,
+		Agents:                 []config.AgentSpec{{ID: "alpha"}},
+		RetrievePromptTemplate: passthroughTmpl,
 	})
 	require.NoError(t, err)
 
-	out, err := b.Spawn(context.Background(), "alpha", "hello world", 5*time.Second)
+	out, err := b.Spawn(context.Background(), SpawnRequest{
+		AgentID: "alpha",
+		Task:    "hello world",
+		Timeout: 5 * time.Second,
+	})
 	require.NoError(t, err)
 	assert.Equal(t, "alpha:hello world", out)
 }
@@ -119,12 +132,16 @@ func TestSubagentCLIBackend_Spawn_DefaultAgent(t *testing.T) {
 	}
 	b, err := NewSubagentCLIBackend(&config.SubagentCLIBackendConfig{
 		Name: "sa", Type: "subagent-cli",
-		Command: "echo {agent_id}",
-		Agents:  []config.AgentSpec{{ID: "primary"}, {ID: "secondary"}},
+		Command:                "echo {agent_id}",
+		Agents:                 []config.AgentSpec{{ID: "primary"}, {ID: "secondary"}},
+		RetrievePromptTemplate: passthroughTmpl,
 	})
 	require.NoError(t, err)
 
-	out, err := b.Spawn(context.Background(), "", "task", 5*time.Second)
+	out, err := b.Spawn(context.Background(), SpawnRequest{
+		Task:    "task",
+		Timeout: 5 * time.Second,
+	})
 	require.NoError(t, err)
 	assert.Equal(t, "primary", out)
 }
@@ -132,12 +149,17 @@ func TestSubagentCLIBackend_Spawn_DefaultAgent(t *testing.T) {
 func TestSubagentCLIBackend_Spawn_UnknownAgent(t *testing.T) {
 	b, err := NewSubagentCLIBackend(&config.SubagentCLIBackendConfig{
 		Name: "sa", Type: "subagent-cli",
-		Command: "echo x",
-		Agents:  []config.AgentSpec{{ID: "alpha"}},
+		Command:                "echo x",
+		Agents:                 []config.AgentSpec{{ID: "alpha"}},
+		RetrievePromptTemplate: passthroughTmpl,
 	})
 	require.NoError(t, err)
 
-	_, err = b.Spawn(context.Background(), "does-not-exist", "t", time.Second)
+	_, err = b.Spawn(context.Background(), SpawnRequest{
+		AgentID: "does-not-exist",
+		Task:    "t",
+		Timeout: time.Second,
+	})
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, model.ErrAgentNotFound))
 }
@@ -148,13 +170,18 @@ func TestSubagentCLIBackend_Spawn_Timeout(t *testing.T) {
 	}
 	b, err := NewSubagentCLIBackend(&config.SubagentCLIBackendConfig{
 		Name: "sa", Type: "subagent-cli",
-		Command: "sleep 5",
-		Agents:  []config.AgentSpec{{ID: "slow"}},
+		Command:                "sleep 5",
+		Agents:                 []config.AgentSpec{{ID: "slow"}},
+		RetrievePromptTemplate: passthroughTmpl,
 	})
 	require.NoError(t, err)
 
 	start := time.Now()
-	_, err = b.Spawn(context.Background(), "slow", "t", 100*time.Millisecond)
+	_, err = b.Spawn(context.Background(), SpawnRequest{
+		AgentID: "slow",
+		Task:    "t",
+		Timeout: 100 * time.Millisecond,
+	})
 	elapsed := time.Since(start)
 
 	require.Error(t, err)
@@ -169,12 +196,17 @@ func TestSubagentCLIBackend_Spawn_NonZeroExit(t *testing.T) {
 	}
 	b, err := NewSubagentCLIBackend(&config.SubagentCLIBackendConfig{
 		Name: "sa", Type: "subagent-cli",
-		Command: "false",
-		Agents:  []config.AgentSpec{{ID: "fail"}},
+		Command:                "false",
+		Agents:                 []config.AgentSpec{{ID: "fail"}},
+		RetrievePromptTemplate: passthroughTmpl,
 	})
 	require.NoError(t, err)
 
-	_, err = b.Spawn(context.Background(), "fail", "t", 5*time.Second)
+	_, err = b.Spawn(context.Background(), SpawnRequest{
+		AgentID: "fail",
+		Task:    "t",
+		Timeout: 5 * time.Second,
+	})
 	require.Error(t, err)
 	assert.False(t, errors.Is(err, model.ErrSubagentTimeout))
 }

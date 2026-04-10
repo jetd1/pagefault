@@ -23,6 +23,35 @@
 server:
   host: "127.0.0.1"
   port: 8444
+  # public_url: "https://pagefault.example.com"
+  #
+  # MCP transports and initialize-time metadata. Both /mcp (streamable-http)
+  # and /sse + /message (legacy SSE) are mounted by default, so Claude Code
+  # and Claude Desktop can both connect without any extra bridging.
+  mcp:
+    sse_enabled: true   # set false to disable /sse + /message
+    # instructions: |
+    #   Optional override for the server-level instructions string
+    #   advertised in the MCP initialize response. This is a full
+    #   REPLACE of the built-in default (not a layer) — empty uses
+    #   the default from internal/tool/instructions.go, which ships
+    #   with cross-language signal phrases, a "don't claim no
+    #   memory" core rule, multi-agent routing guidance, and a
+    #   120s timeout floor. Only override when you want to name
+    #   YOUR specific backends / agents by name, which is the
+    #   single highest-leverage routing hint in a multi-MCP
+    #   session. See docs/config-doc.md → "Instructions override:
+    #   worked example" for a full template. Minimum viable shape:
+    #
+    #   pagefault is my personal memory server. Backends include
+    #   a daily journal at memory://daily/YYYY-MM-DD.md, project
+    #   notes under memory://projects/<name>/, and a lossless-lcm
+    #   archive of every past chat session with wocha (work) and
+    #   cha (personal). Do not say "I don't remember" / "我不记得"
+    #   without first calling pf_scan or pf_fault — your context
+    #   is only this session, the archive covers everything else.
+    #   In multi-agent setups call pf_ps first and pick by
+    #   description; never set pf_fault.timeout_seconds below 120.
 
 auth:
   mode: "none"   # for a live deployment, use "bearer" + a tokens file
@@ -67,11 +96,47 @@ backends:
     type: subagent-cli
     command: "echo {agent_id}:{task}"
     timeout: 60
+    # Subagent prompt wrapping (0.6.0+). Pagefault prepends a
+    # resolved template to the raw caller content before
+    # substituting {task} here, so a fresh subagent knows its job
+    # is memory retrieval / placement rather than generic Q&A.
+    # Leaving these empty uses the built-in DefaultRetrieve... /
+    # DefaultWritePromptTemplate constants from
+    # internal/backend/prompt.go — a sensible starting point.
+    # Override only for installation-specific framing (e.g. "my
+    # notes live in a custom Obsidian vault at ~/brain"):
+    #
+    # retrieve_prompt_template: |
+    #   You are wocha's memory retriever. Your job is to SEARCH
+    #   the user's memory (MEMORY.md, ~/workspace/memory/**, the
+    #   lossless-lcm database) for content matching the query
+    #   below. Do not answer from your own training data.
+    #
+    #   QUERY: {task}
+    #   {time_range}
+    # write_prompt_template: |
+    #   You are wocha's memory writer. Persist the content below
+    #   into ~/workspace/memory/ using the YYYY-MM-DD.md daily
+    #   layout. Extend existing entries when the theme matches.
+    #
+    #   TARGET HINT: {target}
+    #   CONTENT: {task}
     agents:
+      # Agent descriptions are the only routing signal a calling
+      # agent has for multi-agent setups. Make each one specific —
+      # "first configured, used as the default" is a bad example in
+      # a real config because pf_fault / pf_poke mode:agent expect
+      # the caller to read pf_ps and pick by scope (work vs
+      # personal, short-term vs long-term, etc.). The alpha/beta
+      # pair here is just a plumbing test, so their descriptions
+      # are intentionally generic.
       - id: alpha
-        description: "example echo agent — first configured, used as the default"
+        description: "example echo agent — plumbing test only, not a real retriever"
+        # Per-agent overrides (optional):
+        # retrieve_prompt_template: "…"
+        # write_prompt_template: "…"
       - id: beta
-        description: "example echo agent — pick via --agent beta"
+        description: "example echo agent — plumbing test only, pick via --agent beta"
 
   # (3) Subprocess — generic "run a command, parse stdout" backend.
   # Canonical use: ripgrep for fast indexed search across a corpus.

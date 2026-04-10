@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/jet/pagefault/internal/dispatcher"
@@ -136,11 +135,14 @@ func handleWriteDirect(ctx context.Context, d *dispatcher.ToolDispatcher, in Wri
 	}, nil
 }
 
-// handleWriteAgent implements mode:"agent" — compose a natural-language
-// task for a subagent and delegate writeback to it via pf_fault's
-// dispatcher path. The subagent has its own tools and workspace
-// access; pagefault does not re-validate its writes because (per
-// plan.md §5.7) agent mode *delegates trust* to the subagent.
+// handleWriteAgent implements mode:"agent" — hand the content to a
+// subagent via the dispatcher's DelegateWrite path. The subagent has
+// its own tools and workspace access, and gets a write-framed prompt
+// template (per-agent override → backend default →
+// [backend.DefaultWritePromptTemplate]) applied inside Spawn so it
+// knows its job is placement, not generation. pagefault does not
+// re-validate the agent's writes — per plan.md §5.7, agent mode
+// *delegates trust* to the subagent.
 func handleWriteAgent(ctx context.Context, d *dispatcher.ToolDispatcher, in WriteInput, caller model.Caller) (WriteOutput, error) {
 	target := in.Target
 	if target == "" {
@@ -151,9 +153,9 @@ func handleWriteAgent(ctx context.Context, d *dispatcher.ToolDispatcher, in Writ
 		timeout = defaultDeepRetrieveTimeout
 	}
 
-	task := composeAgentWriteTask(in.Content, target, caller)
-
-	res, err := d.DeepRetrieve(ctx, task, in.Agent, timeout, caller)
+	res, err := d.DelegateWrite(ctx, in.Content, in.Agent, timeout, caller, dispatcher.DelegateWriteOptions{
+		Target: target,
+	})
 	if err != nil {
 		return WriteOutput{}, err
 	}
@@ -176,23 +178,6 @@ func handleWriteAgent(ctx context.Context, d *dispatcher.ToolDispatcher, in Writ
 		Result:         answer,
 		TimedOut:       res.TimedOut,
 	}, nil
-}
-
-// composeAgentWriteTask builds the natural-language instruction sent
-// to a subagent for mode:"agent" writes. Kept as a pure function so
-// tests can assert against the exact string shape.
-func composeAgentWriteTask(content, target string, caller model.Caller) string {
-	var label string
-	if caller.Label != "" {
-		label = caller.Label
-	} else {
-		label = caller.ID
-	}
-	var b strings.Builder
-	fmt.Fprintf(&b, "A remote agent (%s) wants to record the following to memory: %q. ", label, content)
-	fmt.Fprintf(&b, "Target: %q. ", target)
-	b.WriteString("Read the relevant memory files, decide the best location, and write it appropriately. Follow existing file conventions.")
-	return b.String()
 }
 
 // backendForDirectWrite resolves the backend that owns the URI scheme

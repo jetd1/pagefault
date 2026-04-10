@@ -18,16 +18,16 @@ import (
 )
 
 // stubSubagent is a zero-dep SubagentBackend for HandleDeepRetrieve
-// tests. It returns a configured answer or an error.
+// tests. It returns a configured answer or an error and records the
+// last SpawnRequest so tests can assert on purpose, time range, and
+// target fields as well as the raw task.
 type stubSubagent struct {
 	name   string
 	agents []backend.AgentInfo
 	answer string
 	err    error
 
-	lastAgentID string
-	lastTask    string
-	lastTimeout time.Duration
+	lastReq backend.SpawnRequest
 }
 
 func (s *stubSubagent) Name() string { return s.name }
@@ -41,10 +41,8 @@ func (s *stubSubagent) ListResources(context.Context) ([]backend.ResourceInfo, e
 	return nil, nil
 }
 func (s *stubSubagent) ListAgents() []backend.AgentInfo { return s.agents }
-func (s *stubSubagent) Spawn(_ context.Context, agentID, task string, timeout time.Duration) (string, error) {
-	s.lastAgentID = agentID
-	s.lastTask = task
-	s.lastTimeout = timeout
+func (s *stubSubagent) Spawn(_ context.Context, req backend.SpawnRequest) (string, error) {
+	s.lastReq = req
 	return s.answer, s.err
 }
 
@@ -76,7 +74,8 @@ func TestHandleDeepRetrieve_HappyPath(t *testing.T) {
 	assert.GreaterOrEqual(t, out.ElapsedSeconds, 0.0)
 	assert.False(t, out.TimedOut)
 	assert.Empty(t, out.PartialResult)
-	assert.Equal(t, "what is pagefault?", sa.lastTask)
+	assert.Equal(t, "what is pagefault?", sa.lastReq.Task)
+	assert.Equal(t, backend.SpawnPurposeRetrieve, sa.lastReq.Purpose)
 }
 
 func TestHandleDeepRetrieve_EmptyQuery(t *testing.T) {
@@ -106,7 +105,7 @@ func TestHandleDeepRetrieve_ExplicitAgent(t *testing.T) {
 		DeepRetrieveInput{Query: "q", Agent: "beta"}, model.AnonymousCaller)
 	require.NoError(t, err)
 	assert.Equal(t, "beta", out.Agent)
-	assert.Equal(t, "beta", sa.lastAgentID)
+	assert.Equal(t, "beta", sa.lastReq.AgentID)
 }
 
 func TestHandleDeepRetrieve_UnknownAgent(t *testing.T) {
@@ -137,7 +136,7 @@ func TestHandleDeepRetrieve_Timeout(t *testing.T) {
 	assert.True(t, out.TimedOut)
 	assert.Equal(t, "partial", out.PartialResult)
 	assert.Empty(t, out.Answer)
-	assert.Equal(t, 5*time.Second, sa.lastTimeout)
+	assert.Equal(t, 5*time.Second, sa.lastReq.Timeout)
 }
 
 func TestHandleDeepRetrieve_DefaultTimeout(t *testing.T) {
@@ -150,7 +149,44 @@ func TestHandleDeepRetrieve_DefaultTimeout(t *testing.T) {
 	_, err := HandleDeepRetrieve(context.Background(), d,
 		DeepRetrieveInput{Query: "q"}, model.AnonymousCaller)
 	require.NoError(t, err)
-	assert.Equal(t, defaultDeepRetrieveTimeout, sa.lastTimeout)
+	assert.Equal(t, defaultDeepRetrieveTimeout, sa.lastReq.Timeout)
+}
+
+// TestHandleDeepRetrieve_TimeRangePassthrough confirms the
+// TimeRangeStart / TimeRangeEnd input fields flow all the way through
+// to the SpawnRequest.TimeRange seen by the backend, including the
+// "from X to Y" / "from X onwards" / "up to Y" formatting that
+// formatTimeRange applies.
+func TestHandleDeepRetrieve_TimeRangePassthrough(t *testing.T) {
+	cases := []struct {
+		name  string
+		start string
+		end   string
+		want  string
+	}{
+		{"both", "2026-04-01", "2026-04-11", "2026-04-01 to 2026-04-11"},
+		{"start only", "2026-04-01", "", "from 2026-04-01 onwards"},
+		{"end only", "", "2026-04-11", "up to 2026-04-11"},
+		{"neither", "", "", ""},
+		{"whitespace-only end", "2026-04-01", "   ", "from 2026-04-01 onwards"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			sa := &stubSubagent{
+				name:   "sa",
+				agents: []backend.AgentInfo{{ID: "alpha"}},
+				answer: "ok",
+			}
+			d := makeSubagentDispatcher(t, sa)
+			_, err := HandleDeepRetrieve(context.Background(), d, DeepRetrieveInput{
+				Query:          "q",
+				TimeRangeStart: tc.start,
+				TimeRangeEnd:   tc.end,
+			}, model.AnonymousCaller)
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, sa.lastReq.TimeRange)
+		})
+	}
 }
 
 func TestHandleDeepRetrieve_NoSubagent(t *testing.T) {

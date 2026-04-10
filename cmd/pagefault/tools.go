@@ -343,11 +343,16 @@ func runFault(args []string) error {
 	configPath, noFilter, asJSON := registerCommonFlags(fs)
 	agent := fs.String("agent", "", "subagent id to spawn (see `pagefault ps`; empty picks the first configured)")
 	timeoutSec := fs.Int("timeout", 120, "max seconds to wait for the agent")
+	// Deliberately not reusing peek's --from / --to here: peek uses them
+	// for 1-indexed line numbers, while fault needs free-form date/time
+	// hints. Separate names avoid the subcommand collision.
+	after := fs.String("after", "", "optional earliest date/time for the subagent's search (free-form)")
+	before := fs.String("before", "", "optional latest date/time for the subagent's search (free-form)")
 	if err := parseInterspersed(fs, args); err != nil {
 		return err
 	}
 	if fs.NArg() < 1 {
-		return errors.New("usage: pagefault fault <query...> [--config PATH] [--agent ID] [--timeout N] [--no-filter] [--json]")
+		return errors.New("usage: pagefault fault <query...> [--config PATH] [--agent ID] [--timeout N] [--after DATE] [--before DATE] [--no-filter] [--json]")
 	}
 	query := strings.Join(fs.Args(), " ")
 
@@ -361,6 +366,8 @@ func runFault(args []string) error {
 		Query:          query,
 		Agent:          *agent,
 		TimeoutSeconds: *timeoutSec,
+		TimeRangeStart: *after,
+		TimeRangeEnd:   *before,
 	}, cliCaller)
 	if err != nil {
 		return err

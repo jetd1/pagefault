@@ -318,13 +318,15 @@ func TestHandleWrite_DirectContentAtCapSucceeds(t *testing.T) {
 // ───────────── agent mode ─────────────
 
 // agentStub is a subagent backend used by the HandleWrite agent-mode
-// tests. It records the task it saw and returns a canned answer.
+// tests. It records the full SpawnRequest so tests can assert the
+// purpose, target, and raw task (no template wrapping — the stub
+// bypasses the CLI/HTTP backend implementations that apply it).
 type agentStub struct {
-	name     string
-	agents   []backend.AgentInfo
-	answer   string
-	err      error
-	lastTask string
+	name    string
+	agents  []backend.AgentInfo
+	answer  string
+	err     error
+	lastReq backend.SpawnRequest
 }
 
 func (s *agentStub) Name() string { return s.name }
@@ -338,8 +340,8 @@ func (s *agentStub) ListResources(context.Context) ([]backend.ResourceInfo, erro
 	return nil, nil
 }
 func (s *agentStub) ListAgents() []backend.AgentInfo { return s.agents }
-func (s *agentStub) Spawn(_ context.Context, _, task string, _ time.Duration) (string, error) {
-	s.lastTask = task
+func (s *agentStub) Spawn(_ context.Context, req backend.SpawnRequest) (string, error) {
+	s.lastReq = req
 	return s.answer, s.err
 }
 
@@ -368,10 +370,12 @@ func TestHandleWrite_AgentHappyPath(t *testing.T) {
 	assert.Equal(t, "writer", out.Backend)
 	assert.Contains(t, out.Result, "Appended")
 
-	// Verify the composed task contains the key pieces.
-	assert.Contains(t, sa.lastTask, "Claude Code")
-	assert.Contains(t, sa.lastTask, "Fixed the auth bug")
-	assert.Contains(t, sa.lastTask, "daily")
+	// The raw task passed to Spawn is the content verbatim — no
+	// prose-wrapping in the handler anymore, because the backend
+	// applies its prompt template.
+	assert.Equal(t, "Fixed the auth bug", sa.lastReq.Task)
+	assert.Equal(t, "daily", sa.lastReq.Target)
+	assert.Equal(t, backend.SpawnPurposeWrite, sa.lastReq.Purpose)
 }
 
 func TestHandleWrite_AgentDefaultTarget(t *testing.T) {
@@ -392,7 +396,9 @@ func TestHandleWrite_AgentDefaultTarget(t *testing.T) {
 		Mode:    "agent",
 	}, model.AnonymousCaller)
 	require.NoError(t, err)
-	assert.Contains(t, sa.lastTask, `Target: "auto"`)
+	assert.Equal(t, "auto", sa.lastReq.Target,
+		"empty Target should default to \"auto\"")
+	assert.Equal(t, backend.SpawnPurposeWrite, sa.lastReq.Purpose)
 }
 
 func TestHandleWrite_AgentNoSubagentConfigured(t *testing.T) {
@@ -428,19 +434,6 @@ func TestHandleWrite_AgentTimeoutSurfacesAsResult(t *testing.T) {
 	require.NoError(t, err, "timeout should not escape as error")
 	assert.True(t, out.TimedOut)
 	assert.Equal(t, "partial draft", out.Result)
-}
-
-func TestComposeAgentWriteTask_Format(t *testing.T) {
-	got := composeAgentWriteTask("body", "long-term", model.Caller{ID: "a", Label: "Agent"})
-	assert.Contains(t, got, "Agent")
-	assert.Contains(t, got, `"body"`)
-	assert.Contains(t, got, `Target: "long-term"`)
-	assert.Contains(t, got, "existing file conventions")
-}
-
-func TestComposeAgentWriteTask_FallsBackToID(t *testing.T) {
-	got := composeAgentWriteTask("x", "auto", model.Caller{ID: "cli", Label: ""})
-	assert.Contains(t, got, "(cli)")
 }
 
 func TestCallerLabelFor_FallsBackToID(t *testing.T) {

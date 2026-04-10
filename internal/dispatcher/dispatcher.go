@@ -573,15 +573,25 @@ type DeepRetrieveResult struct {
 	PartialResult  string  `json:"partial_result,omitempty"`
 }
 
+// DeepRetrieveOptions bundles the optional knobs for DeepRetrieve
+// (time range, future caller hints, etc.) so we can grow the call
+// shape without churning every call site.
+type DeepRetrieveOptions struct {
+	// TimeRange is a free-form hint restricting the subagent's
+	// search to a time window. Passed through to the backend's
+	// prompt template as {time_range}; empty means "no restriction".
+	TimeRange string
+}
+
 // DeepRetrieve spawns a subagent to answer the query and returns the
 // agent's response. agentID may be empty (use the first subagent
 // backend's default). timeout overrides the backend's configured default
-// when non-zero.
+// when non-zero. opts carries optional hints like TimeRange.
 //
 // On timeout, DeepRetrieve returns a successful result with TimedOut=true
 // and the partial stdout in PartialResult. Other errors (unknown agent,
 // backend failure) propagate via the error return.
-func (d *ToolDispatcher) DeepRetrieve(ctx context.Context, query string, agentID string, timeout time.Duration, caller model.Caller) (*DeepRetrieveResult, error) {
+func (d *ToolDispatcher) DeepRetrieve(ctx context.Context, query string, agentID string, timeout time.Duration, caller model.Caller, opts DeepRetrieveOptions) (*DeepRetrieveResult, error) {
 	start := time.Now()
 
 	var result *DeepRetrieveResult
@@ -591,9 +601,11 @@ func (d *ToolDispatcher) DeepRetrieve(ctx context.Context, query string, agentID
 		if result != nil {
 			size = len(result.Answer) + len(result.PartialResult)
 		}
-		d.auditLog.Log(audit.NewEntry(caller, "pf_fault",
-			map[string]any{"query": query, "agent": agentID, "timeout_s": int(timeout.Seconds())},
-			start, size, err))
+		args := map[string]any{"query": query, "agent": agentID, "timeout_s": int(timeout.Seconds())}
+		if opts.TimeRange != "" {
+			args["time_range"] = opts.TimeRange
+		}
+		d.auditLog.Log(audit.NewEntry(caller, "pf_fault", args, start, size, err))
 	}()
 
 	if query == "" {
@@ -608,7 +620,13 @@ func (d *ToolDispatcher) DeepRetrieve(ctx context.Context, query string, agentID
 	}
 
 	// Spawn runs synchronously; the backend respects our timeout.
-	answer, spawnErr := target.Spawn(ctx, agentName, query, timeout)
+	answer, spawnErr := target.Spawn(ctx, backend.SpawnRequest{
+		AgentID:   agentName,
+		Task:      query,
+		Purpose:   backend.SpawnPurposeRetrieve,
+		TimeRange: opts.TimeRange,
+		Timeout:   timeout,
+	})
 	elapsed := time.Since(start).Seconds()
 
 	r := &DeepRetrieveResult{
@@ -625,6 +643,96 @@ func (d *ToolDispatcher) DeepRetrieve(ctx context.Context, query string, agentID
 		// result carries the timeout indicator. Surface the sentinel in
 		// the audit log instead.
 		slog.Warn("deep_retrieve: subagent timed out",
+			"agent", agentName, "backend", target.Name(),
+			"elapsed_s", elapsed, "caller", caller.ID)
+		return r, nil
+	}
+	if spawnErr != nil {
+		err = spawnErr
+		return nil, err
+	}
+
+	r.Answer = answer
+	result = r
+	return r, nil
+}
+
+// DelegateWriteOptions carries the optional knobs for DelegateWrite —
+// notably the free-form Target hint that tells the subagent where to
+// prefer persisting the content.
+type DelegateWriteOptions struct {
+	// Target is a free-form placement hint passed through to the
+	// subagent via the prompt template's {target} placeholder
+	// ("daily", "long-term", "auto", etc.). Empty defaults to
+	// "auto" at the handler layer.
+	Target string
+}
+
+// DelegateWrite spawns a subagent and asks it to persist `content`
+// into the user's memory. It is the dispatcher entry point for
+// pf_poke mode:"agent". Structurally identical to DeepRetrieve —
+// find a subagent, call Spawn, surface timeouts as TimedOut results —
+// but with SpawnPurposeWrite so the backend picks the write-framed
+// prompt template instead of the retrieval-framed one.
+//
+// The audit entry is emitted under tool: "pf_fault" to match the
+// 0.5.x contract documented in docs/security.md §Audit (agent-mode
+// writes currently share the pf_fault row because they are, in the
+// end, subagent spawns — revisit in Phase 5 when the structured
+// subagent response format lands).
+func (d *ToolDispatcher) DelegateWrite(ctx context.Context, content string, agentID string, timeout time.Duration, caller model.Caller, opts DelegateWriteOptions) (*DeepRetrieveResult, error) {
+	start := time.Now()
+
+	var result *DeepRetrieveResult
+	var err error
+	defer func() {
+		size := 0
+		if result != nil {
+			size = len(result.Answer) + len(result.PartialResult)
+		}
+		args := map[string]any{
+			"content_bytes": len(content),
+			"agent":         agentID,
+			"timeout_s":     int(timeout.Seconds()),
+			"purpose":       "write",
+		}
+		if opts.Target != "" {
+			args["target"] = opts.Target
+		}
+		d.auditLog.Log(audit.NewEntry(caller, "pf_fault", args, start, size, err))
+	}()
+
+	if content == "" {
+		err = fmt.Errorf("%w: empty content", model.ErrInvalidRequest)
+		return nil, err
+	}
+
+	target, agentName, ferr := d.findSubagent(agentID)
+	if ferr != nil {
+		err = ferr
+		return nil, err
+	}
+
+	answer, spawnErr := target.Spawn(ctx, backend.SpawnRequest{
+		AgentID: agentName,
+		Task:    content,
+		Purpose: backend.SpawnPurposeWrite,
+		Target:  opts.Target,
+		Timeout: timeout,
+	})
+	elapsed := time.Since(start).Seconds()
+
+	r := &DeepRetrieveResult{
+		Agent:          agentName,
+		Backend:        target.Name(),
+		ElapsedSeconds: elapsed,
+	}
+
+	if errors.Is(spawnErr, model.ErrSubagentTimeout) {
+		r.TimedOut = true
+		r.PartialResult = answer
+		result = r
+		slog.Warn("delegate_write: subagent timed out",
 			"agent", agentName, "backend", target.Name(),
 			"elapsed_s", elapsed, "caller", caller.ID)
 		return r, nil

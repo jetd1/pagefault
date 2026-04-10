@@ -14,7 +14,8 @@ import (
 )
 
 // SubagentCLIBackend spawns an external CLI process to do deep retrieval.
-// It fits the SubagentBackend interface used by pf_fault.
+// It fits the SubagentBackend interface used by pf_fault and by
+// pf_poke mode:"agent".
 //
 // The command template is tokenized once at construction. Each token is a
 // separate argv element — there is no shell interpretation, so a user-
@@ -27,13 +28,25 @@ import (
 //	command: "openclaw agent run --agent {agent_id} --task {task} --timeout {timeout}"
 //
 // At Spawn time, {agent_id}, {task}, {timeout} in each token are replaced
-// with the actual values.
+// with the actual values. The {task} substitution happens *after* the
+// raw SpawnRequest.Task has been wrapped with the resolved prompt
+// template (per-agent override → backend default → built-in for the
+// purpose), so the subprocess sees a fully-framed prompt rather than
+// a bare user query.
 type SubagentCLIBackend struct {
 	name       string
 	argv       []string // tokenized command template
 	timeoutSec int
 	agents     []AgentInfo
 	defaultID  string
+
+	// Prompt-template wiring. retrieveTmpl / writeTmpl are the
+	// backend-level defaults (empty fields fall through to the
+	// built-ins in prompt.go). agentTmpl holds per-agent overrides
+	// keyed on agent id.
+	retrieveTmpl string
+	writeTmpl    string
+	agentTmpl    map[string]agentTemplates
 
 	// execCommand is indirected for tests so they can substitute a fake
 	// process (typically `go test -run ... -helper`).
@@ -56,6 +69,7 @@ func NewSubagentCLIBackend(cfg *config.SubagentCLIBackendConfig) (*SubagentCLIBa
 		return nil, fmt.Errorf("subagent-cli backend %q: no agents configured", cfg.Name)
 	}
 	agents := make([]AgentInfo, 0, len(cfg.Agents))
+	agentTmpl := make(map[string]agentTemplates, len(cfg.Agents))
 	seen := make(map[string]bool, len(cfg.Agents))
 	for _, a := range cfg.Agents {
 		if a.ID == "" {
@@ -66,18 +80,25 @@ func NewSubagentCLIBackend(cfg *config.SubagentCLIBackendConfig) (*SubagentCLIBa
 		}
 		seen[a.ID] = true
 		agents = append(agents, AgentInfo{ID: a.ID, Description: a.Description})
+		agentTmpl[a.ID] = agentTemplates{
+			RetrievePromptTemplate: a.RetrievePromptTemplate,
+			WritePromptTemplate:    a.WritePromptTemplate,
+		}
 	}
 	timeout := cfg.Timeout
 	if timeout <= 0 {
 		timeout = 300
 	}
 	return &SubagentCLIBackend{
-		name:        cfg.Name,
-		argv:        argv,
-		timeoutSec:  timeout,
-		agents:      agents,
-		defaultID:   agents[0].ID,
-		execCommand: exec.CommandContext,
+		name:         cfg.Name,
+		argv:         argv,
+		timeoutSec:   timeout,
+		agents:       agents,
+		defaultID:    agents[0].ID,
+		retrieveTmpl: cfg.RetrievePromptTemplate,
+		writeTmpl:    cfg.WritePromptTemplate,
+		agentTmpl:    agentTmpl,
+		execCommand:  exec.CommandContext,
 	}, nil
 }
 
@@ -112,28 +133,62 @@ func (b *SubagentCLIBackend) ListAgents() []AgentInfo {
 // a Spawn call passes an empty agentID.
 func (b *SubagentCLIBackend) DefaultAgentID() string { return b.defaultID }
 
-// Spawn runs the configured command for agentID with the given task. The
-// returned string is the agent's stdout (trimmed of trailing newline). If
-// the timeout fires before the process exits, Spawn returns
-// (partial, wrapped ErrSubagentTimeout) — callers may surface the partial
-// result if it is useful.
-func (b *SubagentCLIBackend) Spawn(ctx context.Context, agentID string, task string, timeout time.Duration) (string, error) {
+// Spawn runs the configured command for the requested agent with the
+// given task. The returned string is the agent's stdout (trimmed of
+// trailing newline). If the timeout fires before the process exits,
+// Spawn returns (partial, wrapped ErrSubagentTimeout) — callers may
+// surface the partial result if it is useful.
+//
+// Before the argv {task} substitution, req.Task is wrapped with the
+// resolved prompt template (per-agent override → backend default →
+// built-in for req.Purpose) via WrapTask. This is the layer that
+// teaches a fresh subagent "you are a memory-retrieval agent, search
+// the user's memory, do not answer from your own world knowledge" so
+// the operator does not have to hand-roll the framing in every
+// caller.
+func (b *SubagentCLIBackend) Spawn(ctx context.Context, req SpawnRequest) (string, error) {
+	agentID := req.AgentID
 	if agentID == "" {
 		agentID = b.defaultID
 	}
 	if !hasAgentID(b.agents, agentID) {
 		return "", fmt.Errorf("%w: %q on backend %q", model.ErrAgentNotFound, agentID, b.name)
 	}
+	timeout := req.Timeout
 	if timeout <= 0 {
 		timeout = time.Duration(b.timeoutSec) * time.Second
 	}
 
-	// Substitute placeholders in the pre-tokenized argv.
+	// Resolve the effective prompt template and wrap the raw task.
+	// An empty agentID at this point has already been replaced with
+	// the backend default, so agentPromptOverride sees the concrete
+	// id.
+	purpose := req.Purpose
+	if purpose == "" {
+		purpose = SpawnPurposeRetrieve
+	}
+	agentOverride := agentPromptOverride(b.agentTmpl, agentID, purpose)
+	backendDefault := b.retrieveTmpl
+	if purpose == SpawnPurposeWrite {
+		backendDefault = b.writeTmpl
+	}
+	tmpl := ResolvePromptTemplate(agentOverride, backendDefault, purpose)
+	wrapped := WrapTask(tmpl, SpawnRequest{
+		AgentID:   agentID,
+		Task:      req.Task,
+		Purpose:   purpose,
+		TimeRange: req.TimeRange,
+		Target:    req.Target,
+	})
+
+	// Substitute placeholders in the pre-tokenized argv. {task} is the
+	// fully-wrapped prompt; {agent_id} and {timeout} come through
+	// from the request.
 	args := make([]string, len(b.argv))
 	timeoutStr := fmt.Sprintf("%d", int(timeout.Seconds()))
 	for i, tok := range b.argv {
 		tok = strings.ReplaceAll(tok, "{agent_id}", agentID)
-		tok = strings.ReplaceAll(tok, "{task}", task)
+		tok = strings.ReplaceAll(tok, "{task}", wrapped)
 		tok = strings.ReplaceAll(tok, "{timeout}", timeoutStr)
 		args[i] = tok
 	}

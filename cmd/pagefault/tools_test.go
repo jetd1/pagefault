@@ -434,6 +434,12 @@ func writeTestConfigWithSubagent(t *testing.T, dir string) string {
 		"    type: subagent-cli\n" +
 		"    command: \"echo {agent_id}:{task}\"\n" +
 		"    timeout: 5\n" +
+		// Passthrough templates so the echo command can assert against
+		// the bare task string — the default memory-retrieval / memory-
+		// write prompts would wrap the task in ~15 lines of framing
+		// text and break these narrow CLI plumbing tests.
+		"    retrieve_prompt_template: \"{task}\"\n" +
+		"    write_prompt_template: \"{task}\"\n" +
 		"    agents:\n" +
 		"      - id: alpha\n" +
 		"        description: \"primary\"\n" +

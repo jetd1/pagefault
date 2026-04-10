@@ -16,13 +16,17 @@ import (
 
 // SubagentHTTPBackend spawns an agent by POSTing to a configured HTTP
 // endpoint and waits synchronously for the response. It satisfies the
-// SubagentBackend interface for pf_fault.
+// SubagentBackend interface used by pf_fault and pf_poke mode:"agent".
 //
 // The request body is built from cfg.Spawn.BodyTemplate with {agent_id},
-// {task}, and {timeout} substituted at spawn time. The response must be
-// JSON; cfg.Spawn.ResponsePath is a simple dotted path (e.g. "result" or
-// "data.answer") that extracts the final text from the body. If empty,
-// the entire response is JSON-re-encoded and returned.
+// {task}, and {timeout} substituted at spawn time. The {task} value
+// is the *prompt-wrapped* form of the raw caller content (per-agent
+// override → backend default → built-in for the purpose), so a
+// fresh subagent gets a framed "you are a memory-retrieval agent"
+// prompt rather than a bare query. The response must be JSON;
+// cfg.Spawn.ResponsePath is a simple dotted path (e.g. "result" or
+// "data.answer") that extracts the final text from the body. If
+// empty, the entire response is JSON-re-encoded and returned.
 type SubagentHTTPBackend struct {
 	name    string
 	baseURL string
@@ -32,6 +36,11 @@ type SubagentHTTPBackend struct {
 	agents  []AgentInfo
 	defID   string
 	client  *http.Client
+
+	// Prompt-template wiring (see SubagentCLIBackend for field docs).
+	retrieveTmpl string
+	writeTmpl    string
+	agentTmpl    map[string]agentTemplates
 }
 
 // NewSubagentHTTPBackend constructs an HTTP subagent backend from config.
@@ -50,6 +59,7 @@ func NewSubagentHTTPBackend(cfg *config.SubagentHTTPBackendConfig) (*SubagentHTT
 	}
 
 	agents := make([]AgentInfo, 0, len(cfg.Agents))
+	agentTmpl := make(map[string]agentTemplates, len(cfg.Agents))
 	seen := make(map[string]bool, len(cfg.Agents))
 	for _, a := range cfg.Agents {
 		if a.ID == "" {
@@ -60,6 +70,10 @@ func NewSubagentHTTPBackend(cfg *config.SubagentHTTPBackendConfig) (*SubagentHTT
 		}
 		seen[a.ID] = true
 		agents = append(agents, AgentInfo{ID: a.ID, Description: a.Description})
+		agentTmpl[a.ID] = agentTemplates{
+			RetrievePromptTemplate: a.RetrievePromptTemplate,
+			WritePromptTemplate:    a.WritePromptTemplate,
+		}
 	}
 
 	timeoutSec := cfg.Timeout
@@ -72,13 +86,16 @@ func NewSubagentHTTPBackend(cfg *config.SubagentHTTPBackendConfig) (*SubagentHTT
 	}
 
 	return &SubagentHTTPBackend{
-		name:    cfg.Name,
-		baseURL: strings.TrimRight(cfg.BaseURL, "/"),
-		authTok: authTok,
-		spawn:   cfg.Spawn,
-		timeout: time.Duration(timeoutSec) * time.Second,
-		agents:  agents,
-		defID:   agents[0].ID,
+		name:         cfg.Name,
+		baseURL:      strings.TrimRight(cfg.BaseURL, "/"),
+		authTok:      authTok,
+		spawn:        cfg.Spawn,
+		timeout:      time.Duration(timeoutSec) * time.Second,
+		agents:       agents,
+		defID:        agents[0].ID,
+		retrieveTmpl: cfg.RetrievePromptTemplate,
+		writeTmpl:    cfg.WritePromptTemplate,
+		agentTmpl:    agentTmpl,
 		// No per-request client timeout: we rely on the per-call context
 		// deadline set in Spawn so timeouts can be overridden per call.
 		client: &http.Client{},
@@ -116,16 +133,44 @@ func (b *SubagentHTTPBackend) DefaultAgentID() string { return b.defID }
 
 // Spawn POSTs the configured request body to the agent endpoint and
 // returns the extracted response text.
-func (b *SubagentHTTPBackend) Spawn(ctx context.Context, agentID string, task string, timeout time.Duration) (string, error) {
+//
+// Before the body template's {task} substitution, req.Task is wrapped
+// with the resolved prompt template (per-agent override → backend
+// default → built-in for req.Purpose) via WrapTask. The wrapped
+// string is then JSON-escaped before being spliced into the body
+// template so newlines and quotes survive the HTTP body round-trip
+// unchanged.
+func (b *SubagentHTTPBackend) Spawn(ctx context.Context, req SpawnRequest) (string, error) {
+	agentID := req.AgentID
 	if agentID == "" {
 		agentID = b.defID
 	}
 	if !hasAgentID(b.agents, agentID) {
 		return "", fmt.Errorf("%w: %q on backend %q", model.ErrAgentNotFound, agentID, b.name)
 	}
+	timeout := req.Timeout
 	if timeout <= 0 {
 		timeout = b.timeout
 	}
+
+	// Resolve the effective prompt template and wrap the raw task.
+	purpose := req.Purpose
+	if purpose == "" {
+		purpose = SpawnPurposeRetrieve
+	}
+	agentOverride := agentPromptOverride(b.agentTmpl, agentID, purpose)
+	backendDefault := b.retrieveTmpl
+	if purpose == SpawnPurposeWrite {
+		backendDefault = b.writeTmpl
+	}
+	tmpl := ResolvePromptTemplate(agentOverride, backendDefault, purpose)
+	wrapped := WrapTask(tmpl, SpawnRequest{
+		AgentID:   agentID,
+		Task:      req.Task,
+		Purpose:   purpose,
+		TimeRange: req.TimeRange,
+		Target:    req.Target,
+	})
 
 	runCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
@@ -137,7 +182,7 @@ func (b *SubagentHTTPBackend) Spawn(ctx context.Context, agentID string, task st
 
 	body := renderTemplate(b.spawn.BodyTemplate, map[string]string{
 		"agent_id": agentID,
-		"task":     jsonEscape(task),
+		"task":     jsonEscape(wrapped),
 		"timeout":  fmt.Sprintf("%d", int(timeout.Seconds())),
 	})
 
@@ -150,21 +195,21 @@ func (b *SubagentHTTPBackend) Spawn(ctx context.Context, agentID string, task st
 	if body != "" {
 		reqBody = bytes.NewBufferString(body)
 	}
-	req, err := http.NewRequestWithContext(runCtx, method, url, reqBody)
+	httpReq, err := http.NewRequestWithContext(runCtx, method, url, reqBody)
 	if err != nil {
 		return "", fmt.Errorf("subagent-http %q: build request: %w", b.name, err)
 	}
 	if body != "" {
-		req.Header.Set("Content-Type", "application/json")
+		httpReq.Header.Set("Content-Type", "application/json")
 	}
 	for k, v := range b.spawn.Headers {
-		req.Header.Set(k, v)
+		httpReq.Header.Set(k, v)
 	}
 	if b.authTok != "" {
-		req.Header.Set("Authorization", "Bearer "+b.authTok)
+		httpReq.Header.Set("Authorization", "Bearer "+b.authTok)
 	}
 
-	resp, err := b.client.Do(req)
+	resp, err := b.client.Do(httpReq)
 	if err != nil {
 		if errors.Is(runCtx.Err(), context.DeadlineExceeded) {
 			return "", fmt.Errorf("%w: agent %q on backend %q timed out after %s",

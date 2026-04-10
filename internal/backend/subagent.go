@@ -2,7 +2,6 @@ package backend
 
 import (
 	"context"
-	"time"
 )
 
 // AgentInfo describes a single subagent that a SubagentBackend can spawn.
@@ -18,7 +17,8 @@ type AgentInfo struct {
 // SubagentBackend is an extension of Backend that can spawn an external
 // agent process to carry out a natural-language task. It is the substrate
 // behind pf_fault (the "real" page fault: hand the miss to a smart worker
-// and wait for the answer).
+// and wait for the answer) and behind pf_poke mode:"agent" (delegate
+// placement of a write to a subagent).
 //
 // A SubagentBackend implementation is still a regular Backend — its
 // Read/Search/ListResources behaviour is backend-specific (typically noop
@@ -26,16 +26,25 @@ type AgentInfo struct {
 type SubagentBackend interface {
 	Backend
 
-	// Spawn runs the agent identified by agentID with the given task and
-	// returns the agent's final textual response. The timeout is enforced
-	// by the backend (via ctx or an internal clock, implementation's
-	// choice) — if the agent does not finish in time, Spawn returns a
-	// wrapped model.ErrSubagentTimeout and any partially-captured output
-	// as the string result.
+	// Spawn runs the requested agent with the given SpawnRequest and
+	// returns the agent's final textual response. The backend wraps
+	// req.Task with the resolved prompt template (per-agent override →
+	// per-backend default → built-in for the purpose) before
+	// substituting it into its own command/body template, so callers
+	// pass only the raw user content in req.Task and the framing is
+	// applied consistently across every transport.
 	//
-	// agentID may be empty, in which case the backend picks its default
-	// (typically the first configured agent).
-	Spawn(ctx context.Context, agentID string, task string, timeout time.Duration) (string, error)
+	// The timeout is enforced by the backend (via ctx or an internal
+	// clock, implementation's choice) — if the agent does not finish
+	// in time, Spawn returns a wrapped model.ErrSubagentTimeout and
+	// any partially-captured output as the string result.
+	//
+	// req.AgentID may be empty, in which case the backend picks its
+	// default (typically the first configured agent). req.Purpose
+	// defaults to SpawnPurposeRetrieve when empty so older call sites
+	// that only cared about pf_fault semantics keep working without
+	// explicit purpose annotation.
+	Spawn(ctx context.Context, req SpawnRequest) (string, error)
 
 	// ListAgents returns every agent configured on this backend. It is
 	// zero-cost: backends populate this from config, no I/O.

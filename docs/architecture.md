@@ -8,16 +8,18 @@ condensed version of `plan.md` §3–5 and should match the code in
 
 pagefault is a **config-driven memory server** that exposes personal
 knowledge (files, search indices, agent sessions) to external AI clients via
-MCP and REST.
+MCP (streamable-http *and* legacy SSE) and a REST / OpenAPI transport.
 
 ## Component overview
 
 ```
 ┌──────────────────────────────────────────────────┐
-│  Clients (Claude Code, Claude iOS, ChatGPT, etc) │
-└────────────┬──────────────────────┬──────────────┘
-             │ MCP (streamable-http)│ REST (POST /api/*)
-             ▼                      ▼
+│  Clients (Claude Code, Claude Desktop, ChatGPT,  │
+│  curl, etc.)                                      │
+└─────┬────────────────┬───────────────┬──────────┘
+      │ /mcp           │ /sse, /message│ /api/pf_*
+      │ streamable     │ legacy SSE    │ REST
+      ▼                ▼               ▼
 ┌──────────────────────────────────────────────────┐
 │  chi router + middleware (Recoverer, Logger)      │
 │  ┌──────────┐                                    │
@@ -30,6 +32,7 @@ MCP and REST.
 │  │  pf_maps / pf_load (P1)       │               │
 │  │  pf_scan / pf_peek (P1)       │               │
 │  │  pf_fault / pf_ps  (P2)       │               │
+│  │  pf_poke           (P4)       │               │
 │  └────────────┬──────────────────┘               │
 │               │                                  │
 │               ▼                                  │
@@ -171,9 +174,18 @@ add an index-backed backend type.
   `response_path`, and converts each element into a `SearchResult`.
 - **SubagentCLIBackend** / **SubagentHTTPBackend** — implement
   `SubagentBackend`, which extends `Backend` with
-  `Spawn(ctx, agentID, task, timeout)` and `ListAgents()`. `pf_fault`
-  calls `Spawn`; `pf_ps` calls `ListAgents` across every configured
-  `SubagentBackend`.
+  `Spawn(ctx, SpawnRequest)` and `ListAgents()`. `SpawnRequest`
+  carries the agent id, the raw task, a `SpawnPurpose`
+  (`retrieve` or `write`), an optional free-form `TimeRange`
+  hint, an optional placement `Target` hint (write only), and a
+  timeout — future additions (caller context, tool-call budgets,
+  tracing ids) can land without another signature change.
+  `pf_fault` calls `Spawn` with `Purpose=retrieve`; `pf_poke`
+  mode:"agent" calls the dispatcher's new `DelegateWrite` method
+  which in turn calls `Spawn` with `Purpose=write` so the backend
+  picks the write-framed prompt template (see
+  "Server-side prompt framing" below). `pf_ps` calls `ListAgents`
+  across every configured `SubagentBackend`.
 
 All backend constructors live in `cmd/pagefault/serve.go`'s
 `buildDispatcher`, which is the single switch on `bc.Type` that wires
@@ -197,6 +209,57 @@ runs with the operator's privileges, not pagefault's. Concretely:
 - Timeouts are enforced by pagefault (`exec.CommandContext` kills the
   child; the HTTP client cancels the request) but a misbehaving agent
   can still complete side effects before the deadline fires.
+
+### Server-side prompt framing
+
+Before handing a task to a subagent, the subagent backend wraps the
+raw caller content with a **resolved prompt template**. This is not
+a security boundary — it's a behaviour lever. The problem it fixes:
+a fresh subagent with no prior context will treat a `pf_fault`
+query like a generic Q&A prompt and answer from its own training
+data ("what did I note about oleander" → toxicity sheet instead of
+chat history). The template tells the agent explicitly:
+"you are a memory-retrieval agent, search the user's memory
+sources (MEMORY.md, managed directories, qmd, lossless-lcm, …),
+do not fall back to your training data".
+
+The resolution chain is three layers, each overriding the next:
+
+1. **Per-agent override** — `AgentSpec.retrieve_prompt_template`
+   or `AgentSpec.write_prompt_template` on a specific agent entry
+   in the YAML config.
+2. **Per-backend default** — `retrieve_prompt_template` or
+   `write_prompt_template` on the `Subagent*BackendConfig`.
+3. **Built-in default** — `backend.DefaultRetrievePromptTemplate`
+   or `backend.DefaultWritePromptTemplate`, selected by the
+   `SpawnRequest.Purpose` field.
+
+The resolved template is then run through `backend.WrapTask`,
+which substitutes `{task}`, `{time_range}`, `{target}`, and
+`{agent_id}` placeholders. Unknown placeholders pass through
+unchanged — operators can add their own without source changes.
+Empty time_range collapses its whole line so the template does
+not emit a trailing "Time range:" header for calls that did not
+set one.
+
+The two default templates live in `internal/backend/prompt.go`
+and encode pagefault's opinion about what a memory retriever /
+placer should do:
+
+- **Retrieve default** — "enumerate the user's memory sources,
+  search them for the query, cite the sources in your answer,
+  do not invent content if nothing is found".
+- **Write default** — "read the current memory layout before
+  placing the content, match the user's naming convention,
+  extend existing files when themes overlap, report the
+  path(s) written".
+
+Because the template is applied by the backend, it is consistent
+whether the subagent was invoked through `pf_fault` or through
+`pf_poke` mode:"agent". The dispatcher's `DelegateWrite` method
+exists specifically so `pf_poke` can route to `Spawn` with
+`Purpose=write` and pick the write template, rather than tunneling
+through `DeepRetrieve` which would use the retrieve template.
 
 ## Auth layer
 
@@ -246,7 +309,13 @@ The dispatcher owns:
 
 Tool handlers in `internal/tool` are thin wrappers over the dispatcher's
 `ListContexts`, `GetContext`, `Search`, `Read`, `DeepRetrieve`,
-`ListAgents`, and `Write` methods.
+`ListAgents`, `Write`, and `DelegateWrite` methods. `DelegateWrite`
+is the write-side twin of `DeepRetrieve` — both spawn a subagent,
+but `DelegateWrite` tags the `SpawnRequest` with
+`Purpose=write` so the subagent picks up the write-framed prompt
+template instead of the retrieve-framed one, and passes a free-form
+`Target` hint ("daily", "long-term", "auto", …) through the
+template's `{target}` placeholder.
 
 ## Transport details
 
@@ -260,16 +329,36 @@ Tool handlers in `internal/tool` are thin wrappers over the dispatcher's
 
 ### MCP
 
-- `mcpserver.NewMCPServer("pagefault", Version, WithToolCapabilities(true))`
+- `mcpserver.NewMCPServer("pagefault", Version, WithToolCapabilities(true),
+  WithInstructions(...))` builds the single shared `MCPServer`. The
+  instructions argument defaults to
+  `internal/tool.DefaultInstructions` and can be overridden via
+  `server.mcp.instructions` in the YAML config; MCP clients surface
+  the string in the agent's system prompt, so it is the primary
+  lever for teaching agents when to use `pf_*` tools.
 - `tool.RegisterMCP` registers each enabled tool (Phase 1–4) with a JSON-schema
   input and a handler that re-uses the same `tool.HandleX` functions
-- `mcpserver.NewStreamableHTTPServer(...)` exposes the server as an
-  `http.Handler` mounted on `/mcp`
+- **Streamable-http** transport: `mcpserver.NewStreamableHTTPServer(...)`
+  exposes the MCPServer as an `http.Handler` mounted on `/mcp`. Modern
+  MCP clients (Claude Code, etc.) speak this.
+- **Legacy SSE** transport (opt-out via `server.mcp.sse_enabled: false`):
+  `mcpserver.NewSSEServer(...)` produces an `SSEServer` whose
+  `SSEHandler()` is mounted at `GET /sse` and whose `MessageHandler()`
+  is mounted at `POST /message`. Claude Desktop and other SSE-only
+  clients connect here. `GET /sse` opens a persistent
+  `text/event-stream`, emits an initial `endpoint` event with a
+  `sessionId`, and streams JSON-RPC responses back as `message`
+  events; the paired POST hits `/message?sessionId=…`, returns 202,
+  and dispatches via the shared MCPServer — the response comes back
+  on the open SSE stream.
 - MCP tool results are wrapped in a single `TextContent` block containing the
   JSON-encoded output (idiomatic mcp-go pattern)
 
-Both transports share the same dispatcher instance, so filters and audit
-fire identically regardless of entry point.
+All three transports (streamable-http, legacy SSE, REST) share the same
+dispatcher instance, so filters, audit logging, and error mapping fire
+identically regardless of entry point. Both MCP transports additionally
+share a single `MCPServer`, so tool registrations and the
+`initialize`-time instructions string are identical across them.
 
 ## Configuration contract
 

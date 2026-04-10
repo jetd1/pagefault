@@ -81,12 +81,17 @@ func TestSubagentHTTPBackend_Spawn_HappyPath(t *testing.T) {
 			BodyTemplate: `{"task": "{task}", "timeout": {timeout}}`,
 			ResponsePath: "result.answer",
 		},
-		Timeout: 10,
-		Agents:  []config.AgentSpec{{ID: "wocha", Description: "dev"}},
+		Timeout:                10,
+		Agents:                 []config.AgentSpec{{ID: "wocha", Description: "dev"}},
+		RetrievePromptTemplate: passthroughTmpl,
 	})
 	require.NoError(t, err)
 
-	out, err := b.Spawn(context.Background(), "wocha", `hello "quoted" world`, 5*time.Second)
+	out, err := b.Spawn(context.Background(), SpawnRequest{
+		AgentID: "wocha",
+		Task:    `hello "quoted" world`,
+		Timeout: 5 * time.Second,
+	})
 	require.NoError(t, err)
 	assert.Equal(t, "42", out)
 	assert.Equal(t, "Bearer secret", gotAuth)
@@ -104,12 +109,13 @@ func TestSubagentHTTPBackend_Spawn_ResponsePathMissing(t *testing.T) {
 
 	b, err := NewSubagentHTTPBackend(&config.SubagentHTTPBackendConfig{
 		Name: "sa", Type: "subagent-http", BaseURL: srv.URL,
-		Spawn:  config.HTTPBackendRequest{Path: "/spawn", ResponsePath: "result.answer"},
-		Agents: []config.AgentSpec{{ID: "a"}},
+		Spawn:                  config.HTTPBackendRequest{Path: "/spawn", ResponsePath: "result.answer"},
+		Agents:                 []config.AgentSpec{{ID: "a"}},
+		RetrievePromptTemplate: passthroughTmpl,
 	})
 	require.NoError(t, err)
 
-	_, err = b.Spawn(context.Background(), "a", "t", 5*time.Second)
+	_, err = b.Spawn(context.Background(), SpawnRequest{AgentID: "a", Task: "t", Timeout: 5 * time.Second})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "not found")
 }
@@ -122,12 +128,13 @@ func TestSubagentHTTPBackend_Spawn_EmptyResponsePathReturnsRaw(t *testing.T) {
 
 	b, err := NewSubagentHTTPBackend(&config.SubagentHTTPBackendConfig{
 		Name: "sa", Type: "subagent-http", BaseURL: srv.URL,
-		Spawn:  config.HTTPBackendRequest{Path: "/spawn"},
-		Agents: []config.AgentSpec{{ID: "a"}},
+		Spawn:                  config.HTTPBackendRequest{Path: "/spawn"},
+		Agents:                 []config.AgentSpec{{ID: "a"}},
+		RetrievePromptTemplate: passthroughTmpl,
 	})
 	require.NoError(t, err)
 
-	out, err := b.Spawn(context.Background(), "a", "t", 5*time.Second)
+	out, err := b.Spawn(context.Background(), SpawnRequest{AgentID: "a", Task: "t", Timeout: 5 * time.Second})
 	require.NoError(t, err)
 	assert.Equal(t, "just text", out)
 }
@@ -141,12 +148,13 @@ func TestSubagentHTTPBackend_Spawn_HTTPError(t *testing.T) {
 
 	b, err := NewSubagentHTTPBackend(&config.SubagentHTTPBackendConfig{
 		Name: "sa", Type: "subagent-http", BaseURL: srv.URL,
-		Spawn:  config.HTTPBackendRequest{Path: "/spawn", ResponsePath: "x"},
-		Agents: []config.AgentSpec{{ID: "a"}},
+		Spawn:                  config.HTTPBackendRequest{Path: "/spawn", ResponsePath: "x"},
+		Agents:                 []config.AgentSpec{{ID: "a"}},
+		RetrievePromptTemplate: passthroughTmpl,
 	})
 	require.NoError(t, err)
 
-	_, err = b.Spawn(context.Background(), "a", "t", 5*time.Second)
+	_, err = b.Spawn(context.Background(), SpawnRequest{AgentID: "a", Task: "t", Timeout: 5 * time.Second})
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, model.ErrBackendUnavailable))
 	assert.Contains(t, err.Error(), "http 500")
@@ -164,12 +172,13 @@ func TestSubagentHTTPBackend_Spawn_Timeout(t *testing.T) {
 
 	b, err := NewSubagentHTTPBackend(&config.SubagentHTTPBackendConfig{
 		Name: "sa", Type: "subagent-http", BaseURL: srv.URL,
-		Spawn:  config.HTTPBackendRequest{Path: "/spawn"},
-		Agents: []config.AgentSpec{{ID: "a"}},
+		Spawn:                  config.HTTPBackendRequest{Path: "/spawn"},
+		Agents:                 []config.AgentSpec{{ID: "a"}},
+		RetrievePromptTemplate: passthroughTmpl,
 	})
 	require.NoError(t, err)
 
-	_, err = b.Spawn(context.Background(), "a", "t", 50*time.Millisecond)
+	_, err = b.Spawn(context.Background(), SpawnRequest{AgentID: "a", Task: "t", Timeout: 50 * time.Millisecond})
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, model.ErrSubagentTimeout), "got: %v", err)
 }
@@ -177,12 +186,13 @@ func TestSubagentHTTPBackend_Spawn_Timeout(t *testing.T) {
 func TestSubagentHTTPBackend_Spawn_UnknownAgent(t *testing.T) {
 	b, err := NewSubagentHTTPBackend(&config.SubagentHTTPBackendConfig{
 		Name: "sa", Type: "subagent-http", BaseURL: "http://x",
-		Spawn:  config.HTTPBackendRequest{Path: "/spawn"},
-		Agents: []config.AgentSpec{{ID: "a"}},
+		Spawn:                  config.HTTPBackendRequest{Path: "/spawn"},
+		Agents:                 []config.AgentSpec{{ID: "a"}},
+		RetrievePromptTemplate: passthroughTmpl,
 	})
 	require.NoError(t, err)
 
-	_, err = b.Spawn(context.Background(), "nope", "t", 5*time.Second)
+	_, err = b.Spawn(context.Background(), SpawnRequest{AgentID: "nope", Task: "t", Timeout: 5 * time.Second})
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, model.ErrAgentNotFound))
 }
@@ -228,12 +238,13 @@ func TestSubagentHTTPBackend_Spawn_NoBodyNoContentType(t *testing.T) {
 
 	b, err := NewSubagentHTTPBackend(&config.SubagentHTTPBackendConfig{
 		Name: "sa", Type: "subagent-http", BaseURL: srv.URL,
-		Spawn:  config.HTTPBackendRequest{Path: "/spawn"},
-		Agents: []config.AgentSpec{{ID: "a"}},
+		Spawn:                  config.HTTPBackendRequest{Path: "/spawn"},
+		Agents:                 []config.AgentSpec{{ID: "a"}},
+		RetrievePromptTemplate: passthroughTmpl,
 	})
 	require.NoError(t, err)
 
-	out, err := b.Spawn(context.Background(), "a", "t", 5*time.Second)
+	out, err := b.Spawn(context.Background(), SpawnRequest{AgentID: "a", Task: "t", Timeout: 5 * time.Second})
 	require.NoError(t, err)
 	assert.Equal(t, `"ok"`, strings.TrimSpace(out))
 	assert.Empty(t, gotCT)
