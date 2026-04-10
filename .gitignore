@@ -27,7 +27,15 @@ audit.jsonl
 # Local config overrides (keep examples)
 configs/*.local.yaml
 tokens.jsonl
+configs/cha-local.yaml
+configs/openclaw.yaml
 
 # Coverage
 coverage.out
 coverage.html
+
+# Smoke test artifacts
+/bin/smoke.*
+
+# Data dirs referenced by local configs
+/demo-data/

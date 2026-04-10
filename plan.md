@@ -710,70 +710,7 @@ Both transports dispatch to the **same** `ToolDispatcher` — zero logic duplica
 
 ## 8. Project Structure
 
-```
-pagefault/
-├── CLAUDE.md                    # AI-assistant dev guide (directory tree + TLDR)
-├── CHANGELOG.md                 # Version history
-├── VERSION                      # Current version (single line)
-├── plan.md                      # This file
-├── README.md                    # Quick start guide
-├── go.mod                       # Go module definition
-├── go.sum
-├── cmd/
-│   └── pagefault/
-│       └── main.go              # CLI entry point (serve, token commands)
-│
-├── internal/
-│   ├── server/                  # HTTP server setup, MCP + REST mounting
-│   │   └── server.go
-│   ├── config/                  # Config structs, YAML loader, env substitution
-│   │   └── config.go
-│   ├── dispatcher/              # ToolDispatcher: routes tool calls to backends
-│   │   └── dispatcher.go
-│   ├── auth/                    # AuthProvider interface + built-in implementations
-│   │   └── auth.go
-│   ├── filter/                  # Filter pipeline (path, tag, redaction)
-│   │   └── filter.go
-│   ├── audit/                   # JSONL audit logger
-│   │   └── audit.go
-│   ├── tool/                    # MCP/REST tool definitions
-│   │   ├── list_contexts.go
-│   │   ├── get_context.go
-│   │   ├── search.go
-│   │   ├── read.go
-│   │   ├── deep_retrieve.go
-│   │   ├── list_agents.go
-│   │   └── write.go             # Direct append + agent writeback
-│   ├── backend/                 # Backend interface + registry
-│   │   ├── backend.go           # Backend, Resource, SearchResult interfaces
-│   │   ├── filesystem.go        # Local filesystem backend (with write support)
-│   │   ├── subprocess.go        # Shell command backend (e.g., ripgrep)
-│   │   ├── http.go              # HTTP API backend
-│   │   └── subagent/            # Subagent backends
-│   │       ├── subagent.go      # SubagentBackend interface
-│   │       ├── cli.go           # CLI-based subagent spawning
-│   │       └── http.go          # HTTP-based subagent spawning
-│   ├── write/                   # Write pipeline (append, format, lock)
-│   │   ├── writer.go           # Writer interface + FilesystemWriter
-│   │   └── format.go           # Entry formatting (timestamped entry, raw)
-│   └── model/                   # Shared data types
-│       └── model.go
-│
-├── docs/
-│   ├── api-doc.md               # Full MCP + REST tool reference
-│   ├── config-doc.md            # Full YAML config reference
-│   ├── architecture.md          # Architecture deep dive
-│   └── security.md              # Security model and threat analysis
-│
-├── configs/
-│   ├── minimal.yaml             # Smallest working config (single dir, no auth)
-│   └── openclaw.yaml            # Full config for Jet's OpenClaw setup
-│
-├── testutil/                   # Test helpers
-│   └── testutil.go
-│
-└── Makefile                    # Build, test, lint targets
-```
+The canonical directory tree with file-level TLDRs lives in **`CLAUDE.md` §Directory Tree** — update that file when adding or moving files. This section used to duplicate the tree and inevitably drifted; pointing at one source of truth is simpler.
 
 ## 9. Tech Stack
 
@@ -799,60 +736,33 @@ Why Go over Python:
 
 ## 10. Implementation Phases
 
-### Phase 1 — MVP: Files + Basic Tools + Bearer Auth
+### Phase 1 — MVP: Files + Basic Tools + Bearer Auth ✅ (shipped in 0.1.0–0.2.0)
 
-**Goal:** A running server that can serve files and search from a directory, with bearer auth and audit logging.
+A running server that serves files and searches from a directory with bearer auth, path/tag filters, JSONL audit, four tools (`pf_maps`, `pf_load`, `pf_scan`, `pf_peek`) over both MCP and REST, and matching `pagefault <tool>` CLI subcommands. `filesystem` backend only; no subagents, no subprocess / http backends, no redaction, no OpenAPI spec.
 
-1. Project scaffold (`go.mod`, `cmd/pagefault/main.go`, `internal/` packages, `Makefile`)
-2. `internal/config/config.go` — Go structs with YAML tags + validator tags, YAML loader with `${ENV}` substitution
-3. `internal/backend/backend.go` — `Backend`, `Resource`, `SearchResult` interfaces
-4. `internal/backend/filesystem.go` — Filesystem backend with glob include/exclude, sandbox, auto-tag, URI scheme mapping
-5. `internal/auth/auth.go` — `AuthProvider` interface + `BearerTokenAuth` + `NoneAuth`
-6. `internal/filter/filter.go` — `CompositeFilter`, `PathFilter` (allow/deny globs), `TagFilter`
-7. `internal/audit/audit.go` — JSONL logger
-8. `internal/dispatcher/dispatcher.go` — `ToolDispatcher`: loads config, registers backends, dispatches tool calls
-9. `internal/tool/list_contexts.go`, `get_context.go`, `search.go`, `read.go`
-10. `internal/server/server.go` — chi router, mount MCP handler on `/mcp`, mount REST on `/api`
-11. `cmd/pagefault/main.go` — `pagefault serve --config <path>`, `pagefault token create/ls/revoke`
-12. `configs/minimal.yaml` — One-directory, no-auth config
-13. Unit tests alongside each package (`_test.go`)
-14. Integration test: `httptest.NewServer` → call tools via HTTP
-15. **Smoke test**: `go run ./cmd/pagefault serve --config configs/minimal.yaml` → real MCP client connects → `pf_maps` → `pf_scan` → `pf_peek` → works
+See `CHANGELOG.md` §0.1.0 and §0.2.0 for the exact per-release breakdown, and `CLAUDE.md` §Common Development Tasks for the "add a backend / tool / filter" recipes distilled from this work.
 
-**Phase 1 does NOT include:** subagent backends, HTTP backends, subprocess backends, redaction filters, OpenAPI spec, `pf_fault`, `pf_ps`.
+### Phase 2 — Subagents + More Backends ✅ (shipped in 0.3.0–0.3.2)
 
-### Phase 2 — Subagents + More Backends (shipped in 0.3.0)
+Four additional backend types — `subprocess` (rg/grep/plain), generic `http`, `subagent-cli` (tokenized argv, no shell), `subagent-http` (POST + bearer + JSON body template) — plus the `SubagentBackend` interface that wraps them for deep retrieval. Two new tools (`pf_fault`, `pf_ps`) exposed via MCP, REST, and CLI with the same dispatcher / filter / audit pipeline as Phase 1. Timeouts flow through `context.WithTimeout` at backend entry; `exec.CommandContext` kills CLI agents on expiry and the HTTP client cancels request contexts. `pf_fault` surfaces timeouts as `timed_out: true` + `partial_result` rather than as errors. `internal/server.errorStatus` maps `ErrAgentNotFound` → 404 and `ErrSubagentTimeout` → 504. `configs/openclaw.yaml` is deferred to a later phase as deployment-specific.
 
-1. ~~`internal/backend/subagent/subagent.go`~~ → `internal/backend/subagent.go`: `SubagentBackend` interface + `AgentInfo`.
-2. ~~`internal/backend/subagent/cli.go`~~ → `internal/backend/subagent_cli.go`: CLI subagent with tokenized argv (no shell), timeout-kill, partial stdout capture.
-3. ~~`internal/backend/subagent/http.go`~~ → `internal/backend/subagent_http.go`: HTTP subagent with bearer auth + JSON body template + dotted `response_path`.
-4. `internal/tool/deep_retrieve.go` — `pf_fault` pure handler; surfaces timeouts as `timed_out: true` + `partial_result` rather than raising an error.
-5. `internal/tool/list_agents.go` — `pf_ps` pure handler.
-6. `internal/backend/subprocess.go` — generic subprocess backend. Parse modes: `ripgrep_json`, `grep`, `plain`.
-7. `internal/backend/http.go` — generic HTTP search backend.
-8. **`configs/openclaw.yaml`** — deferred to Phase 3 as it depends on deployment details (LCM API shape, writable paths, etc.); not required to exercise the Phase-2 wire surface.
-9. Timeouts flow through `context.WithTimeout` at the backend entry point; `exec.CommandContext` kills the child on expiry, HTTP uses the request context.
-10. Tests for every new backend + tool (unit tests for parsers, httptest-backed tests for HTTP variants, stubSubagent tests for pf_fault).
-11. `docs/api-doc.md` — `pf_fault` + `pf_ps` sections, updated CLI examples.
-12. `docs/config-doc.md` — new backend type sections (subprocess / http / subagent-cli / subagent-http).
-13. `CLAUDE.md` — directory tree refreshed, tool-naming table updated.
-14. Version bump to `0.3.0` + CHANGELOG.
-15. **CLI subcommands.** `pagefault fault <query…>` and `pagefault ps` round out the tool surface so local debugging works without the HTTP server.
-16. `internal/server`: `ErrAgentNotFound` → 404, `ErrSubagentTimeout` → 504 in the errorStatus map; REST routes for the two new tools behind the same auth + filter stack.
+See `CHANGELOG.md` §0.3.0 / §0.3.1 / §0.3.2 for the detailed per-release notes.
 
 ### Phase 3 — Polish + Production
+
+(`pagefault token` CLI subcommands already shipped in 0.1.0 — originally
+slated here, moved to Phase 1 during implementation.)
 
 1. `internal/filter/filter.go` — `RedactionFilter` (regex-based content redaction)
 2. Context formats: JSON, markdown-with-metadata
 3. OpenAPI spec at `/api/openapi.json` (for ChatGPT Actions)
-4. Graceful degradation when backends are unreachable
-5. `pagefault token` CLI subcommands
-6. Better error messages, structured error responses
-7. Rate limiting (configurable per-caller)
-8. CORS config
-9. README.md with setup guide for Claude Code, Claude Desktop, ChatGPT
-10. Update all docs (`api-doc.md`, `config-doc.md`, `security.md`)
-11. Version bump + CHANGELOG
+4. Graceful degradation when backends are unreachable (health probes, backoff)
+5. Structured error responses (error codes, not just messages)
+6. Rate limiting (configurable per-caller)
+7. CORS config
+8. README.md setup guides for Claude Code, Claude Desktop, ChatGPT Custom GPT
+9. Update all docs (`api-doc.md`, `config-doc.md`, `security.md`)
+10. Version bump + CHANGELOG
 
 ### Phase 4 — Writeback (Read-Write)
 
@@ -969,100 +879,50 @@ OpenAPI spec available at `/api/openapi.json` — paste this URL into ChatGPT Cu
 - **Mitigation:** Per-device tokens with `pagefault token revoke <id>`
 - Audit log shows exactly what each token accessed
 
-## 13. Open Questions (resolve before/during Phase 1)
+## 13. Open Questions
 
-1. **OpenClaw CLI for agent spawning:** Does `openclaw agent run --agent <id> --task <task>` exist? If not, what's the CLI or API for spawning an agent and getting its output? This determines the subagent-cli command template.
-2. **mcp-go streamable-http integration:** How to mount mcp-go's streamable-http handler on a chi sub-router at `/mcp`? Verify the handler implements `http.Handler` and can be mounted cleanly.
-3. **Context response format:** Should contexts default to `text/markdown` (raw concatenation) or `application/json` (structured with metadata)? Leaning markdown for simplicity, JSON as opt-in.
-4. **Search result merging:** When multiple backends return search results, how to merge/rank? Simple: interleave by backend, no cross-backend scoring. Can be improved later.
-5. **Write concurrency:** When Cha (via OpenClaw) and an external agent (via pagefault) write to the same daily note simultaneously, `flock` serializes the writes but the entry order depends on who acquires the lock first. Is this acceptable, or do we need a write queue with ordering guarantees?
-6. **Agent writeback trust boundary:** `mode: "agent"` bypasses pagefault's `write_paths` allowlist because the subagent writes directly to the filesystem (not through pagefault). Should pagefault validate the subagent's write result against `write_paths`, or fully trust the subagent's judgment? Leaning toward full trust — the subagent already has workspace-level access.
+Questions from the original pre-Phase-1 list have been resolved by shipped
+work (OpenClaw CLI shape → configurable via `subagent-cli` template;
+mcp-go chi mounting → verified in `internal/server`; multi-backend merging
+→ interleave, no cross-ranking). What's still open, all Phase 3+:
+
+1. **Context response format.** Should contexts default to `text/markdown`
+   (raw concatenation, current behavior) or grow an `application/json`
+   mode (structured with metadata)? Phase 3.
+2. **Write concurrency.** When two writers (e.g. Cha via OpenClaw and an
+   external agent via pagefault) append to the same daily note, `flock`
+   serializes the writes but the entry order depends on lock-acquisition
+   order. Is that acceptable, or do we need a write queue with ordering
+   guarantees? Phase 4.
+3. **Agent writeback trust boundary.** `mode: "agent"` will bypass
+   pagefault's `write_paths` allowlist because the subagent writes
+   directly (not through pagefault). Should pagefault validate the
+   subagent's write result against `write_paths`, or fully trust the
+   subagent's judgment? Current lean: full trust — the subagent already
+   has workspace-level access. Phase 4.
 
 ## 14. For Claude Code: How to Start
 
+Phases 1 and 2 have shipped — the foundations (filesystem backend, MCP + REST transports, four additional backend types, the six `pf_*` tools, CLI subcommands, auth, filters, audit) all exist in working form. The original step-by-step Phase-1 build order lived here but was removed once it became historical; for *new* work the canonical entry points are:
+
+- **`CLAUDE.md`** — directory tree, build/test commands, per-task recipes ("add a backend / tool / filter"), conventions, and rules. Read this first.
+- **Section 0** of this file — conventions and non-negotiables from the project's early days that still apply.
+- **`CHANGELOG.md`** — per-release history.
+
 ### Before writing any code
 
-1. **Read Section 0 (Development Guide)** of this file. It defines all conventions.
-2. **Read this entire `plan.md`** carefully. It is the spec.
-3. **Read `configs/minimal.yaml`** once it exists for a concrete example.
-4. If anything is ambiguous, **write questions to `questions.md`** rather than guessing. You can ask the human.
-5. Do NOT introduce any dependency on OpenClaw, Hermes, or any specific infrastructure in the core code. The framework is generic. All specificity goes in config files.
-
-### Build order (strict)
-
-Follow this order. Each step should produce working, testable code before moving to the next.
-
-0. **Create CLAUDE.md** — Initial version with directory tree (even if mostly `# TODO`), quick reference (build/test commands), and placeholder file TLDRs. **Update this file every time you create a new file.**
-1. **Project scaffold** — `go.mod`, `cmd/pagefault/main.go`, `internal/` directory structure, `Makefile` with `build`, `test`, `lint` targets. Create `VERSION` (`0.1.0`), `CHANGELOG.md`, `.gitignore`.
-2. **`internal/config/config.go`** — Go structs with YAML tags + validator tags matching the schema in Section 6. YAML loader with `${ENV_VAR}` substitution. Validate against `configs/minimal.yaml`.
-3. **`internal/backend/backend.go`** — `Backend`, `Resource`, `SearchResult` types + interface. Pure interfaces, no implementation.
-4. **`internal/backend/filesystem.go`** — Filesystem backend. This is the first real backend and the most important one to get right. Must handle: glob include/exclude, sandbox (no path traversal via `filepath.EvalSymlinks`), URI scheme ↔ filesystem path mapping, auto-tagging, line-range reads, directory listing.
-5. **`internal/auth/auth.go`** — `AuthProvider` interface, `BearerTokenAuth`, `NoneAuth`. Token file format: JSONL, one JSON object per line.
-6. **`internal/filter/filter.go`** — `CompositeFilter`, `PathFilter` (allow/deny with glob), `TagFilter`. All optional, can be disabled.
-7. **`internal/audit/audit.go`** — JSONL logger using `log/slog` underneath. Each entry: timestamp, caller_id, caller_label, tool, args (sanitized), duration_ms, result_size, error (if any).
-8. **`internal/dispatcher/dispatcher.go`** — `ToolDispatcher`: holds backends, contexts, filters, audit logger. Methods for each tool that route to the right backend(s).
-9. **`internal/tool/`** — One file per tool. Each registers an MCP tool handler. Keep tool logic thin — the dispatcher does the routing, the tool handler does MCP input/output formatting.
-10. **`internal/server/server.go`** — chi router. Mount mcp-go streamable-http handler on `/mcp`. Mount REST routes on `/api`. Wire up auth middleware. Health endpoint.
-11. **`cmd/pagefault/main.go`** — `pagefault serve --config <path> [--host] [--port]`, `pagefault token create --label <label>`, `pagefault token ls`, `pagefault token revoke <id>`, `pagefault --version`.
-12. **`configs/minimal.yaml`** — Smallest working config:
-    ```yaml
-    server:
-      host: "127.0.0.1"
-      port: 8444
-    auth:
-      mode: "none"
-    backends:
-      - name: fs
-        type: filesystem
-        root: "./demo-data"
-        include: ["**/*.md"]
-        exclude: []
-        uri_scheme: "memory"
-        sandbox: true
-    contexts:
-      - name: demo
-        description: "Demo context"
-        sources:
-          - backend: fs
-            uri: "memory://README.md"
-        format: markdown
-        max_size: 4000
-    filters:
-      enabled: false
-    audit:
-      enabled: true
-      log_path: "/tmp/pagefault-audit.jsonl"
-    ```
-13. **Tests** — Write tests alongside each module (`_test.go`). Minimum: config, filesystem backend, filters, auth, server integration.
-14. **Smoke test** — `pagefault serve --config configs/minimal.yaml` → verify `/health` returns 200 → verify MCP client can connect and call `pf_maps`.
-15. **Docs** — Create `docs/api-doc.md` (Phase 1 tools only), `docs/config-doc.md` (full schema), `docs/architecture.md` (condensed from plan.md), initial `CLAUDE.md` with directory tree + file TLDRs.
-16. **Version** — Create `VERSION` file (`0.1.0`), `CHANGELOG.md` with initial entry.
+1. Read **`CLAUDE.md`** top-to-bottom for the current layout and build commands.
+2. Skim **Section 0** of this file for conventions.
+3. Check **`CHANGELOG.md`** for the most recent release notes so you know what just landed.
+4. If anything is ambiguous, ask before guessing. Do NOT introduce any dependency on OpenClaw, Hermes, or any specific infrastructure in the core code — the framework is generic; all specificity goes in config files.
 
 ### Style & conventions
 
-See **Section 0 (Development Guide)** for the full list. Key points:
-
-- Use `context.Context` as first param in all backend/tool methods (idiomatic Go)
-- Define clear interfaces; accept interfaces, return structs
-- Use `errors.Is` / `errors.As` for error handling, not type assertions
-- Use `log/slog` for structured logging (no `fmt.Println` in library code)
-- Godoc on all exported types and functions
-- Error types:
-  ```go
-  var (
-      ErrAccessViolation  = errors.New("access violation: blocked by filter")
-      ErrBackendUnavailable = errors.New("backend unavailable")
-      ErrSubagentTimeout  = errors.New("subagent timed out")
-      ErrResourceNotFound  = errors.New("resource not found")
-  )
-  ```
-- Commit messages: conventional commits style. Append `Co-Authored-By: Cha <cha@jetd.one> via OpenClaw` on every commit if spawned by Cha, or the appropriate co-author tag.
-- Run `make lint` (go vet + staticcheck + gofmt) before committing.
-- **Bump version and update CHANGELOG.md before every behavioral commit.** See Section 0 for the full pre-bump checklist.
+See **Section 0 (Development Guide)** above and **`CLAUDE.md` §Conventions**.
 
 ### What NOT to do
 
-See **Section 0 (Development Guide)** for the full list.
+See **Section 0 (Development Guide)** above and **`CLAUDE.md` §Rules**.
 
 ## 15. Relationship to OpenClaw (Informative Only)
 

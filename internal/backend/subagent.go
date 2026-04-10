@@ -41,3 +41,15 @@ type SubagentBackend interface {
 	// zero-cost: backends populate this from config, no I/O.
 	ListAgents() []AgentInfo
 }
+
+// hasAgentID reports whether id appears in agents. Shared by
+// SubagentCLIBackend and SubagentHTTPBackend, which both validate the
+// requested agent id on Spawn before doing any work.
+func hasAgentID(agents []AgentInfo, id string) bool {
+	for _, a := range agents {
+		if a.ID == id {
+			return true
+		}
+	}
+	return false
+}

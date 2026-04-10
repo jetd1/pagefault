@@ -113,8 +113,9 @@ type SubprocessBackendConfig struct {
 	Command string   `yaml:"command" validate:"required"`
 	Roots   []string `yaml:"roots,omitempty"`
 	Timeout int      `yaml:"timeout,omitempty"` // seconds; default 10
-	// Parse is the stdout format: "ripgrep_json" | "plain" (line per match).
-	// Default is "plain".
+	// Parse is the stdout format: "ripgrep_json" (ripgrep --json),
+	// "grep" (classic path:lineno:content), or "plain" (one snippet
+	// per line). Default is "plain".
 	Parse string `yaml:"parse,omitempty"`
 }
 

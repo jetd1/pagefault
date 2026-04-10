@@ -108,7 +108,7 @@ backends:
 | `auto_tag`   | map[string][]string| no       | —       | Path glob → tag list. Tags become resource metadata and are visible to the tag filter. |
 | `sandbox`    | bool               | no       | `false` | If true, reject any file whose resolved path (after symlink resolution) escapes `root`. |
 
-**Backends do not expose writes in Phase 1.** Write support is Phase 4.
+**Backends do not expose writes yet.** Write support is Phase 4.
 
 ### `subprocess` backend
 
@@ -274,7 +274,7 @@ contexts:
 | `sources`      | [object] | yes      | —          | At least one source required. |
 | `sources[].backend` | string | yes    | —          | Backend name from the `backends` section. |
 | `sources[].uri`     | string | yes    | —          | URI to load. |
-| `sources[].params`  | object | no     | —          | Reserved for dynamic sources (Phase 2). |
+| `sources[].params`  | object | no     | —          | Reserved for future dynamic-source features; currently accepted but ignored. |
 | `format`       | string   | no       | `markdown` | Output format: `markdown` or `json`. |
 | `max_size`     | int      | no       | `16000`    | Max characters before truncation. Truncation is UTF-8-safe (rune-aligned). |
 

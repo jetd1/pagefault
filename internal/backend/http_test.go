@@ -114,6 +114,9 @@ func TestHTTPBackend_Search_Limit(t *testing.T) {
 }
 
 func TestHTTPBackend_Search_ResponsePathMissing(t *testing.T) {
+	// A configured response_path that isn't in the body is almost
+	// always an operator typo — surface it loudly instead of silently
+	// returning zero results.
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = io.WriteString(w, `{"other": []}`)
 	}))
@@ -125,9 +128,10 @@ func TestHTTPBackend_Search_ResponsePathMissing(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	out, err := b.Search(context.Background(), "q", 10)
-	require.NoError(t, err)
-	assert.Nil(t, out)
+	_, err = b.Search(context.Background(), "q", 10)
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, model.ErrBackendUnavailable))
+	assert.Contains(t, err.Error(), `response path "results" not found`)
 }
 
 func TestHTTPBackend_Search_NonArrayPath(t *testing.T) {
@@ -144,6 +148,7 @@ func TestHTTPBackend_Search_NonArrayPath(t *testing.T) {
 
 	_, err = b.Search(context.Background(), "q", 10)
 	require.Error(t, err)
+	assert.True(t, errors.Is(err, model.ErrBackendUnavailable))
 }
 
 func TestHTTPBackend_Search_HTTPError(t *testing.T) {

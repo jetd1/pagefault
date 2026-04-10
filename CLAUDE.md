@@ -36,7 +36,7 @@ bash scripts/smoke.sh  # End-to-end smoke test (builds, runs, curls every endpoi
 pagefault/
 ├── CLAUDE.md                             # This file — agent dev guide
 ├── CHANGELOG.md                          # Version history
-├── VERSION                               # Current version (single line: 0.3.0)
+├── VERSION                               # Current version (single line, read by the Makefile and -ldflags)
 ├── README.md                             # Quick-start guide
 ├── Makefile                              # build/test/lint/run/clean/smoke targets
 ├── plan.md                               # Full spec, source of truth

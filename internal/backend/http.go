@@ -156,11 +156,18 @@ func decodeHTTPSearchResults(raw []byte, path string, limit int, backendName str
 	}
 	node, ok := walkPath(decoded, path)
 	if !ok {
-		return nil, nil
+		// A configured response_path that isn't present in the body is
+		// almost always an operator typo — silently returning "no
+		// results" hides the mistake. Surface it as a backend error so
+		// the REST transport reports 502 and the caller can see what
+		// went wrong.
+		return nil, fmt.Errorf("%w: http backend %q: response path %q not found in response body",
+			model.ErrBackendUnavailable, backendName, path)
 	}
 	arr, ok := node.([]any)
 	if !ok {
-		return nil, fmt.Errorf("http backend %q: response path %q is not an array", backendName, path)
+		return nil, fmt.Errorf("%w: http backend %q: response path %q is not an array",
+			model.ErrBackendUnavailable, backendName, path)
 	}
 
 	out := make([]SearchResult, 0, min(len(arr), limit))

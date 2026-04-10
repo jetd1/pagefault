@@ -27,8 +27,9 @@ MCP and REST.
 │       ▼                                          │
 │  ┌───────────────────────────────┐               │
 │  │ Tool layer                    │               │
-│  │  pf_maps / pf_load            │               │
-│  │  pf_scan / pf_peek            │               │
+│  │  pf_maps / pf_load (P1)       │               │
+│  │  pf_scan / pf_peek (P1)       │               │
+│  │  pf_fault / pf_ps  (P2)       │               │
 │  └────────────┬──────────────────┘               │
 │               │                                  │
 │               ▼                                  │
@@ -44,7 +45,9 @@ MCP and REST.
 │   ┌───────────┴───────────┐                      │
 │   ▼                       ▼                      │
 │ Backend registry       Audit logger              │
-│ (filesystem in P1)     (JSONL / stdout / off)    │
+│ (filesystem, subproc,  (JSONL / stdout / off)    │
+│  http, subagent-cli,                             │
+│  subagent-http)                                  │
 └──────────────────────────────────────────────────┘
 ```
 
@@ -55,7 +58,7 @@ MCP and REST.
 | `cmd/pagefault`         | CLI entry point: `serve`, `token`, `--version` |
 | `internal/config`       | YAML schema structs, loader, env substitution, validation |
 | `internal/model`        | Shared types (`Caller`) and sentinel errors |
-| `internal/backend`      | `Backend` interface, Phase-1 filesystem backend |
+| `internal/backend`      | `Backend` / `SubagentBackend` interfaces and five built-in types: `filesystem` (P1), `subprocess`, `http`, `subagent-cli`, `subagent-http` (P2) |
 | `internal/auth`         | `AuthProvider` interface, Bearer/None/TrustedHeader, middleware |
 | `internal/filter`       | `Filter` interface, `CompositeFilter`, PathFilter, TagFilter |
 | `internal/audit`        | `Logger` interface, JSONL/stdout/nop sinks, arg sanitization |
@@ -217,7 +220,8 @@ The dispatcher owns:
 - `toolsCfg`  — enable/disable flags
 
 Tool handlers in `internal/tool` are thin wrappers over the dispatcher's
-`ListContexts`, `GetContext`, `Search`, and `Read` methods.
+`ListContexts`, `GetContext`, `Search`, `Read`, `DeepRetrieve`, and
+`ListAgents` methods.
 
 ## Transport details
 
@@ -232,7 +236,7 @@ Tool handlers in `internal/tool` are thin wrappers over the dispatcher's
 ### MCP
 
 - `mcpserver.NewMCPServer("pagefault", Version, WithToolCapabilities(true))`
-- `tool.RegisterMCP` registers each enabled Phase-1 tool with a JSON-schema
+- `tool.RegisterMCP` registers each enabled tool (Phase 1-2) with a JSON-schema
   input and a handler that re-uses the same `tool.HandleX` functions
 - `mcpserver.NewStreamableHTTPServer(...)` exposes the server as an
   `http.Handler` mounted on `/mcp`

@@ -10,11 +10,12 @@ backing store and resumes execution. pagefault does the same for AI agents:
 when they need context they don't have, they fault to this server, which
 loads the right information from configured backends.
 
-Phase 1 is a minimal, working slice: a Go binary that serves markdown files
-from a directory, with four tools (`pf_maps`, `pf_load`, `pf_scan`,
-`pf_peek`), bearer-token auth, path/tag filters, and JSONL audit logging.
-Tool names follow a `pf_*` scheme borrowed from Unix memory management and
-kernel debugging — see `docs/api-doc.md` for the mapping.
+Phases 1-2 ship a Go binary that serves markdown files from a directory,
+answers search via subprocess or HTTP backends, and spawns real subagents
+for deep retrieval — six tools (`pf_maps`, `pf_load`, `pf_scan`, `pf_peek`,
+`pf_fault`, `pf_ps`), bearer-token auth, path/tag filters, and JSONL audit
+logging. Tool names follow a `pf_*` scheme borrowed from Unix memory
+management and kernel debugging — see `docs/api-doc.md` for the mapping.
 
 ## Quick start
 
@@ -73,12 +74,28 @@ bash scripts/smoke.sh   # end-to-end smoke test
 ## Documentation
 
 - **`plan.md`** — full product spec and roadmap (source of truth)
-- **`docs/api-doc.md`** — tool reference (Phase 1)
+- **`docs/api-doc.md`** — tool reference (Phase 1-2)
 - **`docs/config-doc.md`** — full YAML configuration reference
 - **`docs/architecture.md`** — architecture deep dive
 - **`CLAUDE.md`** — developer guide for AI agents working on this repo
 
 ## Recent Changes
+
+### 0.3.2 — 2026-04-10
+
+- **HTTP backend no longer masks operator typos.** A configured
+  `response_path` that isn't present in the response body used to
+  silently return zero results. It now surfaces a wrapped
+  `ErrBackendUnavailable` (→ HTTP 502) naming the missing path, so the
+  caller sees "response path \"results\" not found in response body"
+  instead of empty search results.
+- **`hasAgent` deduplicated** across `subagent_cli.go` and
+  `subagent_http.go` into a single `hasAgentID(agents, id)` helper in
+  `subagent.go`. Behaviour unchanged.
+- **Doc cleanup.** README / CLAUDE.md / api-doc.md references to
+  "Phase 1 / four tools / 0.3.0" updated to reflect the current
+  Phase-1-2 / six-tool / 0.3.2 reality. `SubprocessBackendConfig.Parse`
+  docstring now lists all three parse modes.
 
 ### 0.3.1 — 2026-04-10
 
@@ -108,27 +125,6 @@ bash scripts/smoke.sh   # end-to-end smoke test
 - **New CLI subcommands.** `pagefault fault <query…> [--agent] [--timeout]`
   and `pagefault ps` — same dispatcher, same audit/filter path as the
   HTTP and MCP transports.
-
-### 0.2.0 — 2026-04-10
-
-- **Tool rename (breaking).** Wire surface now uses `pf_*` names:
-  `list_contexts → pf_maps`, `get_context → pf_load`, `search → pf_scan`,
-  `read → pf_peek` (plus `pf_fault` / `pf_ps` / `pf_poke` for Phases 2/4).
-- **CLI subcommands.** `pagefault maps` / `load` / `scan` / `peek` drive the
-  same dispatchers as the HTTP/MCP transports. Common flags: `--config`,
-  `--no-filter`, `--json`. Config lookup: `--config → $PAGEFAULT_CONFIG →
-  ./pagefault.yaml`.
-- **`pf_load` skipped-source visibility.** Sources dropped by filters or
-  backend errors are returned in `skipped_sources` with a reason, and
-  logged at WARN. UTF-8 truncation now walks back to a rune boundary.
-
-### 0.1.0 — 2026-04-10
-
-- Initial Phase 1 MVP: filesystem backend, bearer auth, path/tag filters,
-  audit logging, four tools (`list_contexts`, `get_context`, `search`,
-  `read`) over both MCP and REST transports
-- CLI: `serve`, `token create/ls/revoke`, `--version`
-- Minimal config and demo data, end-to-end smoke script
 
 See [`CHANGELOG.md`](CHANGELOG.md) for the full history.
 

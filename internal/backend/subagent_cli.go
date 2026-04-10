@@ -121,7 +121,7 @@ func (b *SubagentCLIBackend) Spawn(ctx context.Context, agentID string, task str
 	if agentID == "" {
 		agentID = b.defaultID
 	}
-	if !b.hasAgent(agentID) {
+	if !hasAgentID(b.agents, agentID) {
 		return "", fmt.Errorf("%w: %q on backend %q", model.ErrAgentNotFound, agentID, b.name)
 	}
 	if timeout <= 0 {
@@ -167,15 +167,6 @@ func (b *SubagentCLIBackend) Spawn(ctx context.Context, agentID string, task str
 		return out, fmt.Errorf("subagent %q on backend %q: %w", agentID, b.name, err)
 	}
 	return out, nil
-}
-
-func (b *SubagentCLIBackend) hasAgent(id string) bool {
-	for _, a := range b.agents {
-		if a.ID == id {
-			return true
-		}
-	}
-	return false
 }
 
 // tokenizeCommand splits a command-template string into argv tokens,

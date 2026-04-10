@@ -120,7 +120,7 @@ func (b *SubagentHTTPBackend) Spawn(ctx context.Context, agentID string, task st
 	if agentID == "" {
 		agentID = b.defID
 	}
-	if !b.hasAgent(agentID) {
+	if !hasAgentID(b.agents, agentID) {
 		return "", fmt.Errorf("%w: %q on backend %q", model.ErrAgentNotFound, agentID, b.name)
 	}
 	if timeout <= 0 {
@@ -184,15 +184,6 @@ func (b *SubagentHTTPBackend) Spawn(ctx context.Context, agentID string, task st
 	}
 
 	return extractResponse(raw, b.spawn.ResponsePath)
-}
-
-func (b *SubagentHTTPBackend) hasAgent(id string) bool {
-	for _, a := range b.agents {
-		if a.ID == id {
-			return true
-		}
-	}
-	return false
 }
 
 // Shared HTTP template / JSON-path helpers (renderTemplate, jsonEscape,

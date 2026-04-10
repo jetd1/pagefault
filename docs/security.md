@@ -100,16 +100,17 @@ The filter pipeline runs three checks per tool call:
 3. **FilterContent.** Content-level transforms (e.g. redaction regexes).
    Runs last, so it sees the final content the client will receive.
 
-The filter types shipped in Phase 1:
+Filter types currently shipped:
 
-| Filter       | Purpose                                       |
-|--------------|-----------------------------------------------|
-| `PathFilter` | Allow/deny by glob (`docs/**/*.md`, `**/secrets/**`) |
-| `TagFilter`  | Allow/deny by metadata tags                   |
-| `Redaction`  | Regex-based content masking                   |
+| Filter       | Purpose                                       | Phase |
+|--------------|-----------------------------------------------|-------|
+| `PathFilter` | Allow/deny by glob (`docs/**/*.md`, `**/secrets/**`) | 1  |
+| `TagFilter`  | Allow/deny by metadata tags                   | 1     |
+| `Redaction`  | Regex-based content masking                   | 3 (planned) |
 
 Filters compose with **AND** semantics: every configured filter must allow
-a URI for the dispatcher to serve it.
+a URI for the dispatcher to serve it. The `redaction` section of the
+config is accepted by the loader today but has no effect until Phase 3.
 
 ### Skipped sources
 
@@ -154,9 +155,9 @@ coverage silently.
 
 ## Write safety (Phase 4+)
 
-Phase 1 is **read-only**. There is no `pf_poke` tool, no writable backend
-config, and no `write_paths` allowlist. When Phase 4 lands, the following
-protections apply:
+pagefault is **read-only through Phase 1-2**. There is no `pf_poke` tool,
+no writable backend config, and no `write_paths` allowlist. When Phase 4
+lands, the following protections apply:
 
 - Backends default to `writable: false`. Turning on writes is explicit.
 - Write allowlist (`write_paths`) is separate from the read allowlist.

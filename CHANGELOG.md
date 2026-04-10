@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+## 0.3.2 (2026-04-10)
+
+Review-response patch for 0.3.0 / 0.3.1. Targeted fixes from an
+independent reviewer plus documentation cleanup. No wire-surface
+changes.
+
+### Changed
+- **HTTP backend surfaces missing `response_path` as an error.**
+  `decodeHTTPSearchResults` previously returned `(nil, nil)` when a
+  configured `response_path` was absent from the body, which silently
+  masked operator typos as "no results". It now returns a wrapped
+  `model.ErrBackendUnavailable` (→ HTTP 502) with a message naming the
+  missing path. The "non-array path" branch is now also wrapped in the
+  same sentinel for consistency, so both config-error cases propagate
+  the same status.
+- **`hasAgent` deduplicated across subagent backends.** `subagent_cli.go`
+  and `subagent_http.go` each had a private method that linear-scanned
+  `b.agents` for an id. Extracted to a package-private
+  `hasAgentID(agents, id) bool` helper in `subagent.go`. Behaviour
+  unchanged; the constructors' uniqueness check was already authoritative.
+- **`SubprocessBackendConfig.Parse` docstring** now lists all three parse
+  modes (`ripgrep_json`, `grep`, `plain`). The `grep` mode was already
+  implemented and tested — only the doc comment was stale.
+
+### Fixed
+- **README, CLAUDE.md, and api-doc.md version drift.** Several places
+  still referenced `0.3.0` (CLAUDE.md directory-tree comment, api-doc.md
+  `/health` example) or described the tool surface as "Phase 1 / four
+  tools" from the pre-Phase-2 state. Updated to reflect Phase 1-2 and
+  six tools.
+- **README Recent Changes trimmed to the three most recent releases**
+  (`0.3.2` / `0.3.1` / `0.3.0`), per the CLAUDE.md house rule.
+  Full history still lives in `CHANGELOG.md`.
+
+### Deferred
+- `subprocess` backend's `plain` parse mode still returns empty-string
+  URIs. A reviewer suggested either a `uri_template` config field or
+  an `unknown://<n>` fallback; both are Phase-3 scope (`plain` is
+  explicitly documented as "smoke-test only — pick a structured mode
+  for real use").
+
 ## 0.3.1 (2026-04-10)
 
 Review-response patch for 0.3.0. No wire-surface or behavior changes —
