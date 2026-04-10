@@ -1,0 +1,813 @@
+# pagefault — Personal Memory Service
+
+> When your agent hits a context miss, pagefault loads the right page back in.
+
+## 1. What Is This
+
+pagefault is a **config-driven memory server** that exposes personal knowledge (files, search indices, agent sessions) to external AI clients via **MCP** and **OpenAPI** transports.
+
+It solves one problem: you have rich, structured memory on one machine (daily notes, long-term memory, conversation summaries, agent context files), and you want any AI client on any device (Claude Code on MacBook, Claude app on iPhone, ChatGPT, Cursor, etc.) to query it on demand — without syncing files, without full agent sessions, and with fine-grained access control.
+
+**The metaphor:** In an OS, a page fault occurs when a process accesses memory not currently loaded — the handler fetches it from backing store and resumes execution. pagefault does the same for AI agents: when they need context they don't have, they fault to this server, which loads the right information from configured backends.
+
+## 2. Design Principles
+
+| # | Principle | Implication |
+|---|-----------|-------------|
+| 1 | **Config-driven, not code-driven** | All behavior (backends, tools, filters, auth, contexts) is defined in a YAML config. The server is a runtime for that config. |
+| 2 | **Framework is generic; deployment is specific** | Zero hardcoded paths, zero infra assumptions, zero client-specific logic in core. All specificity lives in config files. |
+| 3 | **Pluggable backends** | Data sources are backend plugins implementing a common interface. Filesystem, subprocess, HTTP, subagent — all are backends. |
+| 4 | **Filters are optional and composable** | Path allowlist/denylist, tag filtering, content redaction — each can be enabled/disabled independently. Can be turned off entirely. |
+| 5 | **Auth is a thin layer** | Default: bearer tokens. Can be disabled for local dev. Production auth is expected to be handled by a reverse proxy (e.g., Hermes, Caddy with forward_auth). The server just reads a trusted header or validates a token. |
+| 6 | **Subagent spawning is first-class** | `deep_retrieve` tool spawns a real subagent (via CLI or HTTP), waits for a real result, and returns it. Not a simulated search — a real agent turn. |
+| 7 | **Dual transport: MCP + OpenAPI** | MCP for Claude family clients. OpenAPI REST for ChatGPT Actions, curl, and any HTTP client. Same tool logic, two doors. |
+| 8 | **Audit everything** | Every tool call is logged with caller, tool, args, timing, result size. No silent access. |
+
+## 3. Architecture
+
+```
+┌──────────────────────────────────────────────────┐
+│  Clients (Claude Code, Claude iOS, ChatGPT, etc) │
+└────────────┬──────────────────────┬──────────────┘
+             │ MCP (streamable-http)│ REST (OpenAPI)
+             ▼                      ▼
+┌──────────────────────────────────────────────────┐
+│  pagefault server (FastAPI + FastMCP)             │
+│  ┌──────────┐  ┌───────────────────────────┐     │
+│  │ Auth     │  │ Tool Dispatcher           │     │
+│  │ (bearer  │  │  list_contexts            │     │
+│  │  /header │  │  get_context              │     │
+│  │  /none)  │  │  search                   │     │
+│  │          │  │  read                     │     │
+│  │          │  │  deep_retrieve → subagent  │     │
+│  │          │  │  list_agents              │     │
+│  └──────────┘  └───────────┬───────────────┘     │
+│                            │                      │
+│  ┌─────────────┐  ┌───────┴────────┐             │
+│  │ Filters     │  │ Backend Registry│             │
+│  │ (allow/deny │  │  filesystem     │             │
+│  │  /redact/   │  │  subprocess     │             │
+│  │  tags)      │  │  http           │             │
+│  │  —optional— │  │  subagent-cli   │             │
+│  └─────────────┘  │  subagent-http  │             │
+│                    └───────┬────────┘             │
+│                            │                      │
+│  ┌─────────────────────────┴──────────────┐       │
+│  │ Audit Logger (JSONL)                    │       │
+│  └─────────────────────────────────────────┘       │
+└──────────────────────────────────────────────────┘
+```
+
+### Request Flow
+
+1. Client calls a tool via MCP or REST
+2. Auth layer identifies the caller (token → identity, or trusted header)
+3. Tool dispatcher validates params, resolves which backend(s) to query
+4. **Pre-filter**: path/tag allowlist + denylist check (if enabled)
+5. Backend executes the query (read file, run subprocess, spawn subagent, etc.)
+6. **Post-filter**: content redaction (if enabled)
+7. Audit log entry is written
+8. Result returned to client
+
+## 4. Core Abstractions
+
+### 4.1 Backend
+
+```python
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+
+@dataclass
+class Resource:
+    uri: str           # e.g. "memory://2026-04-10.md"
+    content: str       # the actual content
+    content_type: str  # "text/markdown", "application/json", etc.
+    metadata: dict     # source, tags, size, mtime, etc.
+
+@dataclass
+class SearchResult:
+    uri: str
+    snippet: str
+    score: float | None  # None for non-ranking backends
+    metadata: dict
+
+class Backend(ABC):
+    @abstractmethod
+    async def read(self, uri: str) -> Resource | None: ...
+
+    @abstractmethod
+    async def search(self, query: str, limit: int = 10) -> list[SearchResult]: ...
+
+    @abstractmethod
+    async def list_resources(self) -> list[dict]: ...
+
+    @property
+    @abstractmethod
+    def name(self) -> str: ...
+```
+
+### 4.2 Context
+
+A **context** is a named, pre-composed bundle of backend results. Instead of making the client know file paths, they ask for a semantic context by name.
+
+```yaml
+contexts:
+  - name: user-profile
+    description: "User's personal profile, preferences, and setup"
+    sources:
+      - backend: fs
+        uri: "memory://USER.md"
+      - backend: fs
+        uri: "memory://IDENTITY.md"
+    format: markdown  # markdown | json
+    max_size: 8000    # characters; truncate with summary if exceeded
+```
+
+Context resolution: load each source → concatenate / merge → apply filters → truncate if needed → return.
+
+### 4.3 Subagent Backend
+
+A special backend type that spawns a full agent process, gives it a task, and returns its final response. This is what makes `deep_retrieve` powerful — it's not a search, it's a real agent reasoning about your memory.
+
+```python
+class SubagentBackend(Backend):
+    @abstractmethod
+    async def spawn(self, agent_id: str, task: str, timeout: float) -> str:
+        """Spawn a subagent, wait for result, return the response text."""
+        ...
+
+    async def read(self, uri: str) -> Resource | None:
+        # Subagent backends don't support read directly
+        return None
+
+    async def search(self, query: str, limit: int = 10) -> list[SearchResult]:
+        # Subagent backends don't support search directly
+        return []
+```
+
+Built-in implementations:
+- **`subagent-cli`**: Runs a shell command, waits for stdout. Configurable command template with `{agent_id}` and `{task}` placeholders.
+- **`subagent-http`**: POSTs to an HTTP endpoint, waits for JSON response. Configurable URL template and headers.
+
+### 4.4 Filter Pipeline
+
+```python
+class Filter(ABC):
+    @abstractmethod
+    def allow_uri(self, uri: str, caller: Caller | None) -> bool: ...
+
+    @abstractmethod
+    def filter_content(self, content: str, uri: str) -> str: ...
+
+class CompositeFilter(Filter):
+    """Chain multiple filters. URI: AND (all must pass). Content: sequential application."""
+    ...
+```
+
+Built-in filters:
+- **PathFilter**: allowlist/denylist of URI glob patterns
+- **TagFilter**: only allow resources with matching tags
+- **RedactionFilter**: regex-based content replacement (e.g., mask API keys, phone numbers)
+
+### 4.5 Auth
+
+```python
+@dataclass
+class Caller:
+    id: str          # token ID or header value
+    label: str       # human-readable label
+    metadata: dict   # extra info from token record
+
+class AuthProvider(ABC):
+    @abstractmethod
+    async def authenticate(self, request) -> Caller | None: ...
+```
+
+Built-in:
+- **BearerTokenAuth**: validates `Authorization: Bearer <token>` against a configured token file
+- **TrustedHeaderAuth**: reads caller identity from a trusted header (e.g., `X-Forwarded-User` from a reverse proxy)
+- **NoneAuth**: no auth, returns anonymous caller (for local dev)
+
+## 5. Tool Surface
+
+All tools are individually enable/disable-able in config. Default: all enabled.
+
+### 5.1 `list_contexts`
+
+Returns all available contexts with names and descriptions. Zero-cost, no backend calls.
+
+**Input:** none
+**Output:**
+```json
+[
+  {"name": "user-profile", "description": "User's personal profile, preferences, and setup"},
+  {"name": "recent-activity", "description": "Daily notes from the last N days"}
+]
+```
+
+### 5.2 `get_context`
+
+Load and return a pre-composed context by name.
+
+**Input:**
+- `name` (string, required) — context name
+- `format` (string, optional) — override output format: "markdown" | "json"
+
+**Output:** The composed context content (truncated if exceeds max_size).
+
+### 5.3 `search`
+
+Full-text and/or semantic search across configured backends. Fan-out to all backends that support search, merge results.
+
+**Input:**
+- `query` (string, required) — search query (keywords, phrases, or natural language depending on backend)
+- `limit` (int, optional, default 10) — max results
+- `backends` (string[], optional) — restrict to specific backend names
+- `date_range` (object, optional) — `{from: "YYYY-MM-DD", to: "YYYY-MM-DD"}` — hint for backends that support it
+
+**Output:**
+```json
+[
+  {"uri": "memory://2026-04-10.md", "snippet": "...matched text...", "score": 0.92, "backend": "fs"},
+  {"uri": "lcm://sum_abc123", "snippet": "...matched text...", "score": 0.85, "backend": "lcm"}
+]
+```
+
+### 5.4 `read`
+
+Read a specific resource by URI.
+
+**Input:**
+- `uri` (string, required) — resource URI (e.g. `memory://2026-04-10.md`)
+- `from_line` (int, optional) — start line (1-indexed) for text resources
+- `to_line` (int, optional) — end line for text resources
+
+**Output:** Full resource content (or slice).
+
+### 5.5 `deep_retrieve`
+
+Spawn a full subagent to do comprehensive retrieval. This is the "hard fault" — the agent has access to all tools (LCM, memory search, file read, session history) and can reason about what's relevant.
+
+**Input:**
+- `query` (string, required) — what to find / understand
+- `agent` (string, optional) — which agent to spawn (default: first configured subagent)
+- `timeout_seconds` (int, optional, default 120) — max wait time
+
+**Output:**
+```json
+{
+  "answer": "The agent's synthesized response...",
+  "agent": "wocha",
+  "elapsed_seconds": 47.3,
+  "sources": ["memory://2026-04-10.md", "lcm://sum_abc123"]
+}
+```
+
+If the subagent times out, return:
+```json
+{
+  "error": "Subagent timed out after 120s",
+  "agent": "wocha",
+  "partial_result": null
+}
+```
+
+### 5.6 `list_agents`
+
+List available subagents (names + descriptions). Allows clients to know which agents they can request for `deep_retrieve`.
+
+**Input:** none
+**Output:**
+```json
+[
+  {"id": "wocha", "description": "Full-featured dev agent with Feishu, LCM, and workspace access"},
+  {"id": "main", "description": "Primary personal agent with full tool access"}
+]
+```
+
+## 6. Configuration Schema
+
+The entire server is driven by a single YAML file. This is the *contract* — the server is just a runtime for it.
+
+```yaml
+# pagefault.yaml — Full schema reference
+
+# ── Server ──────────────────────────────────────
+server:
+  host: "0.0.0.0"
+  port: 8444
+  # Base URL for OpenAPI spec generation (used by ChatGPT Actions, etc.)
+  public_url: "https://pagefault.jetd.one"
+
+# ── Auth ────────────────────────────────────────
+auth:
+  # "none" | "bearer" | "trusted_header"
+  mode: "bearer"
+
+  bearer:
+    # Path to JSONL tokens file, one JSON object per line:
+    # {"id": "macbook-cc", "token": "pf_xxx...", "label": "Claude Code on MacBook"}
+    tokens_file: "/etc/pagefault/tokens.jsonl"
+
+  trusted_header:
+    # Header name that carries the authenticated user identity
+    # Set by a reverse proxy (Hermes, Caddy forward_auth, etc.)
+    header: "X-Forwarded-User"
+    # Optional: require that the request comes from a trusted proxy IP
+    trusted_proxies: ["127.0.0.1", "192.168.50.224"]
+
+# ── Backends ────────────────────────────────────
+# Each backend has a unique name and a type.
+# "type" determines which implementation class to use.
+# Additional keys are type-specific config.
+
+backends:
+  - name: fs
+    type: filesystem
+    root: "/home/jet/.openclaw/workspace"
+    # Only files matching these globs are visible (relative to root)
+    include: ["memory/**/*.md", "AGENTS.md", "USER.md", "SOUL.md", "IDENTITY.md", "TOOLS.md"]
+    # Even within include, these are excluded
+    exclude: ["memory/intimate.md", "memory/cha-fun-facts.md"]
+    # URI scheme for this backend
+    uri_scheme: "memory"
+    # Automatically tag resources by path pattern
+    auto_tag:
+      "memory/**/*.md": ["daily", "memory"]
+      "AGENTS.md": ["config", "bootstrap"]
+      "USER.md": ["config", "bootstrap", "profile"]
+    # Sandbox: never serve files outside root, even with symlinks
+    sandbox: true
+
+  - name: self-improving
+    type: filesystem
+    root: "/home/jet/.openclaw/self-improving"
+    include: ["**/*.md"]
+    exclude: []
+    uri_scheme: "self-improving"
+    auto_tag:
+      "**/*.md": ["self-improving", "meta"]
+    sandbox: true
+
+  - name: rg
+    type: subprocess
+    # Command template. {query} is replaced with the search query (shell-escaped).
+    command: "rg --json -i -n --max-count 20 '{query}' {roots}"
+    # Roots to search (substituted into {roots})
+    roots:
+      - "/home/jet/.openclaw/workspace/memory"
+      - "/home/jet/.openclaw/self-improving"
+    timeout: 10
+    # Parse stdout as JSON lines (ripgrep --json format)
+    parse: "ripgrep_json"
+
+  - name: lcm
+    type: http
+    # Base URL for the LCM/search API
+    base_url: "http://127.0.0.1:6443"
+    # Auth for this backend (can differ from server auth)
+    auth:
+      mode: "bearer"
+      token: "${OPENCLAW_GATEWAY_TOKEN}"  # env substitution
+    search:
+      method: "POST"
+      path: "/api/lcm/search"
+      body_template: '{"query": "{query}", "limit": {limit}}'
+      response_path: "$.results"  # JSONPath to extract results
+    timeout: 15
+
+  - name: openclaw
+    type: subagent-cli
+    # Command template to spawn an OpenClaw agent
+    # {agent_id} and {task} are substituted at runtime
+    command: "openclaw agent run --agent {agent_id} --task '{task}' --timeout {timeout} --format plain"
+    timeout: 300  # default timeout in seconds
+    # Available agents (for list_agents tool)
+    agents:
+      - id: wocha
+        description: "Dev agent with Feishu, LCM, workspace, and coding tools"
+      - id: main
+        description: "Primary personal agent with full tool access"
+
+  # Alternative: subagent via HTTP (for gateway API access)
+  # - name: openclaw-http
+  #   type: subagent-http
+  #   base_url: "https://localhost:6443/api"
+  #   auth:
+  #     mode: "bearer"
+  #     token: "${OPENCLAW_GATEWAY_TOKEN}"
+  #   spawn:
+  #     method: "POST"
+  #     path: "/agents/{agent_id}/run"
+  #     body_template: '{"task": "{task}", "timeout": {timeout}}'
+  #     response_path: "$.result"
+  #   timeout: 300
+  #   agents:
+  #     - id: wocha
+  #       description: "Dev agent with Feishu, LCM, workspace, and coding tools"
+
+# ── Contexts ────────────────────────────────────
+# Pre-composed bundles that clients can request by name.
+
+contexts:
+  - name: user-profile
+    description: "User's personal profile, preferences, and setup"
+    sources:
+      - backend: fs
+        uri: "memory://USER.md"
+      - backend: fs
+        uri: "memory://IDENTITY.md"
+    format: markdown
+    max_size: 8000
+
+  - name: agent-bootstrap
+    description: "Agent initialization docs (AGENTS.md, SOUL.md, TOOLS.md) — filtered for external agents"
+    sources:
+      - backend: fs
+        uri: "memory://AGENTS.md"
+      - backend: fs
+        uri: "memory://SOUL.md"
+      - backend: fs
+        uri: "memory://TOOLS.md"
+    format: markdown
+    max_size: 16000
+
+  - name: recent-activity
+    description: "Daily notes from the last N days"
+    sources:
+      # Dynamic source: resolved at query time
+      - backend: fs
+        uri: "memory://recent"  # special URI pattern resolved by filesystem backend
+        params:
+          days: 7
+          glob: "*.md"
+    format: markdown
+    max_size: 24000
+
+  - name: self-improving
+    description: "Agent self-improvement lessons and corrections"
+    sources:
+      - backend: self-improving
+        uri: "self-improving://memory.md"
+    format: markdown
+    max_size: 8000
+
+# ── Tools ───────────────────────────────────────
+# Enable/disable individual tools. Default: all enabled.
+
+tools:
+  list_contexts: true
+  get_context: true
+  search: true
+  read: true
+  deep_retrieve: true
+  list_agents: true
+
+# ── Filters ─────────────────────────────────────
+# Optional. Can be disabled entirely with `enabled: false`.
+
+filters:
+  enabled: true
+
+  # Path-level: evaluated BEFORE backend access
+  path:
+    # If allow is set, ONLY these URIs are accessible
+    allow: []
+    # These URIs are always blocked, even if in allow list
+    deny:
+      - "memory://memory/intimate.md"
+      - "memory://memory/cha-fun-facts.md"
+      - "self-improving://**/corrections.md"  # glob supported
+
+  # Tag-level: only serve resources with these tags
+  tags:
+    # If set, ONLY resources with at least one matching tag are served
+    allow: []
+    deny: []
+
+  # Content-level: applied AFTER backend returns content
+  redaction:
+    enabled: false
+    rules:
+      - pattern: '(?i)(api[_-]?key|token|secret|password)\s*[:=]\s*\S+'
+        replacement: '[REDACTED]'
+      - pattern: '\b\d{16,19}\b'  # credit card numbers
+        replacement: '[REDACTED]'
+
+# ── Audit ───────────────────────────────────────
+audit:
+  enabled: true
+  # "jsonl" (append-only file) | "stdout" | "off"
+  log_path: "/var/log/pagefault/audit.jsonl"
+  # Include full result content in audit (warning: large)
+  include_content: false
+```
+
+## 7. Transport Details
+
+### MCP (Primary)
+
+- Endpoint: `POST /mcp` (streamable-http transport)
+- Tools are registered as MCP tools with Pydantic-derived schemas
+- FastMCP 2.x handles protocol details (session management, JSON-RPC, SSE streaming)
+- Auth: Bearer token in `Authorization` header (standard MCP auth pattern)
+
+### OpenAPI (Secondary)
+
+- Endpoints: `POST /api/{tool_name}` for each tool
+- OpenAPI 3.0 spec at `GET /api/openapi.json`
+- Used by ChatGPT Custom GPT Actions, curl, and any HTTP client
+- Auth: Same as MCP (Bearer token in header)
+
+Both transports dispatch to the **same** `ToolDispatcher` — zero logic duplication.
+
+### Health / Meta
+
+- `GET /health` → `{"status": "ok", "backends": {"fs": "ok", "lcm": "ok", ...}}`
+- `GET /` → Redirect to `/docs` (FastAPI Swagger UI)
+
+## 8. Project Structure
+
+```
+page-fault/
+├── plan.md                      # This file
+├── README.md                    # Quick start guide
+├── pyproject.toml               # Python project config (PEP 621)
+│
+├── src/pagefault/
+│   ├── __init__.py
+│   ├── server.py                # FastAPI app factory, mount MCP + REST
+│   ├── config.py                # Pydantic models, YAML loader, env substitution
+│   ├── dispatcher.py            # ToolDispatcher: routes tool calls to backends
+│   ├── auth.py                  # AuthProvider ABC + built-in implementations
+│   ├── filters.py               # Filter pipeline (path, tag, redaction)
+│   ├── audit.py                 # JSONL audit logger
+│   ├── tools/                   # MCP/REST tool definitions
+│   │   ├── __init__.py
+│   │   ├── list_contexts.py
+│   │   ├── get_context.py
+│   │   ├── search.py
+│   │   ├── read.py
+│   │   ├── deep_retrieve.py
+│   │   └── list_agents.py
+│   ├── backends/                # Backend implementations
+│   │   ├── __init__.py          # BackendRegistry + Backend ABC
+│   │   ├── base.py              # Backend, Resource, SearchResult ABCs
+│   │   ├── filesystem.py        # Local filesystem backend
+│   │   ├── subprocess.py        # Shell command backend (e.g., ripgrep)
+│   │   ├── http_backend.py      # HTTP API backend
+│   │   └── subagent/            # Subagent backends
+│   │       ├── __init__.py      # SubagentBackend ABC
+│   │       ├── cli.py           # CLI-based subagent spawning
+│   │       └── http.py          # HTTP-based subagent spawning
+│   └── cli.py                   # CLI entry point (pagefault serve, pagefault token)
+│
+├── configs/
+│   ├── minimal.yaml             # Smallest working config (single dir, no auth)
+│   └── openclaw.yaml            # Full config for Jet's OpenClaw setup
+│
+├── tests/
+│   ├── conftest.py              # Shared fixtures (test config, mock backends)
+│   ├── test_config.py
+│   ├── test_auth.py
+│   ├── test_filters.py
+│   ├── test_backends_filesystem.py
+│   ├── test_backends_subprocess.py
+│   ├── test_backends_subagent.py
+│   ├── test_tools.py
+│   ├── test_dispatcher.py
+│   └── test_server.py           # Integration: spin up app, call endpoints
+│
+└── scripts/
+    └── dev.sh                   # Hot-reload dev server
+```
+
+## 9. Tech Stack
+
+| Component | Choice | Why |
+|-----------|--------|-----|
+| Language | Python 3.12+ | Fast iteration, rich async ecosystem, Claude Code writes it well |
+| MCP SDK | FastMCP 2.x | Official Python MCP server framework, streamable-http support |
+| HTTP | FastAPI | OpenAPI auto-gen, async-native, pairs with FastMCP |
+| Schema | Pydantic v2 | Config validation, JSON Schema generation for MCP tool params |
+| HTTP client | httpx | Async HTTP for backend calls |
+| YAML | PyYAML or ruamel.yaml | Config loading with env var substitution |
+| Testing | pytest + pytest-asyncio | Standard Python testing |
+| Package manager | uv | Fast, modern Python package management |
+
+## 10. Implementation Phases
+
+### Phase 1 — MVP: Files + Basic Tools + Bearer Auth
+
+**Goal:** A running server that can serve files and search from a directory, with bearer auth and audit logging.
+
+1. Project scaffold (`pyproject.toml`, `src/pagefault/`, `tests/`)
+2. `config.py` — Pydantic models for full config schema, YAML loader with `${ENV}` substitution
+3. `backends/base.py` — `Backend`, `Resource`, `SearchResult` ABCs
+4. `backends/filesystem.py` — Filesystem backend with glob include/exclude, sandbox, auto-tag, URI scheme mapping
+5. `auth.py` — `AuthProvider` ABC + `BearerTokenAuth` + `NoneAuth`
+6. `filters.py` — `PathFilter` (allow/deny globs), `TagFilter`
+7. `audit.py` — JSONL logger
+8. `dispatcher.py` — `ToolDispatcher`: loads config, registers backends, dispatches tool calls
+9. `tools/list_contexts.py`, `tools/get_context.py`, `tools/search.py`, `tools/read.py`
+10. `server.py` — FastAPI app, mount FastMCP on `/mcp`, mount REST on `/api`
+11. `cli.py` — `pagefault serve --config <path>`, `pagefault token create/ls/revoke`
+12. `configs/minimal.yaml` — One-directory, no-auth config
+13. Unit tests for config, filesystem backend, filters, auth
+14. Integration test: spin up server, call tools via HTTP
+15. **Smoke test**: `pagefault serve --config configs/minimal.yaml` → real MCP client connects → `list_contexts` → `search` → `read` → works
+
+**Phase 1 does NOT include:** subagent backends, HTTP backends, subprocess backends, redaction filters, OpenAPI spec, `deep_retrieve`, `list_agents`.
+
+### Phase 2 — Subagents + More Backends
+
+1. `backends/subagent/base.py` — `SubagentBackend` ABC
+2. `backends/subagent/cli.py` — CLI subagent (shell out, capture stdout)
+3. `backends/subagent/http.py` — HTTP subagent (POST, poll/wait)
+4. `tools/deep_retrieve.py` — Spawn subagent, wait, return result
+5. `tools/list_agents.py` — List configured agents
+6. `backends/subprocess.py` — Generic subprocess backend (e.g., ripgrep)
+7. `backends/http_backend.py` — Generic HTTP backend (e.g., LCM API)
+8. `configs/openclaw.yaml` — Full production config
+9. Timeout handling, graceful kill on timeout, partial result capture
+10. Tests for each new backend + tool
+
+### Phase 3 — Polish + Production
+
+1. `filters.py` — `RedactionFilter` (regex-based content redaction)
+2. Context formats: JSON, markdown-with-metadata
+3. OpenAPI spec at `/api/openapi.json` (for ChatGPT Actions)
+4. Graceful degradation when backends are unreachable
+5. `pagefault token` CLI subcommands
+6. Better error messages, structured error responses
+7. Rate limiting (configurable per-caller)
+8. CORS config
+9. README.md with setup guide for Claude Code, Claude Desktop, ChatGPT
+
+### Phase 4 — Hardening
+
+1. OAuth2 auth provider
+2. Caching layer (LRU in-process, or Redis)
+3. Streaming for long subagent responses
+4. Metrics endpoint (Prometheus)
+5. Docker image
+6. systemd unit file example
+
+## 11. OpenAPI Endpoint Mapping (for ChatGPT Actions)
+
+Each MCP tool maps to a REST endpoint:
+
+| MCP Tool | REST Endpoint | Method |
+|----------|--------------|--------|
+| `list_contexts` | `/api/list_contexts` | POST |
+| `get_context` | `/api/get_context` | POST |
+| `search` | `/api/search` | POST |
+| `read` | `/api/read` | POST |
+| `deep_retrieve` | `/api/deep_retrieve` | POST |
+| `list_agents` | `/api/list_agents` | POST |
+
+All accept JSON bodies matching the MCP tool input schemas. All return JSON.
+
+OpenAPI spec available at `/api/openapi.json` — paste this URL into ChatGPT Custom GPT Actions.
+
+## 12. Security Model
+
+### Threat: Unauthorized access
+- **Mitigation:** Bearer tokens (per-device, revocable) or trusted-header auth behind a reverse proxy
+- Tokens are never logged or included in audit records (only token ID + label)
+
+### Threat: Path traversal
+- **Mitigation:** Filesystem backend enforces `sandbox: true` — resolves symlinks, rejects paths outside `root`
+- URI scheme mapping prevents arbitrary filesystem access
+
+### Threat: Sensitive data exposure
+- **Mitigation:** `filters.path.deny` blocks specific URIs (e.g., intimate.md, financial details)
+- `filters.redaction` masks patterns in content (API keys, credit cards)
+- Tags allow coarse-grained access control
+- All filters are **optional** — can be disabled for trusted environments
+
+### Threat: Data leaving the perimeter
+- **Acknowledgment:** Any content returned to an MCP client enters the model provider's API (Anthropic, OpenAI, etc.)
+- This is the same trust boundary as using Claude or ChatGPT directly
+- Filters exist to keep the most sensitive content off this path entirely
+
+### Threat: Token theft (phone lost, etc.)
+- **Mitigation:** Per-device tokens with `pagefault token revoke <id>`
+- Audit log shows exactly what each token accessed
+
+## 13. Open Questions (resolve before/during Phase 1)
+
+1. **OpenClaw CLI for agent spawning:** Does `openclaw agent run --agent <id> --task <task>` exist? If not, what's the CLI or API for spawning an agent and getting its output? This determines the subagent-cli command template.
+2. **FastMCP + FastAPI mount:** Can FastMCP 2.x streamable-http be cleanly mounted as a FastAPI sub-app at `/mcp`? Verify this works or find the right integration pattern.
+3. **Context response format:** Should contexts default to `text/markdown` (raw concatenation) or `application/json` (structured with metadata)? Leaning markdown for simplicity, JSON as opt-in.
+4. **Search result merging:** When multiple backends return search results, how to merge/rank? Simple: interleave by backend, no cross-backend scoring. Can be improved later.
+
+## 14. For Claude Code: How to Start
+
+### Before writing any code
+
+1. **Read this entire `plan.md`** carefully. It is the spec.
+2. **Read `configs/minimal.yaml`** once it exists for a concrete example.
+3. If anything is ambiguous, **write questions to `questions.md`** rather than guessing. You can ask the human.
+4. Do NOT introduce any dependency on OpenClaw, Hermes, or any specific infrastructure in the core code. The framework is generic. All specificity goes in config files.
+
+### Build order (strict)
+
+Follow this order. Each step should produce working, testable code before moving to the next.
+
+1. **Project scaffold** — `pyproject.toml`, directory structure, `src/pagefault/__init__.py`
+2. **`config.py`** — Full Pydantic models matching the YAML schema above. YAML loader with `${ENV_VAR}` substitution. Validate against `configs/minimal.yaml`.
+3. **`backends/base.py`** — `Backend`, `Resource`, `SearchResult` classes. Pure ABC, no implementation.
+4. **`backends/filesystem.py`** — Filesystem backend. This is the first real backend and the most important one to get right. Must handle: glob include/exclude, sandbox (no path traversal), URI scheme ↔ filesystem path mapping, auto-tagging, line-range reads, directory listing.
+5. **`auth.py`** — `AuthProvider` ABC, `BearerTokenAuth`, `NoneAuth`. Token file format: JSONL, one JSON object per line.
+6. **`filters.py`** — `CompositeFilter`, `PathFilter` (allow/deny with glob), `TagFilter`. All optional, can be disabled.
+7. **`audit.py`** — Simple JSONL logger. Each entry: timestamp, caller_id, caller_label, tool, args (sanitized), duration_ms, result_size, error (if any).
+8. **`dispatcher.py`** — `ToolDispatcher`: holds backends, contexts, filters, audit logger. Methods for each tool that route to the right backend(s).
+9. **`tools/`** — One file per tool. Each exports a function that the dispatcher calls. Keep tool logic thin — the dispatcher does the routing, the tool function does the MCP/REST-specific input/output formatting.
+10. **`server.py`** — FastAPI app factory. Mount FastMCP on `/mcp`. Mount REST routes on `/api`. Wire up auth middleware. Health endpoint.
+11. **`cli.py`** — `pagefault serve --config <path> [--host] [--port]`, `pagefault token create --label <label>`, `pagefault token ls`, `pagefault token revoke <id>`.
+12. **`configs/minimal.yaml`** — Smallest working config:
+    ```yaml
+    server:
+      host: "127.0.0.1"
+      port: 8444
+    auth:
+      mode: "none"
+    backends:
+      - name: fs
+        type: filesystem
+        root: "./demo-data"
+        include: ["**/*.md"]
+        exclude: []
+        uri_scheme: "memory"
+        sandbox: true
+    contexts:
+      - name: demo
+        description: "Demo context"
+        sources:
+          - backend: fs
+            uri: "memory://README.md"
+        format: markdown
+        max_size: 4000
+    filters:
+      enabled: false
+    audit:
+      enabled: true
+      log_path: "/tmp/pagefault-audit.jsonl"
+    ```
+13. **Tests** — Write tests alongside each module. Minimum: `test_config.py`, `test_backends_filesystem.py`, `test_filters.py`, `test_auth.py`, `test_server.py`.
+14. **Smoke test** — `pagefault serve --config configs/minimal.yaml` → verify `/health` returns 200 → verify MCP client can connect and call `list_contexts`.
+
+### Style & conventions
+
+- Use `async/await` throughout (all backends and tools are async)
+- Use Pydantic models for all inputs and outputs (this auto-generates MCP tool schemas)
+- Type hints everywhere
+- Docstrings on all public classes and functions
+- Error hierarchy:
+  ```python
+  class PageFaultError(Exception): pass
+  class AccessViolation(PageFaultError): pass    # blocked by filter
+  class BackendUnavailable(PageFaultError): pass  # backend is down
+  class SubagentTimeout(PageFaultError): pass     # subagent didn't respond in time
+  class ResourceNotFound(PageFaultError): pass    # URI doesn't exist
+  ```
+- Commit messages: conventional commits style. Append `Co-Authored-By: Cha <cha@jetd.one> via OpenClaw` on every commit if spawned by Cha, or the appropriate co-author tag.
+
+### What NOT to do
+
+- Do NOT import anything from OpenClaw, Hermes, or any local package
+- Do NOT hardcode any paths, URLs, or user IDs
+- Do NOT assume a specific OS or shell
+- Do NOT add caching in Phase 1 (YAGNI)
+- Do NOT add streaming responses in Phase 1
+- Do NOT build Docker/systemd/Caddy configs — that's post-deploy infra
+- Do NOT skip writing tests
+- When in doubt, make it configurable rather than hardcoded
+
+## 15. Relationship to OpenClaw (Informative Only)
+
+This section is for **context only** — it does NOT affect the code. The core framework is agnostic.
+
+pagefault is designed to work alongside an OpenClaw instance. In Jet's setup:
+
+- **OpenClaw** runs on a Pop-OS workstation (IP 192.168.50.31) with:
+  - Gateway on port 6443 (TLS, trusted-proxy auth behind Hermes SSO)
+  - Two agents: `main` (Cha, personal) and `wocha` (dev/engineering)
+  - LCM (Lossless Context Management) for conversation history compaction/recall
+  - QMD (local memory search) for file-based semantic search
+  - Workspace at `~/.openclaw/workspace/` with `memory/`, `MEMORY.md`, etc.
+  - Self-improving memory at `~/.openclaw/self-improving/`
+
+- **Hermes** provides SSO + reverse proxy for home-lab services on `*.jetd.one`
+  - Issues one-time OTPs and persistent API tokens
+  - Caddy does TLS termination and forwards `X-Hermes-User` after auth
+  - pagefault will sit behind Caddy/Hermes at `pagefault.jetd.one` (or similar)
+
+- **Subagent spawning** via OpenClaw:
+  - CLI: `openclaw agent run --agent wocha --task "..."` (exact command TBD)
+  - HTTP: Gateway API at `https://localhost:6443/api/...` (exact endpoints TBD)
+  - The subagent has full access to LCM, memory search, workspace files, Feishu tools, etc.
+  - This is what makes `deep_retrieve` powerful — it's a real agent, not a search index
+
+All of this is expressed through the YAML config. The server code never imports or references OpenClaw.
