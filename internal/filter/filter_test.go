@@ -11,20 +11,20 @@ import (
 )
 
 func TestPathFilter_AllowEmptyMeansAllowAll(t *testing.T) {
-	pf, err := NewPathFilter(nil, nil)
+	pf, err := NewPathFilter(nil, nil, nil, nil)
 	require.NoError(t, err)
 	assert.True(t, pf.AllowURI("memory://anything.md", nil))
 }
 
 func TestPathFilter_DenyBlocks(t *testing.T) {
-	pf, err := NewPathFilter(nil, []string{"memory://secret/*.md"})
+	pf, err := NewPathFilter(nil, []string{"memory://secret/*.md"}, nil, nil)
 	require.NoError(t, err)
 	assert.False(t, pf.AllowURI("memory://secret/notes.md", nil))
 	assert.True(t, pf.AllowURI("memory://public/notes.md", nil))
 }
 
 func TestPathFilter_AllowAllowlist(t *testing.T) {
-	pf, err := NewPathFilter([]string{"memory://public/**"}, nil)
+	pf, err := NewPathFilter([]string{"memory://public/**"}, nil, nil, nil)
 	require.NoError(t, err)
 	assert.True(t, pf.AllowURI("memory://public/a.md", nil))
 	assert.True(t, pf.AllowURI("memory://public/sub/b.md", nil))
@@ -32,19 +32,19 @@ func TestPathFilter_AllowAllowlist(t *testing.T) {
 }
 
 func TestPathFilter_DenyTrumpsAllow(t *testing.T) {
-	pf, err := NewPathFilter([]string{"memory://**/*.md"}, []string{"memory://secrets/*.md"})
+	pf, err := NewPathFilter([]string{"memory://**/*.md"}, []string{"memory://secrets/*.md"}, nil, nil)
 	require.NoError(t, err)
 	assert.False(t, pf.AllowURI("memory://secrets/x.md", nil))
 	assert.True(t, pf.AllowURI("memory://notes/x.md", nil))
 }
 
 func TestPathFilter_InvalidPattern(t *testing.T) {
-	_, err := NewPathFilter([]string{"[bad"}, nil)
+	_, err := NewPathFilter([]string{"[bad"}, nil, nil, nil)
 	require.Error(t, err)
 }
 
 func TestPathFilter_DoubleStarGlob(t *testing.T) {
-	pf, err := NewPathFilter(nil, []string{"memory://**/secret.md"})
+	pf, err := NewPathFilter(nil, []string{"memory://**/secret.md"}, nil, nil)
 	require.NoError(t, err)
 	assert.False(t, pf.AllowURI("memory://a/b/c/secret.md", nil))
 	assert.True(t, pf.AllowURI("memory://a/b/c/public.md", nil))
@@ -71,7 +71,7 @@ func TestTagFilter_EmptyMeansAllowAll(t *testing.T) {
 }
 
 func TestCompositeFilter_AllAllow(t *testing.T) {
-	pf, _ := NewPathFilter(nil, []string{"memory://secrets/*"})
+	pf, _ := NewPathFilter(nil, []string{"memory://secrets/*"}, nil, nil)
 	tf := NewTagFilter(nil, []string{"intimate"})
 	c := NewCompositeFilter(pf, tf)
 
@@ -80,7 +80,7 @@ func TestCompositeFilter_AllAllow(t *testing.T) {
 }
 
 func TestCompositeFilter_AnyDenyBlocks(t *testing.T) {
-	pf, _ := NewPathFilter(nil, []string{"memory://secrets/*"})
+	pf, _ := NewPathFilter(nil, []string{"memory://secrets/*"}, nil, nil)
 	tf := NewTagFilter(nil, []string{"intimate"})
 	c := NewCompositeFilter(pf, tf)
 
@@ -131,7 +131,7 @@ func TestNewFromConfig_InvalidGlob(t *testing.T) {
 func TestCompositeFilter_UsesCaller(t *testing.T) {
 	// Sanity check that the caller is threaded through without panicking
 	// (Phase 1 filters do not inspect the caller).
-	pf, _ := NewPathFilter(nil, nil)
+	pf, _ := NewPathFilter(nil, nil, nil, nil)
 	c := NewCompositeFilter(pf)
 	caller := &model.Caller{ID: "x", Label: "x"}
 	assert.True(t, c.AllowURI("memory://a", caller))
@@ -224,4 +224,85 @@ func TestNewFromConfig_RedactionInvalidPattern(t *testing.T) {
 	}
 	_, err := NewFromConfig(cfg)
 	require.Error(t, err)
+}
+
+// ───────────── Phase-4 write filter tests ─────────────
+
+func TestPathFilter_AllowWriteURI_FallsBackToReadWhenUnset(t *testing.T) {
+	// No writeAllow/writeDeny → AllowWriteURI delegates to the read
+	// allow/deny pair. Anything the reader can touch, the writer can.
+	pf, err := NewPathFilter(
+		nil,
+		[]string{"memory://secrets/*.md"},
+		nil, nil,
+	)
+	require.NoError(t, err)
+	assert.True(t, pf.AllowWriteURI("memory://notes/a.md", nil))
+	assert.False(t, pf.AllowWriteURI("memory://secrets/x.md", nil))
+}
+
+func TestPathFilter_AllowWriteURI_UsesWriteListWhenSet(t *testing.T) {
+	// When writeAllow is set, the read allowlist is ignored for writes.
+	pf, err := NewPathFilter(
+		[]string{"memory://**/*.md"}, // read: every .md
+		nil,
+		[]string{"memory://memory/*.md"}, // write: only `memory/`
+		nil,
+	)
+	require.NoError(t, err)
+	assert.True(t, pf.AllowURI("memory://random/x.md", nil), "read should be allowed")
+	assert.False(t, pf.AllowWriteURI("memory://random/x.md", nil), "write should be denied")
+	assert.True(t, pf.AllowWriteURI("memory://memory/x.md", nil))
+}
+
+func TestPathFilter_AllowWriteURI_WriteDenyBlocks(t *testing.T) {
+	pf, err := NewPathFilter(
+		nil, nil,
+		nil, []string{"memory://**/secret.md"},
+	)
+	require.NoError(t, err)
+	assert.False(t, pf.AllowWriteURI("memory://a/b/secret.md", nil))
+	assert.True(t, pf.AllowWriteURI("memory://a/b/public.md", nil))
+}
+
+func TestPathFilter_NewPathFilter_InvalidWritePattern(t *testing.T) {
+	_, err := NewPathFilter(nil, nil, []string{"[bad"}, nil)
+	require.Error(t, err)
+}
+
+func TestTagFilter_AllowWriteURIIsPassThrough(t *testing.T) {
+	tf := NewTagFilter(nil, []string{"intimate"})
+	assert.True(t, tf.AllowWriteURI("memory://anything", nil))
+}
+
+func TestRedactionFilter_AllowWriteURIIsPassThrough(t *testing.T) {
+	rf, err := NewRedactionFilter(nil)
+	require.NoError(t, err)
+	assert.True(t, rf.AllowWriteURI("memory://anything", nil))
+}
+
+func TestCompositeFilter_AllowWriteURI_AllAllow(t *testing.T) {
+	pf, _ := NewPathFilter(nil, nil, []string{"memory://notes/*.md"}, nil)
+	tf := NewTagFilter(nil, []string{"intimate"})
+	c := NewCompositeFilter(pf, tf)
+	assert.True(t, c.AllowWriteURI("memory://notes/x.md", nil))
+	assert.False(t, c.AllowWriteURI("memory://other/x.md", nil))
+}
+
+func TestCompositeFilter_AllowWriteURI_EmptyIsPassThrough(t *testing.T) {
+	c := NewCompositeFilter()
+	assert.True(t, c.AllowWriteURI("memory://anything", nil))
+}
+
+func TestNewFromConfig_WriteAllowCompilesPathFilter(t *testing.T) {
+	cfg := config.FiltersConfig{
+		Enabled: true,
+		Path: config.PathFilterConfig{
+			WriteAllow: []string{"memory://memory/*.md"},
+		},
+	}
+	c, err := NewFromConfig(cfg)
+	require.NoError(t, err)
+	assert.True(t, c.AllowWriteURI("memory://memory/today.md", nil))
+	assert.False(t, c.AllowWriteURI("memory://other.md", nil))
 }

@@ -128,6 +128,9 @@ func New(cfg *config.Config, d *dispatcher.ToolDispatcher, authP auth.AuthProvid
 			if d.ToolEnabled("pf_ps") {
 				ar.Post("/pf_ps", restHandler(d, tool.HandleListAgents))
 			}
+			if d.ToolEnabled("pf_poke") {
+				ar.Post("/pf_poke", restHandler(d, tool.HandleWrite))
+			}
 		})
 	})
 
@@ -208,6 +211,7 @@ func (s *Server) handleRoot(w http.ResponseWriter, _ *http.Request) {
 	_, _ = io.WriteString(w, "  POST /api/pf_peek        — peek at a resource by URI\n")
 	_, _ = io.WriteString(w, "  POST /api/pf_fault       — spawn a subagent to answer a query\n")
 	_, _ = io.WriteString(w, "  POST /api/pf_ps          — list configured subagents\n")
+	_, _ = io.WriteString(w, "  POST /api/pf_poke        — poke content back into memory\n")
 }
 
 // ───────────────── REST handler adapter ─────────────────
@@ -251,6 +255,8 @@ func errorStatus(err error) int {
 		errors.Is(err, model.ErrBackendNotFound),
 		errors.Is(err, model.ErrAgentNotFound):
 		return http.StatusNotFound
+	case errors.Is(err, model.ErrContentTooLarge):
+		return http.StatusRequestEntityTooLarge
 	case errors.Is(err, model.ErrBackendUnavailable):
 		return http.StatusBadGateway
 	case errors.Is(err, model.ErrSubagentTimeout):
@@ -281,6 +287,8 @@ func errorCode(err error) string {
 		return "backend_not_found"
 	case errors.Is(err, model.ErrAgentNotFound):
 		return "agent_not_found"
+	case errors.Is(err, model.ErrContentTooLarge):
+		return "content_too_large"
 	case errors.Is(err, model.ErrBackendUnavailable):
 		return "backend_unavailable"
 	case errors.Is(err, model.ErrSubagentTimeout):

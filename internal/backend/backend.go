@@ -81,3 +81,31 @@ type Backend interface {
 type HealthChecker interface {
 	Health(ctx context.Context) error
 }
+
+// WritableBackend is the optional Phase-4 extension that a backend
+// implements to support pf_poke direct-append writes. The dispatcher
+// type-asserts to this interface before routing a write — backends
+// that do not implement it are treated as read-only and writes
+// terminate with [model.ErrAccessViolation].
+//
+// Writable returns true iff the backend's operator explicitly enabled
+// writes in config. A backend that implements the interface but
+// returns Writable() == false is still treated as read-only; this is
+// how the filesystem backend shares a single concrete type between
+// read-only and read-write deployments.
+//
+// Write mutates the resource at uri with the given content. The
+// backend is responsible for enforcing its own write_paths allowlist,
+// write_mode policy, and max_entry_size limit, and for returning one
+// of the standard sentinel errors ([model.ErrAccessViolation],
+// [model.ErrContentTooLarge], [model.ErrInvalidRequest],
+// [model.ErrResourceNotFound]) on violation. On success the method
+// returns the number of bytes written to the underlying resource
+// (which may differ from len(content) when the backend applies an
+// entry template — callers should treat it as "bytes hitting disk",
+// not "bytes accepted from the client").
+type WritableBackend interface {
+	Backend
+	Writable() bool
+	Write(ctx context.Context, uri string, content string) (int, error)
+}

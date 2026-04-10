@@ -4,114 +4,22 @@
 
 ## 0. Development Guide
 
-This section is **required reading** for anyone (human or AI) contributing to pagefault.
+Development conventions, directory tree, build/test commands, "add a
+backend / tool / filter" recipes, versioning rules, and the rules list
+all live in **`CLAUDE.md`** — it is the primary navigation aid for
+contributors (human or AI) and the single source of truth for how the
+codebase is laid out and how work lands. Start there.
 
-### Documentation Requirements
+`plan.md` (this file) is the **product spec and phase roadmap** —
+what exists, what's next, what was deferred, and the design
+rationale behind each piece. It does not duplicate CLAUDE.md's
+per-task recipes.
 
-**README.md** — Always keep up to date. Must contain:
-- One-paragraph description and the pagefault metaphor
-- Quick start (build, configure, run)
-- The 3 most recent changelog entries (synced from CHANGELOG.md)
-- Link to full docs in `docs/`
-
-**CLAUDE.md** — The AI-assistant development guide (like this section, but as a standalone file). Must contain:
-- Quick reference: build commands, test commands, directory tree
-- File-level TLDR for every file in the repo (one line each) — this is the primary navigation aid for agents
-- Architecture overview (condensed from plan.md)
-- Common development tasks (add a backend, add a tool, add a filter)
-- Conventions and rules
-
-**Update CLAUDE.md whenever:**
-- A new file is created or deleted
-- A package's responsibility changes
-- A new development pattern is established
-- The directory tree changes
-
-### Documentation in `docs/`
-
-All non-trivial subsystems get their own doc in `docs/`. Required docs:
-
-| File | Content |
-|------|---------|
-| `docs/api-doc.md` | Full MCP + REST tool reference: every tool's input schema, output schema, error cases, and example request/response. Auto-generated sections are acceptable if kept in sync. |
-| `docs/config-doc.md` | Full YAML config reference: every field, type, default, and description. Group by section (server, auth, backends, contexts, tools, filters, audit). Include at least one complete example per backend type. |
-| `docs/architecture.md` | Architecture deep dive: request flow, backend plugin model, filter pipeline, auth layer, transport details. Diagrams welcome. |
-| `docs/security.md` | Security model: threat model, auth mechanisms, filter behavior, write safety, audit format. |
-
-Update the relevant doc whenever the corresponding code changes. Stale docs are worse than no docs.
-
-### Directory Tree in CLAUDE.md
-
-Maintain a full directory tree with one-line TLDRs in CLAUDE.md. Format:
-
-```
-pagefault/
-├── cmd/pagefault/main.go          # CLI entry point: serve, token subcommands
-├── internal/
-│   ├── server/server.go           # HTTP server: chi router, MCP + REST mounts
-│   ├── config/config.go           # Config structs, YAML loader, env substitution
-│   ... (every file)
-```
-
-This is the **first thing** an agent reads to orient itself. Keep it accurate.
-
-### Versioning and Changelog
-
-- Version is in a `VERSION` file at repo root (single line, e.g., `0.1.0`) and echoed by the binary (`pagefault --version`).
-- **Bump the version before every commit that changes behavior:**
-  - Bug fixes, minor tweaks, small refactors: **patch** bump (e.g., `0.1.0` → `0.1.1`)
-  - New features, new tools, new config fields, new backends: **minor** bump (e.g., `0.1.1` → `0.2.0`)
-  - **Never** bump the major version unless explicitly asked.
-- **Update `CHANGELOG.md`** whenever the version changes. Add an entry under `## X.Y.Z (YYYY-MM-DD)` with `### Added`, `### Changed`, `### Removed`, `### Fixed` subsections as appropriate.
-- **Always document breaking changes**: renamed config fields, removed tools, changed response shapes. Include migration guidance (old → new).
-- **Before bumping the version**, run a full check:
-  1. `make test` passes
-  2. `make lint` passes
-  3. All `.md` files are up to date (README, CLAUDE.md, docs/api-doc.md, docs/config-doc.md, CHANGELOG.md)
-  4. Directory tree in CLAUDE.md matches reality
-  5. Version string in `VERSION` matches the changelog entry
-- **Keep the 3 most recent changelog entries in `README.md`** under a "Recent Changes" section.
-
-### Testing
-
-- **Every phase must have tests before it's considered complete.** No exceptions.
-- Tests live alongside source files (`internal/backend/filesystem_test.go`).
-- **Minimum test coverage per module:**
-  - Config: parse valid YAML, reject invalid YAML, env substitution, default values
-  - Backends: read, search, list, sandbox enforcement, glob matching, error cases
-  - Auth: valid token, invalid token, expired token, missing header, none mode
-  - Filters: allow/deny globs, tag matching, redaction regex, disabled filters pass-through
-  - Tools: input validation, dispatch to correct backend, error formatting
-  - Server: health endpoint, MCP mount responds, REST mount responds, auth middleware rejects
-  - Write: append, format entry, flock behavior, write_paths enforcement, max_entry_size
-- **Integration tests** use `httptest.NewServer` — spin up the full server with a test config, call tools via HTTP, verify responses.
-- **Table-driven tests** preferred (idiomatic Go): `[]struct{ name, input, want }`.
-- **Test data** goes in `testdata/` directories alongside test files. Do not use `/tmp` for test fixtures.
-- Run `make test` before every commit.
-
-### Code Conventions
-
-- **Go style**: `gofmt`, `go vet`, `staticcheck` must pass. Run `make lint`.
-- **Interfaces**: accept interfaces, return concrete structs.
-- **Context**: `context.Context` as first param in all methods that do I/O or could block.
-- **Errors**: use `fmt.Errorf("...: %w", err)` for wrapping. Use sentinel errors (`var ErrX = errors.New(...)`) for programmatic checks. Check with `errors.Is` / `errors.As`.
-- **Logging**: use `log/slog` (structured logging). No `fmt.Println` in library code.
-- **Naming**: Go conventions — `NewFilesystemBackend`, not `CreateFilesystemBackend`. Acronyms are all-caps (`URI`, `HTTP`), not `Uri`, `Http`.
-- **Comments**: Godoc on all exported types and functions. Package-level doc comment in every package.
-- **Commits**: conventional commits (`feat:`, `fix:`, `refactor:`, `docs:`, `test:`, `chore:`). Append `Co-Authored-By:` trailer as appropriate.
-
-### What NOT to Do
-
-- Do NOT import anything from OpenClaw, Hermes, or any deployment-specific package
-- Do NOT hardcode any paths, URLs, IPs, or user identifiers in code
-- Do NOT assume a specific OS, shell, or filesystem layout
-- Do NOT add caching in Phase 1 (YAGNI)
-- Do NOT add streaming responses in Phase 1
-- Do NOT build Docker/systemd/Caddy configs — that's post-deploy infra, not part of the binary
-- Do NOT skip writing tests
-- Do NOT change config schema without updating docs/config-doc.md
-- Do NOT add a tool without updating docs/api-doc.md
-- When in doubt, make it configurable rather than hardcoded
+Two non-negotiables worth restating here because they shape the
+spec below: (1) all behaviour is config-driven — no hardcoded paths,
+URLs, or client-specific logic in core code; and (2) the framework
+stays generic — nothing in `internal/` may import from OpenClaw,
+Hermes, or any deployment-specific package.
 
 ## 1. What Is This
 
@@ -146,21 +54,22 @@ It solves one problem: you have rich, structured memory on one machine (daily no
 │  pagefault server (Go + mcp-go)                   │
 │  ┌──────────┐  ┌───────────────────────────┐     │
 │  │ Auth     │  │ Tool Dispatcher           │     │
-│  │ (bearer  │  │  pf_maps                  │     │
-│  │  /header │  │  pf_load                  │     │
-│  │  /none)  │  │  pf_scan                  │     │
-│  │          │  │  pf_peek                  │     │
-│  │          │  │  pf_fault → subagent      │     │
-│  │          │  │  pf_ps                    │     │
+│  │ (bearer  │  │  pf_maps  pf_peek         │     │
+│  │  /header │  │  pf_load  pf_fault ─► sa  │     │
+│  │  /none)  │  │  pf_scan  pf_ps           │     │
+│  │          │  │  pf_poke  (direct / agent)│     │
 │  └──────────┘  └───────────┬───────────────┘     │
 │                            │                      │
 │  ┌─────────────┐  ┌───────┴────────┐             │
 │  │ Filters     │  │ Backend Registry│             │
 │  │ (allow/deny │  │  filesystem     │             │
-│  │  /redact/   │  │  subprocess     │             │
-│  │  tags)      │  │  http           │             │
-│  │  —optional— │  │  subagent-cli   │             │
-│  └─────────────┘  │  subagent-http  │             │
+│  │  +write_*   │  │  subprocess     │             │
+│  │  /redact/   │  │  http           │             │
+│  │  tags)      │  │  subagent-cli   │             │
+│  │ —optional—  │  │  subagent-http  │             │
+│  └─────────────┘  │  (WritableBackend│             │
+│                   │   implemented by │             │
+│                   │   filesystem)    │             │
 │                    └───────┬────────┘             │
 │                            │                      │
 │  ┌─────────────────────────┴──────────────┐       │
@@ -174,9 +83,13 @@ It solves one problem: you have rich, structured memory on one machine (daily no
 1. Client calls a tool via MCP or REST
 2. Auth layer identifies the caller (token → identity, or trusted header)
 3. Tool dispatcher validates params, resolves which backend(s) to query
-4. **Pre-filter**: path/tag allowlist + denylist check (if enabled)
-5. Backend executes the query (read file, run subprocess, spawn subagent, etc.)
-6. **Post-filter**: content redaction (if enabled)
+4. **Pre-filter**: path/tag allowlist + denylist (read calls use
+   `AllowURI`; `pf_poke` direct mode uses `AllowWriteURI` with
+   write-specific globs falling back to read allow/deny when unset)
+5. Backend executes the query (read file, run subprocess, spawn
+   subagent, or — for `pf_poke` direct — type-assert to
+   `WritableBackend` and call `Write`, which enforces `write_paths`)
+6. **Post-filter**: content redaction (if enabled; read path only)
 7. Audit log entry is written
 8. Result returned to client
 
@@ -446,12 +359,19 @@ Poke content back into memory — the write counterpart to `pf_peek`. Supports t
 }
 ```
 
+> **Note (0.5.1):** `targets_written` is reserved in the response
+> schema but is currently always absent — pagefault forwards the
+> subagent's textual reply via `result` and has no structured way to
+> extract the list of URIs the subagent wrote to. Populating
+> `targets_written` requires the subagent to emit a structured
+> response envelope; that work is deferred to Phase 5.
+
 **Error cases:**
 - Backend is not writable → `403 AccessViolation: backend is read-only`
 - URI not in `write_paths` allowlist → `403 AccessViolation: write path not allowed`
 - Content exceeds `max_entry_size` → `413 ContentTooLarge: entry exceeds max_entry_size`
 - `format: "raw"` but `write_mode` is `"append"` → `400 InvalidRequest: raw format requires write_mode: any`
-- Subagent times out → `504 SubagentTimeout: agent writeback timed out`
+- Subagent times out (agent mode) → `200 OK` with `timed_out: true` in the response envelope — timeouts are flattened into a success envelope so clients can inspect the partial text instead of branching on an error code. Mirrors `pf_fault`. The `504 subagent_timeout` status code is reserved for future use (if pagefault ever wants to hard-fail instead of returning partial results) but is not currently emitted.
 
 ## 6. Configuration Schema
 
@@ -754,55 +674,28 @@ See `CHANGELOG.md` §0.3.0 / §0.3.1 / §0.3.2 for the detailed per-release note
 
 See `CHANGELOG.md` §0.4.0 for the detailed breakdown.
 
-### Phase 4 — Writeback (Read-Write)
+### Phase 4 — Writeback (Read-Write) ✅ (shipped in 0.5.0, bugfix in 0.5.1)
 
-Adding `pf_poke` tool with two modes: direct append and agent writeback.
+`pf_poke` ships as the write counterpart to `pf_peek` — two modes
+(`direct` filesystem append and `agent` subagent delegation) guarded
+by five independent gates (tool enable, server-wide write filter,
+per-backend `Writable()`, per-backend `write_paths`, and
+`max_entry_size`). A new `internal/write` package holds the
+flock-serialised append primitive and the entry-template formatter;
+the filesystem backend implements the optional
+`backend.WritableBackend` interface; the filter pipeline gains
+`AllowWriteURI` with write-specific allow/deny globs; and
+`dispatcher.Write` routes the mutation path (filter → scheme →
+type-assert → call). Agent mode composes a natural-language task and
+delegates through `dispatcher.DeepRetrieve`, flattening timeouts into
+a success envelope with `timed_out: true`. 0.5.1 fixed a bug where
+`max_entry_size` was enforced against the *wrapped* body, silently
+penalising `format: "entry"` callers — the check now runs in the
+tool layer against the raw caller content, as always documented.
 
-**4a. Direct append (filesystem backend write support):**
-
-1. `internal/write/writer.go` — `Writer` interface + `FilesystemWriter` implementation
-   - `Append(ctx, uri, content) error` — atomic append with file locking (`flock`)
-   - `WriteMode` enum: `AppendOnly`, `Any` (append, prepend, overwrite)
-   - Validates URI against `write_paths` allowlist before writing
-   - Enforces `max_entry_size` limit
-   - Uses `os.OpenFile` with `O_APPEND|O_WRONLY` for atomic appends
-2. `internal/write/format.go` — Entry formatting
-   - `FormatEntry(content, format, caller) string` — wraps content as timestamped entry
-   - `"entry"` format: `\n---\n## [HH:MM] via pagefault\n\n{content}\n`
-   - `"raw"` format: content as-is (requires `write_mode: "any"`)
-3. `internal/tool/write.go` — `pf_poke` tool handler for `mode: "direct"`
-4. `internal/backend/filesystem.go` — extend with write support
-   - `Writable() bool`, `WritePaths() []string`, `WriteMode() WriteMode`, `MaxEntrySize() int`
-   - `Write(ctx, uri, content) error` — delegates to `FilesystemWriter`
-5. `internal/config/config.go` — add `Writable`, `WritePaths`, `WriteMode`, `MaxEntrySize`, `FileLocking` fields to `FilesystemBackendConfig`
-6. `internal/filter/filter.go` — extend `PathFilter` with write-specific allowlist (`write_paths`)
-   - Read allowlist and write allowlist are separate (you can read broadly but write narrowly)
-7. `internal/audit/audit.go` — log write operations with content hash (not full content)
-8. Tests: `internal/write/writer_test.go`, `internal/write/format_test.go`, `internal/tool/write_test.go`
-9. Update `configs/openclaw.yaml` with writable filesystem backend config
-10. Update `docs/api-doc.md` with `pf_poke` tool
-11. Update `docs/config-doc.md` with write-related config fields
-12. Update `docs/security.md` with write threat model
-13. Update `CLAUDE.md` directory tree
-14. Version bump + CHANGELOG
-
-**4b. Agent writeback (subagent-assisted):**
-
-1. Extend `internal/tool/write.go` — handle `mode: "agent"`
-   - Compose subagent task: `"A remote agent wants to record the following to memory: '{content}'. Target: {target}. Read the relevant memory files, decide the best location, and write it appropriately. Follow existing file conventions."`
-   - Spawn subagent via `SubagentBackend.Spawn()`
-   - Return subagent's response to the caller
-2. The subagent itself uses its own write capabilities (it has full workspace access, not constrained by pagefault's write_paths). pagefault's `write_paths` only gates the `mode: "direct"` path — agent mode delegates trust to the subagent.
-3. Tests: `internal/tool/write_agent_test.go` with mock subagent backend
-
-**Security considerations for write:**
-- **Default is read-only.** `writable: false` unless explicitly enabled.
-- **Write allowlist is separate from read allowlist.** Even if a backend is writable, only `write_paths` URIs accept writes.
-- **Append-only by default.** `write_mode: "append"` prevents overwrites. `write_mode: "any"` must be explicitly configured.
-- **Size limit.** `max_entry_size` prevents dumping large content.
-- **File locking.** `flock` prevents race conditions when Cha and Claude Code write simultaneously.
-- **Agent mode trusts the subagent.** The subagent has its own write constraints (workspace rules, AGENTS.md). pagefault doesn't re-validate agent writes.
-- **Audit.** Every write is logged (who, what URI, how many bytes, mode).
+See `CHANGELOG.md` §0.5.0 (ship) and §0.5.1 (bugfix + doc drift pass)
+for the detailed breakdowns, and `docs/api-doc.md` §pf_poke for the
+tool reference.
 
 ### Phase 5 — Hardening
 
@@ -890,28 +783,13 @@ What's still open:
    subagent's judgment? Current lean: full trust — the subagent already
    has workspace-level access. Phase 4.
 
-## 14. For Claude Code: How to Start
+## 14. For Contributors: Where to Start
 
-Phases 1, 2, and 3 have shipped — the foundations (filesystem backend, MCP + REST transports, four additional backend types, the six `pf_*` tools, CLI subcommands, auth, path/tag/redaction filters, audit, live OpenAPI spec, opt-in CORS and rate limiting, structured error envelope) all exist in working form. The original step-by-step Phase-1 build order lived here but was removed once it became historical; for *new* work the canonical entry points are:
-
-- **`CLAUDE.md`** — directory tree, build/test commands, per-task recipes ("add a backend / tool / filter"), conventions, and rules. Read this first.
-- **Section 0** of this file — conventions and non-negotiables from the project's early days that still apply.
-- **`CHANGELOG.md`** — per-release history.
-
-### Before writing any code
-
-1. Read **`CLAUDE.md`** top-to-bottom for the current layout and build commands.
-2. Skim **Section 0** of this file for conventions.
-3. Check **`CHANGELOG.md`** for the most recent release notes so you know what just landed.
-4. If anything is ambiguous, ask before guessing. Do NOT introduce any dependency on OpenClaw, Hermes, or any specific infrastructure in the core code — the framework is generic; all specificity goes in config files.
-
-### Style & conventions
-
-See **Section 0 (Development Guide)** above and **`CLAUDE.md` §Conventions**.
-
-### What NOT to do
-
-See **Section 0 (Development Guide)** above and **`CLAUDE.md` §Rules**.
+Phases 1–4 have shipped. For new work, read **`CLAUDE.md`** for the
+directory tree / build commands / per-task recipes, then
+**`CHANGELOG.md`** for what just landed. The phase sections in §10
+above list what each release delivered and where to find the
+detailed notes.
 
 ## 15. Relationship to OpenClaw (Informative Only)
 

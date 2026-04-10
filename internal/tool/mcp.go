@@ -16,8 +16,9 @@ import (
 // dispatcher uses the per-request Caller for filters and audit.
 //
 // Wire names: pf_maps, pf_load, pf_scan, pf_peek (Phase 1); pf_fault,
-// pf_ps (Phase 2). Internal Go names retain their generic form
-// (HandleListContexts, etc.) — see CLAUDE.md for the wire ↔ code map.
+// pf_ps (Phase 2); pf_poke (Phase 4). Internal Go names retain their
+// generic form (HandleListContexts, etc.) — see CLAUDE.md for the
+// wire ↔ code map.
 func RegisterMCP(srv *mcpserver.MCPServer, d *dispatcher.ToolDispatcher) {
 	if d.ToolEnabled("pf_maps") {
 		registerListContexts(srv, d)
@@ -36,6 +37,9 @@ func RegisterMCP(srv *mcpserver.MCPServer, d *dispatcher.ToolDispatcher) {
 	}
 	if d.ToolEnabled("pf_ps") {
 		registerListAgents(srv, d)
+	}
+	if d.ToolEnabled("pf_poke") {
+		registerWrite(srv, d)
 	}
 }
 
@@ -182,6 +186,61 @@ func registerListAgents(srv *mcpserver.MCPServer, d *dispatcher.ToolDispatcher) 
 	srv.AddTool(t, func(ctx context.Context, _ mcppkg.CallToolRequest) (*mcppkg.CallToolResult, error) {
 		caller := auth.CallerFromContext(ctx)
 		out, err := HandleListAgents(ctx, d, ListAgentsInput{}, caller)
+		if err != nil {
+			return toolResultError(err), nil
+		}
+		return toolResultJSON(out)
+	})
+}
+
+// registerWrite wires the pf_poke tool. Two modes:
+//
+//   - mode:"direct" appends content to a URI (filesystem backend).
+//     The backend enforces its own write_paths allowlist, write_mode,
+//     and max_entry_size.
+//   - mode:"agent" hands the content to a subagent that decides where
+//     to persist it. Trust is delegated to the subagent — pagefault
+//     does not re-validate what the agent writes.
+func registerWrite(srv *mcpserver.MCPServer, d *dispatcher.ToolDispatcher) {
+	t := mcppkg.NewTool("pf_poke",
+		mcppkg.WithDescription("Poke content back into memory. mode:\"direct\" appends to a specific URI (filesystem backends only); mode:\"agent\" spawns a subagent to decide where and how to write. The write-side counterpart to pf_peek."),
+		mcppkg.WithString("uri",
+			mcppkg.Description("Target URI for mode:direct (e.g. memory://memory/2026-04-11.md). Ignored in mode:agent."),
+		),
+		mcppkg.WithString("content",
+			mcppkg.Description("Content to persist. Required for both modes."),
+			mcppkg.Required(),
+		),
+		mcppkg.WithString("mode",
+			mcppkg.Description("\"direct\" (append to uri) or \"agent\" (delegate to a subagent)."),
+			mcppkg.Required(),
+		),
+		mcppkg.WithString("format",
+			mcppkg.Description("mode:direct only — \"entry\" (default, wrap as timestamped markdown block) or \"raw\" (append bytes as-is; requires backend write_mode:any)"),
+		),
+		mcppkg.WithString("agent",
+			mcppkg.Description("mode:agent only — subagent id (default: first configured)."),
+		),
+		mcppkg.WithString("target",
+			mcppkg.Description("mode:agent only — a free-form hint for the subagent (e.g. \"auto\", \"daily\", \"long-term\"). Default: auto."),
+		),
+		mcppkg.WithNumber("timeout_seconds",
+			mcppkg.Description("mode:agent only — per-call deadline. Default 120."),
+		),
+	)
+	srv.AddTool(t, func(ctx context.Context, req mcppkg.CallToolRequest) (*mcppkg.CallToolResult, error) {
+		args := req.GetArguments()
+		in := WriteInput{
+			URI:            asString(args["uri"]),
+			Content:        asString(args["content"]),
+			Mode:           asString(args["mode"]),
+			Format:         asString(args["format"]),
+			Agent:          asString(args["agent"]),
+			Target:         asString(args["target"]),
+			TimeoutSeconds: asInt(args["timeout_seconds"]),
+		}
+		caller := auth.CallerFromContext(ctx)
+		out, err := HandleWrite(ctx, d, in, caller)
 		if err != nil {
 			return toolResultError(err), nil
 		}

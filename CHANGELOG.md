@@ -7,6 +7,255 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+## 0.5.1 (2026-04-11)
+
+Post-0.5.0 review pass. One real bug (`max_entry_size` was enforced
+*after* entry-template wrapping, silently penalising `format: "entry"`
+callers by ~40–60 bytes of wrapper overhead and breaking the
+documented "raw and entry share one budget" promise), several
+documentation/example drifts, and a batch of explicit "known
+limitation" notes for issues that don't warrant code changes yet.
+No wire or config schema changes — a `pf_poke` caller who was
+already staying under the cap sees no difference.
+
+### Fixed
+- **`max_entry_size` is now enforced against the raw caller content,
+  not the post-wrap body.** Before 0.5.1, `handleWriteDirect` called
+  `write.FormatEntry` first and then passed the wrapped bytes to
+  `dispatcher.Write` → `FilesystemBackend.Write`, which ran
+  `len(content) > maxEntrySize` against the already-wrapped content.
+  Net effect: a 1960-byte raw payload in `format: "entry"` failed
+  the 2000-byte cap (because the wrapper pushed it to ~2020), even
+  though the 0.5.0 docstring on `model.ErrContentTooLarge` and
+  `docs/security.md` §Write safety both promised the cap was
+  measured on the raw content. The fix:
+  - Added `MaxEntrySize() int` to the `writableBackendAccessor`
+    interface in `internal/tool/write.go`.
+  - `handleWriteDirect` now peeks the backend once, checks
+    `len(in.Content) > be.MaxEntrySize()` **before** calling
+    `FormatEntry`, and returns `ErrContentTooLarge` if over.
+  - `FilesystemBackend.Write` dropped its own `maxEntrySize`
+    check — the backend now exposes the limit via the accessor but
+    does not itself reject oversize writes, because by the time
+    content arrives the raw/wrapped distinction is lost.
+  - `TestHandleWrite_DirectContentTooLarge` rewritten to use a raw
+    payload that exceeds the cap (the old test exploited the wrap
+    overhead — the exact bug this fix removes). New test
+    `TestHandleWrite_DirectContentAtCapSucceeds` guards the
+    regression: a 10-byte raw payload into a 10-byte cap now passes
+    and writes a ~60-byte wrapped entry, as intended.
+  - `TestFilesystem_Write_MaxEntrySize` renamed to
+    `TestFilesystem_Write_MaxEntrySizeNotEnforcedAtBackend` and
+    inverted — it now proves the backend accepts over-cap content
+    and that enforcement moved to the tool layer.
+
+### Changed (docs)
+- **`docs/security.md` §Audit** — corrected the `bytes` field
+  description. The audit log records the bytes passed to the
+  backend (for `format: "entry"` that includes the wrapper), not
+  a pre-wrap "raw content byte count" as 0.5.0 claimed. The
+  enforcement promise is now on `max_entry_size` (raw bytes, tool
+  layer); the audit field is just "bytes on the wire to the
+  backend".
+- **`docs/security.md` §Write safety** — added a "Known limitation"
+  block under *Sandbox for new files* documenting the TOCTOU race
+  between `resolveWritePath`'s symlink check and the subsequent
+  `MkdirAll` + `OpenFile`. Deferred to whenever pagefault grows a
+  multi-tenant deployment story; the single-operator trust model
+  already puts the attacker on the wrong side of the sandbox.
+- **`docs/security.md` §Audit** — added an explicit note that
+  `mode: "agent"` writes surface as `tool: "pf_fault"` in the audit
+  log (because the work is done by `dispatcher.DeepRetrieve`, which
+  emits its own audit entry). Operators auditing *all* writes must
+  scan both `pf_poke` and `pf_fault` rows. Emitting a duplicate
+  `pf_poke` row per agent call was considered but rejected — the
+  underlying action really is a subagent spawn, not a direct write.
+  Revisit when structured subagent responses ship in Phase 5.
+- **`docs/security.md` §Mode: agent** — flagged
+  `targets_written` as "reserved but always absent" until Phase 5
+  ships structured subagent responses.
+- **`docs/api-doc.md` §pf_poke** — same `targets_written`
+  clarification in the mode:agent response section; corrected the
+  Security Notes bullet that claimed the backend enforces
+  `max_entry_size` (it's the tool layer now).
+- **`docs/config-doc.md`** — `write_paths` now explicitly calls out
+  the URI-scheme footgun: unlike `include` (relative paths), these
+  patterns must be full URIs (`memory://notes/*.md`). A scheme-less
+  `notes/*.md` silently matches nothing. Also documented that
+  `max_entry_size: 0` is *not* "unlimited" — `applyWriteDefaults`
+  rewrites it to the 2000-byte safe default whenever `writable:
+  true`; callers who really want no cap must set a very large
+  number.
+- **`plan.md`** — error-case table for `pf_poke` mode:agent now
+  correctly describes timeouts as `200 OK` with `timed_out: true`
+  (matching the `pf_fault` success-envelope pattern), not a `504`.
+  Also added a note that `targets_written` is reserved for Phase 5.
+- **`configs/example.yaml`** — removed the "Phase 4, not yet
+  implemented" comment on `pf_poke`, turned it on by default, and
+  added a commented-out Phase-4 write block on the `fs` backend
+  (with the URI-scheme caveat spelled out inline). The `filters`
+  section gained a commented-out `path.write_allow`/`write_deny`
+  example.
+- **`internal/write/writer.go`** — `WriteModeAny` docstring no
+  longer claims to permit prepend and overwrite. As of 0.5.1 the
+  only observable effect of `any` is unlocking `format: "raw"` on
+  `pf_poke`; prepend and overwrite operations are reserved but
+  not implemented (the `Writer` interface only exposes `Append`).
+  `internal/config/config.go` and `docs/config-doc.md` updated to
+  match.
+- **`internal/model/model.go`** — `ErrContentTooLarge` docstring
+  updated to describe the new enforcement site (tool layer,
+  before wrap) and to point at the handler for the checked bytes.
+
+### Deferred (documented, not fixed)
+- `resolveWritePath` TOCTOU (see §Write safety). Single-operator
+  threat model makes it academic; a real fix needs
+  `openat(O_NOFOLLOW)`.
+- Agent-mode audit gap (appears as `pf_fault`, not `pf_poke`).
+- `targets_written` always absent. Waits on structured subagent
+  responses.
+- Prepend/overwrite under `write_mode: "any"`. Not in Phase 4
+  scope; `Writer` interface would need new methods.
+
+## 0.5.0 (2026-04-11)
+
+Phase 4 — writeback. `pf_poke` ships, the filesystem backend gains
+optional write support behind five independent gates, and the write
+path gets its own filter layer. Every item from `plan.md` §10 Phase 4
+shipped. The bump is minor because Phase 3 clients are unaffected —
+read-only deployments see no behavior change.
+
+### Added
+- **`pf_poke` tool.** The write counterpart to `pf_peek`. Two modes:
+  - **`direct`** — filesystem append. The backend enforces its own
+    `write_paths` allowlist, `write_mode` (append-only vs. any
+    mutation), and `max_entry_size` cap. The tool layer wraps content
+    via `write.FormatEntry` in `format: "entry"` mode (a
+    newline-delimited, horizontal-ruled, timestamped markdown block),
+    or passes it through unchanged in `format: "raw"` mode (which
+    additionally requires `write_mode: "any"` on the target backend
+    as a second-tier opt-in). The raw caller content is measured
+    against `max_entry_size` *before* entry-template wrapping, so
+    `raw` and `entry` share one byte budget.
+  - **`agent`** — delegate to a subagent. Routes through the same
+    `dispatcher.DeepRetrieve` machinery `pf_fault` uses. Composes a
+    natural-language task ("A remote agent (<caller>) wants to record
+    … Target: … Read the relevant memory files, decide the best
+    location, and write it appropriately") and flattens timeouts
+    into a success envelope with `timed_out: true` + partial stdout.
+    **Trust is delegated to the subagent**: pagefault's `write_paths`
+    and `filters.path.write_*` do *not* apply to what the agent
+    writes — see `docs/security.md` §Write safety.
+- **`internal/write` package.** New `Writer` interface plus
+  `FilesystemWriter` with POSIX advisory locking. `Append` takes
+  LOCK_EX via `syscall.Flock` on the open fd, does an
+  `O_APPEND|O_WRONLY|O_CREATE` write, and fsyncs before returning.
+  `file_locking: "none"` falls back to a per-writer mutex for
+  single-writer environments. `FormatEntry` handles the `entry` /
+  `raw` templating with an injectable `Clock` so tests can pin the
+  timestamp.
+- **`backend.WritableBackend` interface.** Optional extension to
+  `Backend` with `Writable() bool` and
+  `Write(ctx, uri, content) (int, error)`. The dispatcher type-asserts
+  to this before routing a write — a backend that does not implement
+  it (or implements it but returns `Writable() == false`) fails the
+  write with `ErrAccessViolation` before any syscall.
+- **`FilesystemBackend` gains write support.** When
+  `writable: true` is set in config, the constructor wires a
+  `FilesystemWriter` and the backend implements `WritableBackend`.
+  `Write` enforces: (a) backend writability, (b) the read
+  `include`/`exclude` filter (writes inherit the read visibility),
+  (c) the per-backend `write_paths` allowlist, (d) `max_entry_size`
+  on the raw content, (e) sandbox-safe path resolution for
+  not-yet-existing leaves via `resolveWritePath`, which walks the
+  parent chain to find the first existing component and verifies
+  its symlink-resolved path stays under `root`. This catches the
+  case where `root/notes` is a symlink to `/etc` and the write is
+  `memory://notes/leak.md` — new-file writes no longer escape the
+  sandbox via a cold-cache parent symlink.
+- **`dispatcher.Write` method.** Server-wide write filter →
+  scheme-based backend lookup → `WritableBackend` type assertion →
+  backend.Write. Audit entries tag `tool: "pf_poke"` with the URI
+  and the raw content byte count (never the content body itself).
+- **`PathFilter` write layer.** `filters.path.write_allow` and
+  `filters.path.write_deny` are Phase-4 additions to
+  `PathFilterConfig`. When at least one is set, writes are checked
+  exclusively against the write pair; when both are empty, writes
+  fall through to the read `allow`/`deny` pair. The `Filter`
+  interface gains an `AllowWriteURI` method; every built-in filter
+  implements it (`TagFilter`/`RedactionFilter` are pass-through).
+- **`FilesystemBackendConfig` write fields.** `Writable`,
+  `WritePaths`, `WriteMode` (`append` / `any`), `MaxEntrySize`,
+  `FileLocking` (`flock` / `none`). `applyWriteDefaults` fills in
+  safe defaults (`append`, 2000 bytes, `flock`) when `Writable` is
+  `true` and the operator omits the rest, so `writable: true` alone
+  is still a safe config.
+- **`ToolsConfig.PfPoke`** — the enable toggle, defaults to enabled.
+- **`model.ErrContentTooLarge` sentinel.** Mapped to HTTP 413 and
+  the stable error code `content_too_large`. Added to the server's
+  `errorCode`/`errorStatus` switches and to the shared error-code
+  table test.
+- **`pf_poke` registered across every transport.** MCP tool schema
+  in `internal/tool/mcp.go`, REST route at `/api/pf_poke` in
+  `internal/server/server.go`, OpenAPI spec in
+  `internal/server/openapi.go` (with new `WriteInput` / `WriteOutput`
+  schemas and a `413 content_too_large` response on every operation),
+  and CLI subcommand `pagefault poke --mode direct|agent
+  [--uri URI] [--format entry|raw] [--agent ID] [--target HINT]
+  [--timeout N] <content...>`. When no positional content is given
+  the CLI reads from stdin, so
+  `echo "fixed auth bug" | pagefault poke --mode direct --uri memory://notes/today.md`
+  works.
+- **Landing page lists `/api/pf_poke`.** `GET /` on the server now
+  mentions the new endpoint.
+
+### Changed
+- **`dispatcher.BackendForURI` exported.** The tool layer's
+  format-raw pre-flight check needs to peek at the backend's
+  `WriteMode` before calling `dispatcher.Write`; exporting
+  `BackendForURI` keeps the scheme-parsing logic in one place.
+- **`api-doc.md` title** bumped to "Phase 1–4"; the "Planned" section
+  no longer lists `pf_poke`. New `pf_poke` section documents both
+  modes with request/response shapes and error cases.
+- **`plan.md` §10 Phase 4** collapsed into a shipped-summary paragraph
+  pointing at this changelog entry. §14 intro updated to reflect
+  "Phases 1, 2, 3, and 4 have shipped".
+- **`docs/security.md` §Write safety rewritten.** Previously a forward
+  reference to Phase 4 — now the canonical write threat model with a
+  five-gate description, entry-template rationale, sandbox-for-new-files
+  explanation, and agent-mode trust delegation. Threat table and
+  deployment checklist pick up write-specific rows.
+- **`docs/architecture.md`** filter pipeline diagram gains a write
+  branch; `internal/write` added to the package map; future phases
+  list updated.
+- **`docs/config-doc.md`** `filesystem` backend section documents
+  every write field with defaults + rationale, and ships a realistic
+  "personal memory write config" example. The `filters` section
+  documents `path.write_allow`/`write_deny` and the read-broadly /
+  write-narrowly pattern. Order-of-operations note lists the new
+  write URI check.
+
+### Tests
+- **Full Phase-4 coverage.** `internal/write/writer_test.go`
+  (happy path, concurrent appends, parent-dir creation, cancelled
+  context, default lock mode); `internal/write/format_test.go`
+  (fixed-clock templating, entry vs. raw, empty-label stripping,
+  trailing newline normalisation); `internal/backend/filesystem_write_test.go`
+  (happy path, read-only rejection, include-vs-write_paths
+  interactions, max_entry_size, path traversal, symlinked-parent
+  escape, accessors); `internal/filter/filter_test.go` (new
+  AllowWriteURI table tests for fallback + write-list + write-deny
+  behavior); `internal/dispatcher/dispatcher_test.go` (writable mock
+  backend + Write happy path + all rejection branches +
+  BackendForURI); `internal/tool/write_test.go` (direct + agent +
+  format raw + filter deny + content too large + entry template);
+  `internal/tool/mcp_test.go` (pf_poke MCP registration +
+  missing-arg paths); `internal/server/server_test.go` (REST
+  `/api/pf_poke` + 413 envelope + OpenAPI includes pf_poke + root
+  landing page mentions pf_poke + ErrContentTooLarge in the shared
+  code-mapping table); `cmd/pagefault/tools_test.go` (runPoke text +
+  JSON + missing URI + empty stdin + read-only backend rejection).
+
 ## 0.4.1 (2026-04-11)
 
 Review-response patch for 0.4.0. Cross-review between an independent

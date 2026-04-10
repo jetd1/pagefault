@@ -360,7 +360,7 @@ func TestDispatcher_Search_UnknownBackend(t *testing.T) {
 
 func TestDispatcher_Search_FilterDeniesResults(t *testing.T) {
 	d, _ := newTestDispatcher(t)
-	pf, err := filter.NewPathFilter(nil, []string{"memory://foo.md"})
+	pf, err := filter.NewPathFilter(nil, []string{"memory://foo.md"}, nil, nil)
 	require.NoError(t, err)
 	d.filter = filter.NewCompositeFilter(pf)
 
@@ -401,7 +401,7 @@ func TestDispatcher_Read_Missing(t *testing.T) {
 
 func TestDispatcher_Read_FilterDeniesURI(t *testing.T) {
 	d, _ := newTestDispatcher(t)
-	pf, err := filter.NewPathFilter(nil, []string{"memory://secret.md"})
+	pf, err := filter.NewPathFilter(nil, []string{"memory://secret.md"}, nil, nil)
 	require.NoError(t, err)
 	d.filter = filter.NewCompositeFilter(pf)
 
@@ -458,4 +458,159 @@ func TestDispatcher_ToolEnabled(t *testing.T) {
 	d, _ := newTestDispatcher(t)
 	assert.True(t, d.ToolEnabled("pf_scan"))
 	assert.False(t, d.ToolEnabled("unknown_tool"))
+}
+
+// ───────────── Phase-4 write tests ─────────────
+
+// writableMockBackend extends mockBackend with a fake WritableBackend
+// implementation. Writes are recorded in written[] instead of touching
+// disk so tests stay fast and hermetic.
+type writableMockBackend struct {
+	mockBackend
+	writable bool
+	written  map[string]string
+	writeErr error
+}
+
+func newWritableMock() *writableMockBackend {
+	return &writableMockBackend{
+		mockBackend: mockBackend{
+			name:      "memory",
+			scheme:    "memory",
+			resources: map[string]*backend.Resource{},
+		},
+		writable: true,
+		written:  map[string]string{},
+	}
+}
+
+func (w *writableMockBackend) Writable() bool { return w.writable }
+func (w *writableMockBackend) Write(_ context.Context, uri, content string) (int, error) {
+	if w.writeErr != nil {
+		return 0, w.writeErr
+	}
+	w.written[uri] = content
+	return len(content), nil
+}
+
+func TestDispatcher_Write_HappyPath(t *testing.T) {
+	wm := newWritableMock()
+	d, err := New(Options{
+		Backends: []backend.Backend{wm},
+		Filter:   filter.NewCompositeFilter(),
+		Audit:    audit.NopLogger{},
+	})
+	require.NoError(t, err)
+
+	res, err := d.Write(context.Background(), "memory://notes/x.md", "hello", model.AnonymousCaller)
+	require.NoError(t, err)
+	assert.Equal(t, "memory://notes/x.md", res.URI)
+	assert.Equal(t, 5, res.BytesWritten)
+	assert.Equal(t, "memory", res.Backend)
+	assert.Equal(t, "hello", wm.written["memory://notes/x.md"])
+}
+
+func TestDispatcher_Write_EmptyURI(t *testing.T) {
+	d, err := New(Options{
+		Backends: []backend.Backend{newWritableMock()},
+		Filter:   filter.NewCompositeFilter(),
+		Audit:    audit.NopLogger{},
+	})
+	require.NoError(t, err)
+
+	_, err = d.Write(context.Background(), "", "x", model.AnonymousCaller)
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, model.ErrInvalidRequest))
+}
+
+func TestDispatcher_Write_UnknownScheme(t *testing.T) {
+	d, err := New(Options{
+		Backends: []backend.Backend{newWritableMock()},
+		Filter:   filter.NewCompositeFilter(),
+		Audit:    audit.NopLogger{},
+	})
+	require.NoError(t, err)
+
+	_, err = d.Write(context.Background(), "other://x.md", "x", model.AnonymousCaller)
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, model.ErrBackendNotFound))
+}
+
+func TestDispatcher_Write_NonWritableBackend(t *testing.T) {
+	// Plain mockBackend does not implement WritableBackend → rejected
+	// as access violation.
+	mb := &mockBackend{name: "memory", scheme: "memory"}
+	d, err := New(Options{
+		Backends: []backend.Backend{mb},
+		Filter:   filter.NewCompositeFilter(),
+		Audit:    audit.NopLogger{},
+	})
+	require.NoError(t, err)
+
+	_, err = d.Write(context.Background(), "memory://x.md", "x", model.AnonymousCaller)
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, model.ErrAccessViolation))
+}
+
+func TestDispatcher_Write_WritableFlagFalse(t *testing.T) {
+	wm := newWritableMock()
+	wm.writable = false // the backend implements the interface but is not enabled
+	d, err := New(Options{
+		Backends: []backend.Backend{wm},
+		Filter:   filter.NewCompositeFilter(),
+		Audit:    audit.NopLogger{},
+	})
+	require.NoError(t, err)
+
+	_, err = d.Write(context.Background(), "memory://x.md", "x", model.AnonymousCaller)
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, model.ErrAccessViolation))
+}
+
+func TestDispatcher_Write_BlockedByFilter(t *testing.T) {
+	wm := newWritableMock()
+	pf, err := filter.NewPathFilter(nil, nil, nil, []string{"memory://**"})
+	require.NoError(t, err)
+	d, err := New(Options{
+		Backends: []backend.Backend{wm},
+		Filter:   filter.NewCompositeFilter(pf),
+		Audit:    audit.NopLogger{},
+	})
+	require.NoError(t, err)
+
+	_, err = d.Write(context.Background(), "memory://x.md", "x", model.AnonymousCaller)
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, model.ErrAccessViolation))
+}
+
+func TestDispatcher_Write_BackendErrorPropagates(t *testing.T) {
+	wm := newWritableMock()
+	wm.writeErr = model.ErrContentTooLarge
+	d, err := New(Options{
+		Backends: []backend.Backend{wm},
+		Filter:   filter.NewCompositeFilter(),
+		Audit:    audit.NopLogger{},
+	})
+	require.NoError(t, err)
+
+	_, err = d.Write(context.Background(), "memory://x.md", "x", model.AnonymousCaller)
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, model.ErrContentTooLarge))
+}
+
+func TestDispatcher_BackendForURI(t *testing.T) {
+	wm := newWritableMock()
+	d, err := New(Options{
+		Backends: []backend.Backend{wm},
+		Filter:   filter.NewCompositeFilter(),
+		Audit:    audit.NopLogger{},
+	})
+	require.NoError(t, err)
+
+	be, err := d.BackendForURI("memory://x.md")
+	require.NoError(t, err)
+	assert.Equal(t, "memory", be.Name())
+
+	_, err = d.BackendForURI("unknown://x")
+	require.Error(t, err)
 }

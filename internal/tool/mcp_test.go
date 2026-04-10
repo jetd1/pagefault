@@ -100,7 +100,7 @@ func textOf(t *testing.T, res *mcppkg.CallToolResult) string {
 
 func TestRegisterMCP_AllToolsRegistered(t *testing.T) {
 	srv := newMCPServerForTest(t)
-	for _, name := range []string{"pf_maps", "pf_load", "pf_scan", "pf_peek", "pf_fault", "pf_ps"} {
+	for _, name := range []string{"pf_maps", "pf_load", "pf_scan", "pf_peek", "pf_fault", "pf_ps", "pf_poke"} {
 		assert.NotNil(t, srv.GetTool(name), "tool %q should be registered", name)
 	}
 }
@@ -295,4 +295,71 @@ func TestRegisterMCP_DeepRetrieve_NoSubagentConfigured(t *testing.T) {
 	res := callTool(t, srv, "pf_fault", map[string]any{"query": "hi"})
 	require.True(t, res.IsError)
 	assert.Contains(t, textOf(t, res), "agent not found")
+}
+
+// ────────────────── pf_poke MCP tests ──────────────────
+
+// newWritableMCPServer wires MCP against a dispatcher with a writable
+// filesystem backend rooted at a tempdir. Used by the pf_poke MCP
+// tests so the handler's argument unmarshaling and direct-mode
+// round-trip are exercised end-to-end.
+func newWritableMCPServer(t *testing.T) *mcpserver.MCPServer {
+	t.Helper()
+	d, _ := newWritableDispatcher(t)
+	srv := mcpserver.NewMCPServer("pagefault-test", "0.0.0",
+		mcpserver.WithToolCapabilities(true),
+	)
+	RegisterMCP(srv, d)
+	return srv
+}
+
+func TestRegisterMCP_Write_DirectSuccess(t *testing.T) {
+	srv := newWritableMCPServer(t)
+	res := callTool(t, srv, "pf_poke", map[string]any{
+		"uri":     "memory://notes/x.md",
+		"content": "hello from mcp",
+		"mode":    "direct",
+	})
+	assert.False(t, res.IsError)
+
+	var out WriteOutput
+	require.NoError(t, json.Unmarshal([]byte(textOf(t, res)), &out))
+	assert.Equal(t, "written", out.Status)
+	assert.Equal(t, "direct", out.Mode)
+	assert.Equal(t, "memory://notes/x.md", out.URI)
+	assert.Positive(t, out.BytesWritten)
+}
+
+func TestRegisterMCP_Write_MissingMode(t *testing.T) {
+	srv := newWritableMCPServer(t)
+	res := callTool(t, srv, "pf_poke", map[string]any{
+		"uri":     "memory://notes/x.md",
+		"content": "x",
+	})
+	require.True(t, res.IsError)
+	assert.Contains(t, textOf(t, res), "mode is required")
+}
+
+func TestRegisterMCP_Write_MissingContent(t *testing.T) {
+	srv := newWritableMCPServer(t)
+	res := callTool(t, srv, "pf_poke", map[string]any{
+		"uri":  "memory://notes/x.md",
+		"mode": "direct",
+	})
+	require.True(t, res.IsError)
+	assert.Contains(t, textOf(t, res), "content is required")
+}
+
+func TestRegisterMCP_Write_DirectReadOnlyBackend(t *testing.T) {
+	// newMCPServerForTest uses the non-writable fakeBackend. A write
+	// against it should surface access_violation through the MCP
+	// result envelope.
+	srv := newMCPServerForTest(t)
+	res := callTool(t, srv, "pf_poke", map[string]any{
+		"uri":     "memory://notes/x.md",
+		"content": "x",
+		"mode":    "direct",
+	})
+	require.True(t, res.IsError)
+	assert.Contains(t, textOf(t, res), "read-only")
 }

@@ -118,6 +118,12 @@ func (b *BackendConfig) UnmarshalYAML(value *yaml.Node) error {
 
 // FilesystemBackendConfig is the configuration for a filesystem backend.
 // It is decoded from BackendConfig.Raw by the filesystem backend constructor.
+//
+// Phase-4 write support: a backend is read-only unless Writable is set.
+// When Writable is true, WritePaths limits which URIs accept writes,
+// WriteMode selects between append-only and full-mutation semantics,
+// MaxEntrySize caps a single write payload, and FileLocking picks the
+// locking strategy (flock vs. none).
 type FilesystemBackendConfig struct {
 	Name      string              `yaml:"name" validate:"required"`
 	Type      string              `yaml:"type" validate:"required,eq=filesystem"`
@@ -127,6 +133,34 @@ type FilesystemBackendConfig struct {
 	URIScheme string              `yaml:"uri_scheme" validate:"required"`
 	AutoTag   map[string][]string `yaml:"auto_tag,omitempty"`
 	Sandbox   bool                `yaml:"sandbox"`
+
+	// ── Write config (all optional; default is read-only) ──
+
+	// Writable switches the backend from read-only to read-write. Every
+	// other write field below is ignored unless this is true.
+	Writable bool `yaml:"writable,omitempty"`
+	// WritePaths is an allowlist of URI glob patterns that accept writes.
+	// If empty and Writable is true, every URI that passes the read
+	// include/exclude filter is also writable — which is rarely what you
+	// want. Prefer specific entries like "memory://memory/20*.md".
+	WritePaths []string `yaml:"write_paths,omitempty"`
+	// WriteMode names the mutation policy. "append" (default) is the
+	// safe mode; "any" is a second-tier operator opt-in whose only
+	// current effect is unlocking pf_poke's format:"raw" (bytes
+	// without the entry-template wrapper). Prepend and overwrite are
+	// reserved for a future phase — setting "any" today does not
+	// enable either operation, it just removes the raw-format gate.
+	WriteMode string `yaml:"write_mode,omitempty" validate:"omitempty,oneof=append any"`
+	// MaxEntrySize caps the size of a single write payload (in bytes)
+	// before entry-template wrapping is applied. Zero means "unlimited"
+	// but applyDefaults sets 2000 for writable backends so the default
+	// is safe.
+	MaxEntrySize int `yaml:"max_entry_size,omitempty"`
+	// FileLocking selects the concurrency-safety strategy: "flock"
+	// (POSIX advisory lock via syscall.Flock, default on writable
+	// backends) or "none" (no locking, acceptable only when pagefault
+	// is the sole writer). Non-writable backends ignore this field.
+	FileLocking string `yaml:"file_locking,omitempty" validate:"omitempty,oneof=flock none"`
 }
 
 // SubprocessBackendConfig configures a generic subprocess-search backend
@@ -277,9 +311,17 @@ type FiltersConfig struct {
 }
 
 // PathFilterConfig configures URI allow/deny globs.
+//
+// Allow/Deny govern every tool; WriteAllow/WriteDeny add a second,
+// write-only layer that stacks on top of each backend's own
+// `write_paths` allowlist. The intent is "read broadly, write
+// narrowly" — a user can read from any memory:// URI but only
+// append to a handful of specific files.
 type PathFilterConfig struct {
-	Allow []string `yaml:"allow,omitempty"`
-	Deny  []string `yaml:"deny,omitempty"`
+	Allow      []string `yaml:"allow,omitempty"`
+	Deny       []string `yaml:"deny,omitempty"`
+	WriteAllow []string `yaml:"write_allow,omitempty"`
+	WriteDeny  []string `yaml:"write_deny,omitempty"`
 }
 
 // TagFilterConfig configures tag allow/deny sets.
@@ -400,7 +442,9 @@ func (c *Config) applyDefaults() {
 
 // DecodeFilesystemBackend extracts a FilesystemBackendConfig from a generic
 // BackendConfig. Returns an error if the type is not "filesystem" or if
-// decoding fails.
+// decoding fails. Write-related defaults are applied here (see
+// applyFilesystemWriteDefaults) so every downstream consumer sees the same
+// effective config regardless of what was written in the YAML.
 func DecodeFilesystemBackend(bc BackendConfig) (*FilesystemBackendConfig, error) {
 	if bc.Type != "filesystem" {
 		return nil, fmt.Errorf("config: backend %q: expected type filesystem, got %q", bc.Name, bc.Type)
@@ -409,11 +453,31 @@ func DecodeFilesystemBackend(bc BackendConfig) (*FilesystemBackendConfig, error)
 	if err := bc.Raw.Decode(&fs); err != nil {
 		return nil, fmt.Errorf("config: backend %q: decode filesystem: %w", bc.Name, err)
 	}
+	fs.applyWriteDefaults()
 	v := validator.New(validator.WithRequiredStructEnabled())
 	if err := v.Struct(&fs); err != nil {
 		return nil, fmt.Errorf("config: backend %q: %w: %s", bc.Name, ErrValidation, err.Error())
 	}
 	return &fs, nil
+}
+
+// applyWriteDefaults fills in Phase-4 write fields. Non-writable backends
+// leave every field at its zero value; writable backends pick up
+// append-only semantics, a 2000-byte entry cap, and flock locking so a
+// config that flips "writable: true" alone is still safe.
+func (fs *FilesystemBackendConfig) applyWriteDefaults() {
+	if !fs.Writable {
+		return
+	}
+	if fs.WriteMode == "" {
+		fs.WriteMode = "append"
+	}
+	if fs.MaxEntrySize <= 0 {
+		fs.MaxEntrySize = 2000
+	}
+	if fs.FileLocking == "" {
+		fs.FileLocking = "flock"
+	}
 }
 
 // DecodeSubprocessBackend extracts a SubprocessBackendConfig from a generic

@@ -145,18 +145,53 @@ backends:
 
 ### `filesystem` backend
 
-| Field        | Type               | Required | Default | Notes |
-|--------------|--------------------|----------|---------|-------|
-| `name`       | string             | yes      | —       | Unique backend identifier. |
-| `type`       | string             | yes      | —       | Must be `filesystem`. |
-| `root`       | path               | yes      | —       | Directory to serve. Resolved to an absolute path at startup. |
-| `include`    | string[]           | no       | all     | Doublestar globs; files must match at least one to be visible. |
-| `exclude`    | string[]           | no       | —       | Globs; files matching any are hidden. |
-| `uri_scheme` | string             | yes      | —       | URI scheme for this backend (e.g. `memory`). |
-| `auto_tag`   | map[string][]string| no       | —       | Path glob → tag list. Tags become resource metadata and are visible to the tag filter. |
-| `sandbox`    | bool               | no       | `false` | If true, reject any file whose resolved path (after symlink resolution) escapes `root`. |
+| Field            | Type                | Required | Default  | Notes |
+|------------------|---------------------|----------|----------|-------|
+| `name`           | string              | yes      | —        | Unique backend identifier. |
+| `type`           | string              | yes      | —        | Must be `filesystem`. |
+| `root`           | path                | yes      | —        | Directory to serve. Resolved to an absolute path at startup. |
+| `include`        | string[]            | no       | all      | Doublestar globs; files must match at least one to be visible. |
+| `exclude`        | string[]            | no       | —        | Globs; files matching any are hidden. |
+| `uri_scheme`     | string              | yes      | —        | URI scheme for this backend (e.g. `memory`). |
+| `auto_tag`       | map[string][]string | no       | —        | Path glob → tag list. Tags become resource metadata and are visible to the tag filter. |
+| `sandbox`        | bool                | no       | `false`  | If true, reject any file whose resolved path (after symlink resolution) escapes `root`. |
+| `writable`       | bool                | no       | `false`  | Phase 4. Set to `true` to enable `pf_poke` against this backend. Every other write field below is ignored when this is false. |
+| `write_paths`    | string[]            | no       | `[]`     | Phase 4. Doublestar URI globs that accept writes. **Patterns must include the URI scheme** (e.g. `memory://memory/*.md`), unlike `include` which matches against relative paths — a scheme-less `notes/*.md` here silently matches nothing. Empty means "every URI that passes `include`", which is rarely what you want. |
+| `write_mode`     | string              | no       | `append` | Phase 4. `append` (default, safest) or `any`. As of 0.5.1 the only observable effect of `any` is unlocking `format: "raw"` on `pf_poke`; prepend and overwrite operations are reserved but not yet implemented. Validated at config load. |
+| `max_entry_size` | int                 | no       | `2000`   | Phase 4. Max bytes per `pf_poke` payload, measured on the **raw caller-supplied content** before entry-template wrapping (so `format: "entry"` and `format: "raw"` share one budget). Enforced by the tool layer, not the backend — see 0.5.1 fix notes. Zero is unused as a sentinel: `applyWriteDefaults` rewrites it to the 2000-byte safe default when `writable: true`, so an explicit `max_entry_size: 0` does not mean "unlimited". Set a very large number if you truly want no effective cap. |
+| `file_locking`   | string              | no       | `flock`  | Phase 4. `flock` takes a POSIX advisory lock (LOCK_EX) around each write, cooperating with other flock-aware writers on the same machine. `none` skips locking and relies on pagefault's per-writer mutex only — single-writer deployments only. |
 
-**Backends do not expose writes yet.** Write support is Phase 4.
+**Writable backends are read-only by default.** `writable: false` is the
+zero value and the safe default. A read-only filesystem backend exposes
+exactly the Phase-1 surface (`pf_peek`, `pf_scan`, `pf_load`) and nothing
+else — `pf_poke` attempts against it terminate with
+`403 access_violation`.
+
+**Sandbox and writes.** When `sandbox: true` is also set (which you
+want), the write path resolver walks up the parent chain of the target
+URI to find the first existing component, resolves its symlinks, and
+refuses the write if the resolved path escapes `root`. This protects
+against a `root/notes → /etc` symlink being used to write
+`memory://notes/leak.md` into `/etc/leak.md`.
+
+**Example — a typical personal memory write config:**
+
+```yaml
+- name: fs
+  type: filesystem
+  root: "/home/jet/.openclaw/workspace"
+  include: ["memory/**/*.md", "MEMORY.md"]
+  uri_scheme: "memory"
+  sandbox: true
+  writable: true
+  write_paths:
+    - "memory://memory/20*.md"    # daily notes
+    - "memory://memory/todos.md"  # todo list
+    - "memory://MEMORY.md"        # long-term memory
+  write_mode: "append"
+  max_entry_size: 2000
+  file_locking: "flock"
+```
 
 ### `subprocess` backend
 
@@ -345,7 +380,9 @@ tools:
   pf_peek:  true    # read a resource by URI
   pf_fault: true    # deep_retrieve — Phase 2, requires a SubagentBackend
   pf_ps:    true    # list_agents  — Phase 2, lists configured subagents
-  pf_poke:  false   # write        — Phase 4, not yet implemented
+  pf_poke:  true    # write        — Phase 4 (shipped 0.5.0); needs a
+                    # writable backend for mode:direct or a subagent
+                    # backend for mode:agent
 ```
 
 `pf_fault` and `pf_ps` are only useful when at least one
@@ -363,10 +400,18 @@ Optional filter pipeline. Can be disabled entirely with `enabled: false`.
 filters:
   enabled: true
   path:
-    allow: []                             # empty = allow all URIs
+    allow: []                             # empty = allow all URIs for reads
     deny:
       - "memory://memory/intimate.md"
       - "self-improving://**/corrections.md"
+    # Phase 4 — write-only allowlist/denylist. When at least one of
+    # these is set, writes are checked exclusively against this pair
+    # (not the read allow/deny above). When both are empty, writes
+    # fall through to the read allow/deny pair.
+    write_allow:
+      - "memory://memory/20*.md"
+      - "memory://memory/todos.md"
+    write_deny: []
   tags:
     allow: []
     deny: ["intimate"]
@@ -382,12 +427,26 @@ filters:
 | Field              | Type                     | Notes |
 |--------------------|--------------------------|-------|
 | `enabled`          | bool                     | Master switch — false turns everything into a pass-through. |
-| `path.allow`       | string[] (glob)          | URI allowlist. Empty = allow all. |
-| `path.deny`        | string[] (glob)          | URI denylist. Deny beats allow. |
+| `path.allow`       | string[] (glob)          | URI read allowlist. Empty = allow all. |
+| `path.deny`        | string[] (glob)          | URI read denylist. Deny beats allow. |
+| `path.write_allow` | string[] (glob)          | Phase 4. URI write allowlist. When set, writes are checked against this list instead of `allow`. |
+| `path.write_deny`  | string[] (glob)          | Phase 4. URI write denylist. |
 | `tags.allow`       | string[]                 | Resources without any matching tag are hidden. |
 | `tags.deny`        | string[]                 | Resources with any matching tag are hidden. |
 | `redaction.enabled`| bool                     | Compiles `rules` into a content filter. Unused rules (with `enabled: false`) are ignored. |
 | `redaction.rules`  | []object                 | Each rule has `pattern` (Go regexp) and `replacement` (supports `$1`/`$2` capture groups). Invalid patterns fail fast at server start. |
+
+**Read broadly, write narrowly.** The canonical reason to set
+`path.write_allow` (or `write_deny`) instead of reusing the read
+lists is so an agent can freely read any memory URI but only write to
+a handful of specific files — e.g., today's daily note and the TODO
+list. When either write list is non-empty, the read `allow`/`deny`
+pair is **ignored** for writes.
+
+This server-wide write filter stacks on top of the backend's own
+`write_paths` allowlist — both must allow a URI for a write to
+proceed. See the `filesystem` backend section above for the
+per-backend write config.
 
 ### Pattern syntax
 
@@ -397,11 +456,14 @@ for tags, and Go `regexp` syntax for redaction rules (`(?i)` inline flag,
 
 ### Order of operations
 
-1. **URI check** (pre-fetch): `path.allow` + `path.deny` — blocked URIs never
+1. **URI check** (pre-fetch, reads): `path.allow` + `path.deny` — blocked URIs never
    hit the backend.
-2. **Tag check** (post-fetch): `tags.allow` + `tags.deny` — applied to
+2. **Write URI check** (pre-write, pf_poke only): `path.write_allow` +
+   `path.write_deny` if set, otherwise `path.allow` + `path.deny`.
+   Runs before the backend's per-backend `write_paths` check.
+3. **Tag check** (post-fetch): `tags.allow` + `tags.deny` — applied to
    resource metadata tags.
-3. **Content transform**: `redaction.rules` — every rule is applied in
+4. **Content transform**: `redaction.rules` — every rule is applied in
    declaration order. The transformed content is what the caller receives
    (no unredacted copy hits the wire).
 

@@ -446,11 +446,152 @@ func TestErrorCodeMapping(t *testing.T) {
 		{model.ErrBackendUnavailable, "backend_unavailable", http.StatusBadGateway},
 		{model.ErrSubagentTimeout, "subagent_timeout", http.StatusGatewayTimeout},
 		{model.ErrRateLimited, "rate_limited", http.StatusTooManyRequests},
+		{model.ErrContentTooLarge, "content_too_large", http.StatusRequestEntityTooLarge},
 	}
 	for _, tc := range cases {
 		assert.Equal(t, tc.wantCode, errorCode(tc.err), "code for %v", tc.err)
 		assert.Equal(t, tc.wantStatus, errorStatus(tc.err), "status for %v", tc.err)
 	}
+}
+
+// ───────────────── pf_poke REST tests ─────────────────
+
+// newWritableTestServer spins up a full pagefault Server with a
+// writable filesystem backend. Used by the pf_poke REST tests.
+func newWritableTestServer(t *testing.T) (*httptest.Server, string) {
+	t.Helper()
+	dir := t.TempDir()
+	fsCfg := &config.FilesystemBackendConfig{
+		Name:         "fs",
+		Type:         "filesystem",
+		Root:         dir,
+		Include:      []string{"**/*.md"},
+		URIScheme:    "memory",
+		Sandbox:      true,
+		Writable:     true,
+		WritePaths:   []string{"memory://notes/*.md"},
+		WriteMode:    "append",
+		MaxEntrySize: 500,
+		FileLocking:  "flock",
+	}
+	fsBackend, err := backend.NewFilesystemBackend(fsCfg)
+	require.NoError(t, err)
+
+	d, err := dispatcher.New(dispatcher.Options{
+		Backends: []backend.Backend{fsBackend},
+		Filter:   filter.NewCompositeFilter(),
+		Audit:    audit.NopLogger{},
+	})
+	require.NoError(t, err)
+
+	cfg := &config.Config{
+		Server: config.ServerConfig{Host: "127.0.0.1", Port: 0},
+		Auth:   config.AuthConfig{Mode: "none"},
+	}
+	provider, err := auth.NewProvider(cfg.Auth)
+	require.NoError(t, err)
+	srv, err := New(cfg, d, provider)
+	require.NoError(t, err)
+	ts := httptest.NewServer(srv.Handler)
+	t.Cleanup(ts.Close)
+	return ts, dir
+}
+
+func TestServer_Write_Direct(t *testing.T) {
+	ts, dir := newWritableTestServer(t)
+	resp, body := post(t, ts, "/api/pf_poke", map[string]any{
+		"uri":     "memory://notes/x.md",
+		"content": "content from rest",
+		"mode":    "direct",
+	}, "")
+	require.Equal(t, http.StatusOK, resp.StatusCode, "body=%s", string(body))
+
+	var out map[string]any
+	require.NoError(t, json.Unmarshal(body, &out))
+	assert.Equal(t, "written", out["status"])
+	assert.Equal(t, "direct", out["mode"])
+	assert.Equal(t, "memory://notes/x.md", out["uri"])
+
+	// Verify the file contents.
+	got, err := os.ReadFile(filepath.Join(dir, "notes/x.md"))
+	require.NoError(t, err)
+	assert.Contains(t, string(got), "content from rest")
+}
+
+func TestServer_Write_DirectMissingContent(t *testing.T) {
+	ts, _ := newWritableTestServer(t)
+	resp, body := post(t, ts, "/api/pf_poke", map[string]any{
+		"uri":  "memory://notes/x.md",
+		"mode": "direct",
+	}, "")
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+
+	var env map[string]any
+	require.NoError(t, json.Unmarshal(body, &env))
+	errObj := env["error"].(map[string]any)
+	assert.Equal(t, "invalid_request", errObj["code"])
+}
+
+func TestServer_Write_ContentTooLarge(t *testing.T) {
+	ts, _ := newWritableTestServer(t)
+
+	// Feed enough content to exceed the 500-byte max_entry_size.
+	big := make([]byte, 600)
+	for i := range big {
+		big[i] = 'x'
+	}
+	resp, body := post(t, ts, "/api/pf_poke", map[string]any{
+		"uri":     "memory://notes/big.md",
+		"content": string(big),
+		"mode":    "direct",
+	}, "")
+	assert.Equal(t, http.StatusRequestEntityTooLarge, resp.StatusCode, "body=%s", string(body))
+
+	var env map[string]any
+	require.NoError(t, json.Unmarshal(body, &env))
+	errObj := env["error"].(map[string]any)
+	assert.Equal(t, "content_too_large", errObj["code"])
+}
+
+func TestServer_Write_ReadOnlyBackend(t *testing.T) {
+	// Default newTestServer uses a read-only backend — pf_poke should
+	// return 403 access_violation.
+	ts, _ := newTestServer(t, "none", "")
+	resp, body := post(t, ts, "/api/pf_poke", map[string]any{
+		"uri":     "memory://notes/x.md",
+		"content": "x",
+		"mode":    "direct",
+	}, "")
+	assert.Equal(t, http.StatusForbidden, resp.StatusCode, "body=%s", string(body))
+
+	var env map[string]any
+	require.NoError(t, json.Unmarshal(body, &env))
+	errObj := env["error"].(map[string]any)
+	assert.Equal(t, "access_violation", errObj["code"])
+}
+
+func TestServer_OpenAPISpec_IncludesPoke(t *testing.T) {
+	ts, _ := newWritableTestServer(t)
+	resp, body := get(t, ts, "/api/openapi.json", "")
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	var spec map[string]any
+	require.NoError(t, json.Unmarshal(body, &spec))
+	paths := spec["paths"].(map[string]any)
+	_, ok := paths["/api/pf_poke"]
+	assert.True(t, ok, "pf_poke path should be in the OpenAPI spec")
+
+	schemas := spec["components"].(map[string]any)["schemas"].(map[string]any)
+	_, hasIn := schemas["WriteInput"]
+	_, hasOut := schemas["WriteOutput"]
+	assert.True(t, hasIn, "WriteInput schema should be defined")
+	assert.True(t, hasOut, "WriteOutput schema should be defined")
+}
+
+func TestServer_Root_Landing_MentionsPoke(t *testing.T) {
+	ts, _ := newTestServer(t, "none", "")
+	resp, body := get(t, ts, "/", "")
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Contains(t, string(body), "/api/pf_poke")
 }
 
 // TestServer_MCP_Initialize verifies the /mcp endpoint accepts the MCP

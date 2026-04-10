@@ -65,4 +65,15 @@ var (
 	// the error envelope matches the shape emitted for every other
 	// rejection.
 	ErrRateLimited = errors.New("rate limited")
+
+	// ErrContentTooLarge indicates a pf_poke write payload exceeded the
+	// target backend's max_entry_size. Mapped to HTTP 413 and code
+	// "content_too_large". The limit is measured against the raw
+	// caller-supplied content (len(in.Content)) before entry-template
+	// wrapping, so format="raw" and format="entry" share the same
+	// budget. The check runs in the pf_poke tool layer — the backend
+	// exposes the cap via its MaxEntrySize accessor but does not
+	// itself enforce it. See internal/tool/write.go's
+	// handleWriteDirect for the enforcement site.
+	ErrContentTooLarge = errors.New("content too large")
 )

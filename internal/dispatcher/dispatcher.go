@@ -516,6 +516,15 @@ func (d *ToolDispatcher) backendForURI(uri string) (backend.Backend, error) {
 	return b, nil
 }
 
+// BackendForURI is the exported form of backendForURI. It lets the
+// tool layer (specifically pf_poke's format:"raw" pre-flight) peek
+// at the backend that owns a URI without duplicating scheme parsing.
+// Callers that only need the generic Backend behaviour should stay on
+// the internal method.
+func (d *ToolDispatcher) BackendForURI(uri string) (backend.Backend, error) {
+	return d.backendForURI(uri)
+}
+
 // ───────────────────── list_agents (pf_ps) ─────────────────────
 
 // AgentSummary is the lightweight shape used by ListAgents. Each entry
@@ -668,6 +677,83 @@ func (d *ToolDispatcher) findSubagent(agentID string) (backend.SubagentBackend, 
 		return nil, "", fmt.Errorf("%w: backend %q has no agents", model.ErrAgentNotFound, firstSub.Name())
 	}
 	return firstSub, agents[0].ID, nil
+}
+
+// ───────────────────── write (pf_poke) ─────────────────────
+
+// WriteResult is the structured response from Write. It carries only
+// the fields pf_poke needs to echo back to the caller — the raw bytes
+// are never part of the response to keep the audit log slim.
+type WriteResult struct {
+	URI          string `json:"uri"`
+	BytesWritten int    `json:"bytes_written"`
+	Backend      string `json:"backend"`
+}
+
+// Write mutates a resource by URI. The content passed in is the final
+// bytes the caller wants appended — any entry-template wrapping must
+// already be applied by the tool layer. The dispatcher is responsible
+// for:
+//
+//  1. Resolving the backend that owns the URI's scheme.
+//  2. Asserting the backend implements [backend.WritableBackend] and
+//     is actually writable (a non-writable backend fails with
+//     [model.ErrAccessViolation]).
+//  3. Running the filter pipeline's AllowWriteURI check (the
+//     server-wide Phase-4 write allowlist).
+//  4. Delegating to the backend's Write method, which enforces the
+//     per-backend `write_paths` allowlist, write_mode rules, and
+//     max_entry_size cap.
+//  5. Emitting an audit entry with tool="pf_poke", sanitized args,
+//     and the bytes-written count (never the content body itself).
+func (d *ToolDispatcher) Write(ctx context.Context, uri string, content string, caller model.Caller) (*WriteResult, error) {
+	start := time.Now()
+
+	var result *WriteResult
+	var err error
+	defer func() {
+		size := 0
+		if result != nil {
+			size = result.BytesWritten
+		}
+		d.auditLog.Log(audit.NewEntry(caller, "pf_poke",
+			map[string]any{"uri": uri, "bytes": len(content)},
+			start, size, err))
+	}()
+
+	if uri == "" {
+		err = fmt.Errorf("%w: uri is required", model.ErrInvalidRequest)
+		return nil, err
+	}
+
+	// Server-wide write allowlist (filters.path.write_allow/write_deny).
+	if !d.filter.AllowWriteURI(uri, &caller) {
+		err = fmt.Errorf("%w: blocked by write filter", model.ErrAccessViolation)
+		return nil, err
+	}
+
+	be, ferr := d.backendForURI(uri)
+	if ferr != nil {
+		err = ferr
+		return nil, err
+	}
+	wb, ok := be.(backend.WritableBackend)
+	if !ok || !wb.Writable() {
+		err = fmt.Errorf("%w: backend %q is read-only", model.ErrAccessViolation, be.Name())
+		return nil, err
+	}
+
+	n, werr := wb.Write(ctx, uri, content)
+	if werr != nil {
+		err = werr
+		return nil, err
+	}
+	result = &WriteResult{
+		URI:          uri,
+		BytesWritten: n,
+		Backend:      be.Name(),
+	}
+	return result, nil
 }
 
 // Close releases dispatcher-owned resources (primarily the audit logger).

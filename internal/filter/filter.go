@@ -37,6 +37,12 @@ type Filter interface {
 	// FilterContent transforms resource content before it is returned to
 	// the caller. Phase-1 filters use this as an identity function.
 	FilterContent(content string, uri string) string
+
+	// AllowWriteURI is the Phase-4 mutation gate. It runs before the
+	// dispatcher calls WritableBackend.Write, giving filters a chance
+	// to refuse a write independently of the read allowlist. Filters
+	// without an opinion on writes return true (pass-through).
+	AllowWriteURI(uri string, caller *model.Caller) bool
 }
 
 // CompositeFilter chains multiple filters. URI and tag checks use AND
@@ -80,6 +86,18 @@ func (c *CompositeFilter) FilterContent(content string, uri string) string {
 	return content
 }
 
+// AllowWriteURI returns true if every child filter allows writing to
+// the URI. Filters without an opinion on writes return true, so a
+// pipeline that configures only read filters is a write pass-through.
+func (c *CompositeFilter) AllowWriteURI(uri string, caller *model.Caller) bool {
+	for _, f := range c.filters {
+		if !f.AllowWriteURI(uri, caller) {
+			return false
+		}
+	}
+	return true
+}
+
 // NewFromConfig builds a CompositeFilter from a FiltersConfig. When disabled
 // it returns an empty pass-through filter.
 func NewFromConfig(cfg config.FiltersConfig) (*CompositeFilter, error) {
@@ -88,8 +106,9 @@ func NewFromConfig(cfg config.FiltersConfig) (*CompositeFilter, error) {
 	}
 	var filters []Filter
 
-	if len(cfg.Path.Allow) > 0 || len(cfg.Path.Deny) > 0 {
-		pf, err := NewPathFilter(cfg.Path.Allow, cfg.Path.Deny)
+	if len(cfg.Path.Allow) > 0 || len(cfg.Path.Deny) > 0 ||
+		len(cfg.Path.WriteAllow) > 0 || len(cfg.Path.WriteDeny) > 0 {
+		pf, err := NewPathFilter(cfg.Path.Allow, cfg.Path.Deny, cfg.Path.WriteAllow, cfg.Path.WriteDeny)
 		if err != nil {
 			return nil, err
 		}
@@ -118,39 +137,43 @@ func NewFromConfig(cfg config.FiltersConfig) (*CompositeFilter, error) {
 //   - allow: if non-empty, the URI must match at least one allow pattern.
 //   - deny:  if any deny pattern matches, the URI is blocked.
 //
+// Phase-4 added a second layer of globs that only apply to mutations
+// (pf_poke): writeAllow/writeDeny. When both pairs are empty, writes
+// fall through to the read allow/deny pair — this keeps the common
+// case ("the only read URI is also the only write URI") from needing
+// a redundant copy of the allow list. When at least one write-glob
+// is configured, writes are checked exclusively against the write
+// pair and ignore allow/deny entirely — "read broadly, write narrowly".
+//
 // Patterns use doublestar syntax (** supported).
 type PathFilter struct {
-	allow []string
-	deny  []string
+	allow      []string
+	deny       []string
+	writeAllow []string
+	writeDeny  []string
 }
 
 // NewPathFilter validates and constructs a PathFilter. Invalid patterns
 // produce an error at construction time.
-func NewPathFilter(allow, deny []string) (*PathFilter, error) {
-	for _, p := range append(append([]string{}, allow...), deny...) {
-		if !doublestar.ValidatePattern(p) {
-			return nil, fmt.Errorf("filter: invalid glob pattern %q", p)
+func NewPathFilter(allow, deny, writeAllow, writeDeny []string) (*PathFilter, error) {
+	for _, group := range [][]string{allow, deny, writeAllow, writeDeny} {
+		for _, p := range group {
+			if !doublestar.ValidatePattern(p) {
+				return nil, fmt.Errorf("filter: invalid glob pattern %q", p)
+			}
 		}
 	}
-	return &PathFilter{allow: allow, deny: deny}, nil
+	return &PathFilter{
+		allow:      allow,
+		deny:       deny,
+		writeAllow: writeAllow,
+		writeDeny:  writeDeny,
+	}, nil
 }
 
 // AllowURI checks the allow/deny globs.
 func (p *PathFilter) AllowURI(uri string, _ *model.Caller) bool {
-	for _, d := range p.deny {
-		if ok, _ := doublestar.Match(d, uri); ok {
-			return false
-		}
-	}
-	if len(p.allow) == 0 {
-		return true
-	}
-	for _, a := range p.allow {
-		if ok, _ := doublestar.Match(a, uri); ok {
-			return true
-		}
-	}
-	return false
+	return matchGlobs(uri, p.allow, p.deny)
 }
 
 // AllowTags is a pass-through for PathFilter.
@@ -158,6 +181,35 @@ func (*PathFilter) AllowTags(string, []string, *model.Caller) bool { return true
 
 // FilterContent is a pass-through for PathFilter.
 func (*PathFilter) FilterContent(content string, _ string) string { return content }
+
+// AllowWriteURI enforces the write-specific allowlist when configured,
+// otherwise delegates to the read allow/deny pair.
+func (p *PathFilter) AllowWriteURI(uri string, _ *model.Caller) bool {
+	if len(p.writeAllow) == 0 && len(p.writeDeny) == 0 {
+		return matchGlobs(uri, p.allow, p.deny)
+	}
+	return matchGlobs(uri, p.writeAllow, p.writeDeny)
+}
+
+// matchGlobs applies a deny-then-allow glob check. An empty allow list
+// means "allow by default"; a non-empty list requires at least one
+// match.
+func matchGlobs(uri string, allow, deny []string) bool {
+	for _, d := range deny {
+		if ok, _ := doublestar.Match(d, uri); ok {
+			return false
+		}
+	}
+	if len(allow) == 0 {
+		return true
+	}
+	for _, a := range allow {
+		if ok, _ := doublestar.Match(a, uri); ok {
+			return true
+		}
+	}
+	return false
+}
 
 // ───────────────────────── TagFilter ─────────────────────────
 
@@ -212,6 +264,10 @@ func (t *TagFilter) AllowTags(_ string, tags []string, _ *model.Caller) bool {
 // FilterContent is a pass-through for TagFilter.
 func (*TagFilter) FilterContent(content string, _ string) string { return content }
 
+// AllowWriteURI is a pass-through for TagFilter — tag checks need the
+// post-read tag set, which is not available before a write.
+func (*TagFilter) AllowWriteURI(string, *model.Caller) bool { return true }
+
 // ───────────────────────── RedactionFilter ─────────────────────────
 
 // RedactionFilter masks content bytes that match any configured regex rule.
@@ -253,6 +309,10 @@ func (*RedactionFilter) AllowURI(string, *model.Caller) bool { return true }
 
 // AllowTags is a pass-through for RedactionFilter.
 func (*RedactionFilter) AllowTags(string, []string, *model.Caller) bool { return true }
+
+// AllowWriteURI is a pass-through for RedactionFilter — redaction is a
+// read-side transform, it has nothing to say about write requests.
+func (*RedactionFilter) AllowWriteURI(string, *model.Caller) bool { return true }
 
 // FilterContent applies every compiled rule in order.
 func (f *RedactionFilter) FilterContent(content string, _ string) string {

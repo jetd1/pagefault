@@ -156,24 +156,163 @@ If the audit log disk fills up, writes will error and the tool call will
 return a `500`. This is intentional — the alternative is losing audit
 coverage silently.
 
-## Write safety (Phase 4+)
+## Write safety (Phase 4, shipped in 0.5.0)
 
-pagefault is **read-only through Phase 1-2**. There is no `pf_poke` tool,
-no writable backend config, and no `write_paths` allowlist. When Phase 4
-lands, the following protections apply:
+pagefault exposes mutations through a single tool — `pf_poke` — and
+every filesystem backend is **read-only by default**. Enabling writes
+is a deliberate opt-in: an operator has to set `writable: true` on a
+specific backend, and even then the tool is gated by two independent
+allowlists plus size and mode caps.
 
-- Backends default to `writable: false`. Turning on writes is explicit.
-- Write allowlist (`write_paths`) is separate from the read allowlist.
-- `write_mode: "append"` by default; `"any"` must be explicitly configured.
-- `format: "entry"` auto-wraps the content with a timestamp header,
-  preventing raw injection into frontmatter.
-- `max_entry_size` caps individual write payloads.
-- `flock` serialises concurrent writers.
-- Agent writeback (`mode: "agent"`) delegates writes to a subagent that
-  runs under its own safety envelope.
-- Every write is audit-logged with before/after metadata.
+**What "default is read-only" means in practice.** With a zero-config
+filesystem backend (the shape `configs/minimal.yaml` ships), every
+`pf_poke` call terminates with `403 access_violation` before any
+file-system syscall is issued. Even if a bug in the filter layer let a
+request through, the backend's `Writable()` check at the top of
+`filesystem.go`'s `Write` method would reject it. The two layers are
+independent by construction.
 
-Do not enable writes without reading this section.
+### Mode: direct (pagefault appends the content)
+
+Five layers gate each direct-append call. A write must pass *all* of
+them to reach the disk:
+
+1. **Tool enable flag.** `tools.pf_poke: false` in config removes the
+   endpoint entirely (no MCP registration, no REST route).
+2. **Server-wide write filter.** `filters.path.write_allow` /
+   `write_deny` (Phase 4 additions to `PathFilter`). When empty, the
+   read allow/deny pair is used as a fallback; when either is set,
+   writes are checked exclusively against the write pair — "read
+   broadly, write narrowly" as a config pattern.
+3. **Backend Writable() flag.** The filesystem backend type-asserts
+   to `WritableBackend`; if `writable: false` (the zero value) the
+   dispatcher rejects before calling into the backend.
+4. **Per-backend write_paths.** A doublestar URI glob list. Empty
+   means "every include-eligible URI", but the canonical config
+   names exact files (`memory://memory/20*.md`, `memory://MEMORY.md`).
+5. **Size + mode caps.** `max_entry_size` is measured on the raw
+   caller content before entry-template wrapping, so `format: "raw"`
+   and `format: "entry"` share the same budget. `write_mode: "any"`
+   is a second-tier opt-in required for `format: "raw"` — the intent
+   is that anyone typing `writable: true` gets entry-template-only
+   semantics for free, and has to explicitly upgrade to raw bytes.
+
+**Entry template.** `format: "entry"` (the default) wraps the content
+as a leading-newline horizontal-rule timestamped block:
+
+```
+\n---\n## [HH:MM] via pagefault (<caller label>)\n\n<content>\n
+```
+
+Two consequences: (a) the block always starts on a fresh line even
+when the existing file has no trailing newline (so injecting a
+header that alters an earlier section isn't possible), and (b) the
+timestamp+label give a short audit trail embedded in the document
+itself. A caller who wants to bypass the template (e.g., to write a
+preamble) has to configure `write_mode: "any"` on the backend *and*
+pass `format: "raw"` on the request — the two-lock design is
+deliberate.
+
+**Sandbox for new files.** Filesystem `sandbox: true` already covers
+existing files via `EvalSymlinks + isUnder`, but new-file writes
+need extra work because the leaf doesn't exist yet at stat time.
+`resolveWritePath` walks up the parent chain of the target, finds
+the first existing component, resolves its symlinks, and refuses
+the write if the resolved path escapes `root`. This means a
+`notes → /etc` parent-directory symlink cannot be used to write
+`memory://notes/leak.md` into `/etc/leak.md` on a cold cache.
+
+> **Known limitation — TOCTOU race on `resolveWritePath`.** The
+> symlink check and the subsequent `MkdirAll` + `OpenFile` are not
+> atomic. An attacker who can mutate the filesystem under `root`
+> between the check and the write can, in principle, swap a vetted
+> parent directory for a symlink pointing outside `root` in the
+> narrow window between the two. Exploiting this requires precise
+> sub-millisecond timing AND local write access to the backend
+> root — which is already the other side of pagefault's trust
+> boundary in the single-operator deployment model (the operator
+> owns the filesystem, per `docs/security.md` §Threat model).
+> A proper fix would need `openat(O_NOFOLLOW)` on every path
+> component; deferred until pagefault has a multi-tenant
+> deployment story.
+
+**Concurrency.** `flock(2)` on the open fd (LOCK_EX) serialises
+writes with any other flock-aware writer on the host — editors,
+the openclaw CLI, a parallel pagefault process. The per-writer
+mutex holds while the file is open so pagefault itself is always
+serialized even when flock is unavailable (`file_locking: "none"`,
+which should only be used in single-writer deployments).
+
+**Audit.** Every `pf_poke` call is logged with:
+
+- Caller id + label (never the token).
+- Tool name `pf_poke`.
+- `uri` + `bytes` (the byte count of the content passed to the
+  backend — for `format: "entry"` this is the wrapped body, ~40–60
+  bytes larger than the raw request). The content body itself is
+  never logged.
+- Duration.
+- `result_size` (bytes that actually hit disk — useful for spotting
+  format=entry overhead; for the filesystem backend this equals
+  `bytes`).
+- Any sentinel error on failure.
+
+> **Agent mode is audited under `tool: "pf_fault"`, not
+> `"pf_poke"`.** Because `mode: "agent"` delegates to the
+> `pf_fault` machinery (via `dispatcher.DeepRetrieve`), the audit
+> entry it produces carries `tool: "pf_fault"` with the composed
+> natural-language task in `args.query` (the task begins with
+> `"A remote agent (<label>) wants to record ..."`). Operators
+> auditing *all* writes must scan both `tool: "pf_poke"` entries
+> (direct mode) and `tool: "pf_fault"` entries whose query begins
+> with that prefix (agent mode). Emitting a duplicate `pf_poke`
+> row for every agent-mode call was considered but rejected for
+> 0.5.1 on the grounds that the underlying action really is a
+> subagent spawn — the `pf_fault` log row is not misleading, it
+> is just insufficient on its own. Revisit once we have
+> structured subagent responses (see §Phase 5).
+
+### Mode: agent (subagent decides where to write)
+
+`mode: "agent"` hands the task to a subagent over the existing
+`pf_fault` machinery. **Critical:** pagefault's `write_paths` and
+`filters.path.write_*` do **not** apply to what the subagent
+writes — they only gate pagefault's *request* (the content + target
+hint passed to the spawn). The subagent has its own workspace
+access, its own conventions, and its own guardrails.
+
+Concretely, this means:
+
+- A `subagent-cli` backend inherits pagefault's file-descriptor and
+  environment posture. The agent process can write anywhere its
+  credentials allow, subject only to whatever sandbox the operator
+  wraps the command template in.
+- A `subagent-http` backend sends the task to a remote endpoint;
+  the remote service is entirely responsible for authorising,
+  validating, and persisting the write. pagefault just forwards.
+- Timeouts still apply (`timeout_seconds`, default 120). On timeout
+  the tool flattens the failure into a `200 OK` envelope with
+  `timed_out: true` and whatever partial stdout the agent produced,
+  matching `pf_fault` semantics — so a caller cannot tell the
+  difference between "agent finished cleanly" and "agent was killed
+  mid-write" without reading the flag.
+- The response envelope's `targets_written` array is **reserved**
+  but **currently always absent**: pagefault forwards the
+  subagent's textual reply via `result` and has no structured way
+  to extract the list of URIs the subagent touched. Clients that
+  want to know what was written must parse `result`, or wait for
+  Phase 5's structured subagent envelope.
+
+**Design rationale.** The plan.md §5.7 rationale is that direct mode
+handles the 80% case (fixed format, known location) and agent mode
+handles the 20% case (needs judgment about where to write, how to
+format, whether to merge with existing content). The trust model
+follows: direct mode is mechanical and sandboxed; agent mode is
+smart and trusted.
+
+Do not enable agent mode writes in environments where you would not
+also enable direct subagent invocation via `pf_fault`. The threat
+surface is identical.
 
 ## Subagent safety (Phase 2+)
 
@@ -236,6 +375,12 @@ run the agent directly, don't give them pagefault access either.
 | Unbounded access via subagent             | Acknowledged: subagents run outside pagefault's sandbox. Treat `pf_fault` callers as users of the configured agent. |
 | Per-caller request floods                 | `server.rate_limit` enforces a per-caller token bucket keyed on `caller.id`; over-budget requests get 429 + `Retry-After`. |
 | Browser cross-origin abuse                | `server.cors` is opt-in with an explicit origin allowlist; disabled by default. |
+| Unauthorized writes (`pf_poke` direct)    | Backends default to `writable: false`; a write must pass the tool enable flag, the server-wide write filter, the backend `Writable()` flag, `write_paths`, and the `max_entry_size` cap — five independent gates. |
+| Write payload dumping                     | `max_entry_size` (default 2000 bytes, measured on raw caller content) caps single-call payloads; oversized writes return 413 `content_too_large`. |
+| Raw-byte injection into file headers      | `format: "entry"` wraps content with a leading newline + horizontal rule + timestamped header; `format: "raw"` is a second-tier opt-in that requires `write_mode: "any"` on the target backend. |
+| Symlinked parent directory escaping root on first write | `resolveWritePath` walks the parent chain, resolves the first existing component's symlinks, and rejects writes whose parent escapes `root`. |
+| Concurrent writers corrupting a file      | `file_locking: "flock"` takes LOCK_EX on the open fd for each write, cooperating with other flock-aware writers on the host. |
+| Agent-mode writes bypassing pagefault's allowlists | **Acknowledged.** Agent mode delegates trust to the subagent — pagefault's `write_paths` do not apply to what the agent writes. Treat `pf_poke` mode:agent callers as users of the configured subagent. |
 
 ## Rate limiting, CORS, and the OpenAPI surface (Phase 3)
 
@@ -272,7 +417,9 @@ bearer gate.
   it for larger corpora.
 - **Subagent sandbox is out of scope.** `pf_fault` runs the configured
   agent with whatever privileges the agent already has. See the
-  "Subagent safety" section above.
+  "Subagent safety" section above. `pf_poke` mode:agent shares the same
+  trust model — the subagent decides what to write and where, pagefault
+  does not re-validate it.
 - **Rate limiting is in-process only.** A single pagefault instance
   honours `server.rate_limit`, but if you run several behind a load
   balancer each one keeps its own buckets. Put a shared limiter at the
@@ -293,6 +440,12 @@ bearer gate.
 - [ ] Filesystem backends have `sandbox: true` and a narrow `root`.
 - [ ] `include` globs scope the visible tree; `exclude` covers the
       obvious secrets (`**/.env`, `**/credentials*`, `**/*token*`).
+- [ ] If a backend needs `writable: true`, `write_paths` is an
+      *explicit* allowlist (never empty), `write_mode` is `append`
+      unless you've thought about raw writes, `max_entry_size` is
+      set, and `file_locking: "flock"`.
+- [ ] `tools.pf_poke: false` on any instance that should stay
+      read-only — belt-and-braces alongside per-backend `writable`.
 - [ ] `filters.enabled: true` unless you have a specific reason.
 - [ ] Audit log path is writable and monitored for disk space.
 - [ ] The service is bound to loopback or to a reverse proxy that adds

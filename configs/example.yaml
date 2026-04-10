@@ -32,7 +32,11 @@ auth:
 backends:
   # (1) Filesystem — the Phase-1 workhorse. Serves markdown files from
   # a directory tree, with include/exclude globs, auto-tagging, and a
-  # sandbox against symlink escapes.
+  # sandbox against symlink escapes. Phase-4 write fields (writable /
+  # write_paths / write_mode / max_entry_size / file_locking) are
+  # commented out below — enable them to unlock `pf_poke` direct-append
+  # writes against this backend. Leaving them off keeps the backend
+  # read-only, which is the safe default.
   - name: fs
     type: filesystem
     root: "./demo-data"
@@ -42,6 +46,17 @@ backends:
     sandbox: true
     auto_tag:
       "**/*.md": ["demo", "markdown"]
+    # ── Phase-4 writeback (opt-in) ───────────────
+    # writable: true
+    # write_paths:
+    #   # IMPORTANT: patterns here must include the URI scheme
+    #   # (memory://...). A scheme-less pattern like `notes/*.md`
+    #   # would silently match nothing. Unlike `include` above,
+    #   # which matches relative paths.
+    #   - "memory://notes/*.md"
+    # write_mode: "append"         # "any" unlocks format:"raw"
+    # max_entry_size: 2000         # raw bytes; entry and raw share one budget
+    # file_locking: "flock"        # or "none" for single-writer deployments
 
   # (2) Subagent (CLI) — spawns an external process for pf_fault. The
   # echo template below is a no-op stand-in so you can exercise pf_ps
@@ -132,12 +147,24 @@ tools:
   pf_peek:  true
   pf_fault: true    # needs at least one subagent backend; sa above satisfies this
   pf_ps:    true
-  # pf_poke: false  # Phase 4, not yet implemented
+  pf_poke:  true    # shipped in 0.5.0; needs a writable backend for mode:direct
+                    # (see the commented-out Phase-4 fields on the `fs` backend
+                    # above) or a subagent backend for mode:agent.
 
 # ── Filters ─────────────────────────────────────
 
 filters:
   enabled: false    # flip to true and add path/tag rules in a real deployment
+  # path:
+  #   allow: ["memory://**"]             # read allowlist
+  #   deny:  ["memory://secrets/**"]     # read denylist
+  #   # Phase-4 write-specific layer. When both write_allow and
+  #   # write_deny are empty, writes fall back to the read allow/deny
+  #   # pair above. Setting either switches writes to use the write
+  #   # pair exclusively — "read broadly, write narrowly". Stacks on
+  #   # top of each backend's own `write_paths` allowlist.
+  #   write_allow: ["memory://notes/*.md"]
+  #   write_deny:  ["memory://notes/secret-*.md"]
 
 # ── Audit ───────────────────────────────────────
 

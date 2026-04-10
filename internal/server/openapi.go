@@ -51,6 +51,10 @@ func buildOpenAPISpec(version, publicURL string, d *dispatcher.ToolDispatcher) m
 		paths["/api/pf_ps"] = pathItem("pf_ps", "List configured subagents.",
 			openapiRef("ListAgentsInput"), openapiRef("ListAgentsOutput"))
 	}
+	if d.ToolEnabled("pf_poke") {
+		paths["/api/pf_poke"] = pathItem("pf_poke", "Poke content back into memory (direct append or agent writeback).",
+			openapiRef("WriteInput"), openapiRef("WriteOutput"))
+	}
 
 	return map[string]any{
 		"openapi": "3.1.0",
@@ -107,6 +111,7 @@ func pathItem(opID, summary string, requestRef, responseRef map[string]any) map[
 				"401": errorResponse("Missing or invalid bearer token"),
 				"403": errorResponse("Request blocked by filter or untrusted proxy"),
 				"404": errorResponse("Unknown context / resource / agent"),
+				"413": errorResponse("Write payload exceeds backend max_entry_size"),
 				"429": errorResponse("Rate limit exceeded"),
 				"502": errorResponse("Backend unreachable"),
 				"504": errorResponse("Subagent timed out"),
@@ -326,6 +331,39 @@ func openapiSchemas() map[string]any {
 				},
 			},
 			"required": []any{"agents"},
+		},
+
+		// pf_poke
+		"WriteInput": map[string]any{
+			"type":        "object",
+			"description": "Write content back to memory. Two modes: direct (append to uri) and agent (delegate to a subagent).",
+			"properties": map[string]any{
+				"uri":             stringProp("Target URI (required for mode:direct)"),
+				"content":         stringProp("Content to persist"),
+				"mode":            stringProp("\"direct\" | \"agent\""),
+				"format":          stringProp("mode:direct only — \"entry\" (default) or \"raw\""),
+				"agent":           stringProp("mode:agent only — subagent id (default: first configured)"),
+				"target":          stringProp("mode:agent only — free-form target hint (\"auto\", \"daily\", \"long-term\", …)"),
+				"timeout_seconds": intProp("mode:agent only — per-call deadline; default 120"),
+			},
+			"required": []any{"content", "mode"},
+		},
+		"WriteOutput": map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"status":          stringProp("\"written\" on success"),
+				"mode":            stringProp("Echoes the input mode (\"direct\" | \"agent\")"),
+				"uri":             stringProp("Target URI (direct mode)"),
+				"bytes_written":   intProp("Bytes that hit disk (direct mode)"),
+				"format":          stringProp("Resolved format (direct mode; \"entry\" or \"raw\")"),
+				"backend":         stringProp("Name of the backend that wrote (direct) or spawned (agent)"),
+				"agent":           stringProp("Agent id (agent mode)"),
+				"elapsed_seconds": map[string]any{"type": "number", "description": "Wall-clock elapsed (agent mode)"},
+				"result":          stringProp("Subagent's textual response (agent mode)"),
+				"targets_written": stringArray("URIs the subagent reports writing (agent mode; may be empty)"),
+				"timed_out":       map[string]any{"type": "boolean", "description": "True if the subagent deadline fired (agent mode)"},
+			},
+			"required": []any{"status", "mode"},
 		},
 	}
 }

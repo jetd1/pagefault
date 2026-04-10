@@ -10,14 +10,16 @@ backing store and resumes execution. pagefault does the same for AI agents:
 when they need context they don't have, they fault to this server, which
 loads the right information from configured backends.
 
-Phases 1–3 ship a Go binary that serves markdown files from a directory,
-answers search via subprocess or HTTP backends, spawns real subagents for
-deep retrieval, and exposes the surface over MCP, REST, and the CLI with
-opt-in rate limiting, CORS, and a live OpenAPI spec. Six tools
-(`pf_maps`, `pf_load`, `pf_scan`, `pf_peek`, `pf_fault`, `pf_ps`),
-bearer-token auth, path/tag/redaction filters, and JSONL audit logging.
-Tool names follow a `pf_*` scheme borrowed from Unix memory management
-and kernel debugging — see `docs/api-doc.md` for the mapping.
+Phases 1–4 ship a Go binary that serves markdown files from a directory,
+answers search via subprocess or HTTP backends, spawns real subagents
+for deep retrieval, writes back through a sandboxed append path or a
+subagent, and exposes the surface over MCP, REST, and the CLI with
+opt-in rate limiting, CORS, and a live OpenAPI spec. Seven tools
+(`pf_maps`, `pf_load`, `pf_scan`, `pf_peek`, `pf_fault`, `pf_ps`,
+`pf_poke`), bearer-token auth, path/tag/redaction filters, and JSONL
+audit logging. Tool names follow a `pf_*` scheme borrowed from Unix
+memory management and kernel debugging — see `docs/api-doc.md` for
+the mapping.
 
 ## Quick start
 
@@ -121,12 +123,78 @@ bash scripts/smoke.sh   # end-to-end smoke test
 ## Documentation
 
 - **`plan.md`** — full product spec and roadmap (source of truth)
-- **`docs/api-doc.md`** — tool reference (Phase 1-2)
+- **`docs/api-doc.md`** — tool reference (Phase 1–4, all seven `pf_*` tools)
 - **`docs/config-doc.md`** — full YAML configuration reference
 - **`docs/architecture.md`** — architecture deep dive
+- **`docs/security.md`** — threat model, auth, filters, audit, write safety
 - **`CLAUDE.md`** — developer guide for AI agents working on this repo
 
 ## Recent Changes
+
+### 0.5.1 — 2026-04-11
+
+- **Bug fix: `max_entry_size` now enforced on raw caller content,
+  not post-wrap bytes.** Before 0.5.1 the cap was measured in the
+  filesystem backend *after* `write.FormatEntry` had added its
+  ~40–60 byte header, silently penalising `format: "entry"` callers
+  by the wrapper overhead and breaking the documented "raw and
+  entry share one budget" promise. The check moved up into
+  `handleWriteDirect` and runs against `len(in.Content)` before
+  wrapping. No wire or config schema changes — only oversize
+  edge-case writes behave differently.
+- **Doc drift cleanups.** `configs/example.yaml` no longer marks
+  `pf_poke` as "not yet implemented"; it enables the tool and
+  ships a commented-out Phase-4 write block on the `fs` backend
+  plus a write-filter example. `docs/config-doc.md` now calls out
+  the `write_paths` URI-scheme footgun (patterns must include
+  `memory://…`) and the `max_entry_size: 0` default-rewrite gotcha.
+  `internal/write/writer.go` clarifies that `WriteModeAny`
+  currently only unlocks `format: "raw"` — prepend and overwrite
+  are reserved for a future phase. `plan.md`'s `pf_poke` error
+  table now correctly describes agent-mode timeouts as
+  `200 OK + timed_out: true` instead of `504`.
+- **New known-limitation notes** in `docs/security.md`: the
+  `resolveWritePath` TOCTOU window (single-operator deployments
+  only; a multi-tenant fix needs `openat(O_NOFOLLOW)`), agent-mode
+  writes showing up in the audit log as `tool: "pf_fault"` rather
+  than `"pf_poke"`, and the response-envelope `targets_written`
+  field being reserved but always absent until structured
+  subagent responses ship in Phase 5.
+
+### 0.5.0 — 2026-04-11
+
+- **Phase 4 ships — `pf_poke`.** Write content back into memory via
+  two modes: `direct` (sandboxed filesystem append) and `agent`
+  (delegate the task to a subagent). Filesystem backends are
+  read-only by default — set `writable: true` plus an explicit
+  `write_paths` allowlist to enable direct writes. Five independent
+  gates protect a direct append: tool enable flag, server-wide
+  `filters.path.write_allow/deny`, backend `Writable()` flag,
+  per-backend `write_paths`, and `max_entry_size`. `flock(2)`
+  serialises concurrent writers.
+- **New `internal/write` package.** `FilesystemWriter` takes LOCK_EX
+  on the open fd and does atomic `O_APPEND|O_CREATE` writes.
+  `FormatEntry` wraps `format: "entry"` payloads as
+  `\n---\n## [HH:MM] via pagefault (<caller>)\n\n<content>\n`;
+  `format: "raw"` appends bytes unchanged but requires
+  `write_mode: "any"` on the target backend (a second-tier opt-in).
+- **`model.ErrContentTooLarge` sentinel.** Mapped to HTTP 413 /
+  code `content_too_large` in the structured REST error envelope.
+  Oversized payloads (measured on the raw caller content before
+  entry-template wrapping) get a clean rejection.
+- **`pf_poke` wired across every transport.** MCP tool registered
+  with full JSON schema, REST route at `/api/pf_poke`, OpenAPI
+  spec gains `WriteInput` / `WriteOutput` schemas + 413 error row,
+  and CLI `pagefault poke --mode direct|agent [--uri URI]
+  <content...>` (with stdin fallback so `echo ... | pagefault poke
+  --mode direct --uri ...` works).
+- **Docs rewritten.** `docs/api-doc.md` gains the full `pf_poke`
+  section, `docs/config-doc.md` documents the filesystem write
+  fields + write filter layer, `docs/security.md` §Write safety is
+  fully rewritten (five-gate model, entry template rationale, agent
+  mode trust delegation, updated threat table + checklist),
+  `docs/architecture.md` gets the write branch in the filter
+  pipeline diagram and `internal/write` in the package map.
 
 ### 0.4.1 — 2026-04-11
 
@@ -147,39 +215,6 @@ bash scripts/smoke.sh   # end-to-end smoke test
   `lastSeen` field dropped from `rateLimiter` with a comment explaining
   why GC is deliberately not implemented yet; MCP `pf_load` description
   now mentions `markdown-with-metadata`.
-
-### 0.4.0 — 2026-04-11
-
-- **Phase 3 ships.** Live `RedactionFilter` (regex content masking with
-  capture groups), JSON and `markdown-with-metadata` context formats
-  for `pf_load`, public `/api/openapi.json` (OpenAPI 3.1.0 generated
-  from the live config), opt-in `server.cors`, per-caller in-process
-  rate limiting via `server.rate_limit`, and richer `/health` output
-  (`ok` / `degraded` / `unavailable` plus per-backend error strings
-  via the new `HealthChecker` interface).
-- **Structured error envelope.** Every REST error is now
-  `{"error":{"code":"invalid_request","status":400,"message":"..."}}`
-  with a stable snake_case `code` field (`rate_limited`,
-  `backend_unavailable`, `agent_not_found`, etc.). **Breaking** for
-  REST clients that parsed the old `{"error","message"}` shape; MCP
-  clients are unaffected.
-- **README client setup guides** for Claude Code, Claude Desktop, and
-  ChatGPT Custom GPT Actions.
-
-### 0.3.2 — 2026-04-10
-
-- **HTTP backend no longer masks operator typos.** A configured
-  `response_path` that isn't present in the response body used to
-  silently return zero results. It now surfaces a wrapped
-  `ErrBackendUnavailable` (→ HTTP 502) naming the missing path, so the
-  caller sees "response path \"results\" not found in response body"
-  instead of empty search results.
-- **`hasAgent` deduplicated** across `subagent_cli.go` and
-  `subagent_http.go` into a single `hasAgentID(agents, id)` helper in
-  `subagent.go`. Behaviour unchanged.
-- **Doc cleanup.** README / CLAUDE.md / api-doc.md references to
-  "Phase 1 / four tools / 0.3.0" updated to reflect the current
-  Phase-1-2 / six-tool / 0.3.2 reality.
 
 See [`CHANGELOG.md`](CHANGELOG.md) for the full history.
 

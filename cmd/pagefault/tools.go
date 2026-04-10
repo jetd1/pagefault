@@ -6,6 +6,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"text/tabwriter"
@@ -382,6 +383,82 @@ func runFault(args []string) error {
 		fmt.Println()
 	}
 	fmt.Fprintf(os.Stderr, "\n(%s/%s, %.1fs)\n", out.Backend, out.Agent, out.ElapsedSeconds)
+	return nil
+}
+
+// ─────────────────── poke (pf_poke) ───────────────────
+
+// runPoke implements `pagefault poke` — the CLI face of pf_poke. It
+// supports both modes: `--mode direct --uri <uri>` appends content
+// directly, `--mode agent` delegates to a subagent. Content is read
+// from the remaining positional args joined with spaces, or from
+// stdin when no positional args are given (so `echo ... | pagefault
+// poke --mode direct --uri memory://x.md` works).
+func runPoke(args []string) error {
+	fs := flag.NewFlagSet("poke", flag.ContinueOnError)
+	configPath, noFilter, asJSON := registerCommonFlags(fs)
+	uri := fs.String("uri", "", "target URI for mode:direct")
+	mode := fs.String("mode", "direct", "write mode: direct | agent")
+	format := fs.String("format", "", "entry template for mode:direct (entry | raw)")
+	agent := fs.String("agent", "", "subagent id for mode:agent (default: first configured)")
+	target := fs.String("target", "", "target hint for mode:agent (default: auto)")
+	timeoutSec := fs.Int("timeout", 120, "per-call deadline in seconds (mode:agent)")
+	if err := parseInterspersed(fs, args); err != nil {
+		return err
+	}
+
+	var content string
+	if fs.NArg() > 0 {
+		content = strings.Join(fs.Args(), " ")
+	} else {
+		// No positional args — read from stdin.
+		buf, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			return fmt.Errorf("read stdin: %w", err)
+		}
+		content = string(buf)
+	}
+	if strings.TrimSpace(content) == "" {
+		return errors.New("usage: pagefault poke --mode direct --uri <uri> <content...>  (or pipe content on stdin)")
+	}
+
+	d, closer, err := loadDispatcherForCLI(*configPath, *noFilter)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = closer() }()
+
+	in := tool.WriteInput{
+		URI:            *uri,
+		Content:        content,
+		Mode:           *mode,
+		Format:         *format,
+		Agent:          *agent,
+		Target:         *target,
+		TimeoutSeconds: *timeoutSec,
+	}
+	out, err := tool.HandleWrite(context.Background(), d, in, cliCaller)
+	if err != nil {
+		return err
+	}
+
+	if *asJSON {
+		return printJSON(out)
+	}
+	switch out.Mode {
+	case "direct":
+		fmt.Printf("%s %s (%d bytes, format=%s, backend=%s)\n",
+			out.Status, out.URI, out.BytesWritten, out.Format, out.Backend)
+	case "agent":
+		if out.TimedOut {
+			fmt.Fprintf(os.Stderr, "(timed out after %.1fs — partial result)\n", out.ElapsedSeconds)
+		}
+		fmt.Print(out.Result)
+		if !strings.HasSuffix(out.Result, "\n") {
+			fmt.Println()
+		}
+		fmt.Fprintf(os.Stderr, "\n(%s/%s, %.1fs)\n", out.Backend, out.Agent, out.ElapsedSeconds)
+	}
 	return nil
 }
 

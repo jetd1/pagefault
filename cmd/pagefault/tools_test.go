@@ -571,6 +571,154 @@ func TestRunPs_Empty(t *testing.T) {
 	assert.Contains(t, out, "no subagents configured")
 }
 
+// ─────────────────── poke (pf_poke) ───────────────────
+
+// writeTestConfigWritable stages a config with a writable filesystem
+// backend. The write_paths allowlist accepts any `memory://notes/*.md`
+// URI.
+func writeTestConfigWritable(t *testing.T, dir string) string {
+	t.Helper()
+	dataDir := filepath.Join(dir, "data")
+	require.NoError(t, os.MkdirAll(dataDir, 0o755))
+
+	yaml := "" +
+		"server:\n" +
+		"  host: \"127.0.0.1\"\n" +
+		"  port: 8444\n" +
+		"auth:\n" +
+		"  mode: \"none\"\n" +
+		"backends:\n" +
+		"  - name: fs\n" +
+		"    type: filesystem\n" +
+		"    root: \"" + dataDir + "\"\n" +
+		"    include: [\"**/*.md\"]\n" +
+		"    uri_scheme: \"memory\"\n" +
+		"    sandbox: true\n" +
+		"    writable: true\n" +
+		"    write_paths: [\"memory://notes/*.md\"]\n" +
+		"    write_mode: \"append\"\n" +
+		"    max_entry_size: 500\n" +
+		"    file_locking: \"flock\"\n" +
+		"contexts: []\n" +
+		"tools:\n" +
+		"  pf_poke: true\n" +
+		"filters:\n" +
+		"  enabled: false\n" +
+		"audit:\n" +
+		"  enabled: false\n"
+
+	cfgPath := filepath.Join(dir, "pagefault.yaml")
+	require.NoError(t, os.WriteFile(cfgPath, []byte(yaml), 0o600))
+	return cfgPath
+}
+
+func TestRunPoke_DirectText(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := writeTestConfigWritable(t, dir)
+
+	out := captureStdout(t, func() {
+		require.NoError(t, runPoke([]string{
+			"--config", cfgPath,
+			"--mode", "direct",
+			"--uri", "memory://notes/today.md",
+			"hello", "from", "cli",
+		}))
+	})
+	assert.Contains(t, out, "written memory://notes/today.md")
+	assert.Contains(t, out, "backend=fs")
+
+	got, err := os.ReadFile(filepath.Join(dir, "data/notes/today.md"))
+	require.NoError(t, err)
+	assert.Contains(t, string(got), "hello from cli")
+}
+
+func TestRunPoke_DirectJSON(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := writeTestConfigWritable(t, dir)
+
+	out := captureStdout(t, func() {
+		require.NoError(t, runPoke([]string{
+			"--config", cfgPath,
+			"--mode", "direct",
+			"--uri", "memory://notes/x.md",
+			"--json",
+			"json body",
+		}))
+	})
+	var decoded tool.WriteOutput
+	require.NoError(t, json.Unmarshal([]byte(out), &decoded))
+	assert.Equal(t, "written", decoded.Status)
+	assert.Equal(t, "direct", decoded.Mode)
+	assert.Equal(t, "memory://notes/x.md", decoded.URI)
+	assert.Equal(t, "fs", decoded.Backend)
+	assert.Positive(t, decoded.BytesWritten)
+}
+
+func TestRunPoke_MissingURIInDirectMode(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := writeTestConfigWritable(t, dir)
+
+	err := runPoke([]string{
+		"--config", cfgPath,
+		"--mode", "direct",
+		"body",
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "uri is required")
+}
+
+func TestRunPoke_NoContent(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := writeTestConfigWritable(t, dir)
+
+	// Empty content and empty stdin → usage error.
+	withStdin(t, "", func() {
+		err := runPoke([]string{
+			"--config", cfgPath,
+			"--mode", "direct",
+			"--uri", "memory://notes/x.md",
+		})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "usage:")
+	})
+}
+
+func TestRunPoke_ReadOnlyBackendRejected(t *testing.T) {
+	dir := t.TempDir()
+	// writeTestConfig sets up a read-only filesystem backend.
+	cfgPath := writeTestConfig(t, dir)
+
+	err := runPoke([]string{
+		"--config", cfgPath,
+		"--mode", "direct",
+		"--uri", "memory://notes/x.md",
+		"body",
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "read-only")
+}
+
+// withStdin swaps os.Stdin to a string-backed pipe for the duration
+// of fn, then restores the original. Used by TestRunPoke_NoContent to
+// exercise the "no positional args → read stdin" branch without
+// blocking on a real terminal.
+func withStdin(t *testing.T, content string, fn func()) {
+	t.Helper()
+	prev := os.Stdin
+	r, w, err := os.Pipe()
+	require.NoError(t, err)
+	defer func() {
+		os.Stdin = prev
+		_ = r.Close()
+	}()
+	os.Stdin = r
+	if content != "" {
+		_, _ = w.WriteString(content)
+	}
+	_ = w.Close()
+	fn()
+}
+
 // ─────────────────── singleLine helper ───────────────────
 
 func TestSingleLine(t *testing.T) {

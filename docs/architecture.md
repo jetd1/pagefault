@@ -58,12 +58,13 @@ MCP and REST.
 | `cmd/pagefault`         | CLI entry point: `serve`, `token`, `--version` |
 | `internal/config`       | YAML schema structs, loader, env substitution, validation |
 | `internal/model`        | Shared types (`Caller`) and sentinel errors |
-| `internal/backend`      | `Backend` / `SubagentBackend` interfaces and five built-in types: `filesystem` (P1), `subprocess`, `http`, `subagent-cli`, `subagent-http` (P2) |
+| `internal/backend`      | `Backend` / `SubagentBackend` / `WritableBackend` interfaces and five built-in types: `filesystem` (P1, P4 write support), `subprocess`, `http`, `subagent-cli`, `subagent-http` (P2) |
 | `internal/auth`         | `AuthProvider` interface, Bearer/None/TrustedHeader, middleware |
-| `internal/filter`       | `Filter` interface, `CompositeFilter`, PathFilter, TagFilter, RedactionFilter (P3) |
+| `internal/filter`       | `Filter` interface, `CompositeFilter`, PathFilter (read + write allowlists), TagFilter, RedactionFilter (P3) |
+| `internal/write`        | `Writer` interface + `FilesystemWriter` (flock + atomic append), entry-format templating — Phase 4 |
 | `internal/audit`        | `Logger` interface, JSONL/stdout/nop sinks, arg sanitization |
-| `internal/dispatcher`   | Central tool router: filter + backend + audit pipeline, markdown / markdown-with-metadata / json context formats |
-| `internal/tool`         | Per-tool Handle\* functions and MCP registrations |
+| `internal/dispatcher`   | Central tool router: filter + backend + audit pipeline, markdown / markdown-with-metadata / json context formats, direct-write routing (P4) |
+| `internal/tool`         | Per-tool Handle\* functions and MCP registrations (including `HandleWrite` for `pf_poke`) |
 | `internal/server`       | chi router, MCP mount, REST adapter, health probes, CORS + rate limit middleware, OpenAPI spec |
 
 ## Request flow
@@ -84,6 +85,7 @@ MCP and REST.
 ## Filter pipeline
 
 ```
+Read path:
 caller → AllowURI  ──(block)──▶ 403 ErrAccessViolation
          │
          ▼
@@ -96,10 +98,20 @@ caller → AllowURI  ──(block)──▶ 403 ErrAccessViolation
          FilterContent   (RedactionFilter; identity when disabled)
          │
          ▼
-         audit.Log
+         audit.Log ──▶ response
+
+Write path (pf_poke direct):
+caller → AllowWriteURI ──(block)──▶ 403 ErrAccessViolation
          │
          ▼
-         response
+         WritableBackend.Write
+           ├── Writable() check
+           ├── write_paths allowlist
+           ├── max_entry_size cap
+           └── resolveWritePath + flock + atomic append
+         │
+         ▼
+         audit.Log ──▶ response
 ```
 
 - **AllowURI** is called before the backend is touched. A denied URI never
@@ -109,6 +121,13 @@ caller → AllowURI  ──(block)──▶ 403 ErrAccessViolation
 - **FilterContent** runs `RedactionFilter` (Phase 3) when rules are
   configured; otherwise it is the identity function. The un-redacted
   copy never leaves the dispatcher.
+- **AllowWriteURI** (Phase 4) is the mutation gate. It's checked
+  *instead of* `AllowURI` on the write path — the PathFilter falls back
+  to the read allow/deny pair when no write-specific globs are
+  configured, so the simple case of "read == write" still works.
+- **WritableBackend.Write** is a type assertion on the backend — if
+  the backend does not implement it, or `Writable()` is false, the
+  dispatcher returns `ErrAccessViolation` before any file-system call.
 
 ## Backend model
 
@@ -123,13 +142,18 @@ type Backend interface {
 }
 ```
 
-**FilesystemBackend** (Phase 1). Responsibilities:
+**FilesystemBackend** (Phase 1 + Phase 4 writes). Responsibilities:
 
 - Map URIs (`memory://foo.md`) to filesystem paths under the configured root
 - Enforce an include/exclude glob filter (doublestar syntax)
-- Enforce a sandbox that rejects symlinks escaping the root
+- Enforce a sandbox that rejects symlinks escaping the root (on
+  reads via `EvalSymlinks`, on writes via `resolveWritePath` which
+  walks the parent chain to find the first existing component)
 - Auto-tag resources by path pattern
 - Serve Read / Search / ListResources
+- When `writable: true`, implement `WritableBackend.Write` — enforce
+  `write_paths`, `write_mode`, and `max_entry_size`, then delegate
+  the atomic append to `internal/write.FilesystemWriter`
 
 Search is naive substring matching (case-insensitive, first match per file).
 It is fast enough for thousands of small markdown files; a future phase can
@@ -221,8 +245,8 @@ The dispatcher owns:
 - `toolsCfg`  — enable/disable flags
 
 Tool handlers in `internal/tool` are thin wrappers over the dispatcher's
-`ListContexts`, `GetContext`, `Search`, `Read`, `DeepRetrieve`, and
-`ListAgents` methods.
+`ListContexts`, `GetContext`, `Search`, `Read`, `DeepRetrieve`,
+`ListAgents`, and `Write` methods.
 
 ## Transport details
 
@@ -237,7 +261,7 @@ Tool handlers in `internal/tool` are thin wrappers over the dispatcher's
 ### MCP
 
 - `mcpserver.NewMCPServer("pagefault", Version, WithToolCapabilities(true))`
-- `tool.RegisterMCP` registers each enabled tool (Phase 1-2) with a JSON-schema
+- `tool.RegisterMCP` registers each enabled tool (Phase 1–4) with a JSON-schema
   input and a handler that re-uses the same `tool.HandleX` functions
 - `mcpserver.NewStreamableHTTPServer(...)` exposes the server as an
   `http.Handler` mounted on `/mcp`
@@ -259,5 +283,5 @@ See `plan.md` §10 for the full roadmap. Short version:
 
 - **Phase 2 (shipped in 0.3.0):** subagent / subprocess / http backends, `pf_fault` (deep retrieval), `pf_ps` (list agents), plus matching CLI subcommands.
 - **Phase 3 (shipped in 0.4.0):** `RedactionFilter`, JSON / markdown-with-metadata context formats, `/api/openapi.json`, opt-in CORS, per-caller rate limiting, `HealthChecker` interface + richer `/health`, structured REST error envelope.
-- **Phase 4:** write support (direct append + agent writeback)
+- **Phase 4 (shipped in 0.5.0):** write support via `pf_poke` — filesystem `WritableBackend` with `write_paths`/`write_mode`/`max_entry_size`/`flock`, direct append via `internal/write`, entry-template formatting, and `mode:"agent"` writeback that delegates to a subagent.
 - **Phase 5:** OAuth2, caching, streaming, metrics

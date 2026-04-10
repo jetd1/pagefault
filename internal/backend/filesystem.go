@@ -15,6 +15,7 @@ import (
 
 	"github.com/jet/pagefault/internal/config"
 	"github.com/jet/pagefault/internal/model"
+	"github.com/jet/pagefault/internal/write"
 )
 
 // FilesystemBackend serves files from a local directory tree. It is the core
@@ -28,7 +29,10 @@ import (
 //   - Simple substring search
 //   - Directory enumeration
 //
-// The backend is read-only in Phase 1. Phase 4 adds write support.
+// Phase 4 added optional write support via the [WritableBackend]
+// interface. Writable, WritePaths, WriteMode, MaxEntrySize, and the
+// embedded writer are only populated when the config flips
+// `writable: true`; read-only deployments leave them at zero value.
 type FilesystemBackend struct {
 	name      string
 	root      string // absolute, symlink-resolved
@@ -37,6 +41,13 @@ type FilesystemBackend struct {
 	uriScheme string
 	autoTag   map[string][]string
 	sandbox   bool
+
+	// writable fields (zero for read-only backends)
+	writable     bool
+	writePaths   []string
+	writeMode    write.WriteMode
+	maxEntrySize int
+	writer       *write.FilesystemWriter
 }
 
 // Health reports the backend as unhealthy if the configured root has
@@ -99,13 +110,18 @@ func NewFilesystemBackend(cfg *config.FilesystemBackendConfig) (*FilesystemBacke
 			return nil, fmt.Errorf("filesystem backend %q: invalid auto_tag pattern %q", cfg.Name, pat)
 		}
 	}
+	for _, g := range cfg.WritePaths {
+		if !doublestar.ValidatePattern(g) {
+			return nil, fmt.Errorf("filesystem backend %q: invalid write_paths pattern %q", cfg.Name, g)
+		}
+	}
 
 	scheme := cfg.URIScheme
 	if scheme == "" {
 		scheme = cfg.Name
 	}
 
-	return &FilesystemBackend{
+	b := &FilesystemBackend{
 		name:      cfg.Name,
 		root:      resolved,
 		include:   cfg.Include,
@@ -113,7 +129,20 @@ func NewFilesystemBackend(cfg *config.FilesystemBackendConfig) (*FilesystemBacke
 		uriScheme: scheme,
 		autoTag:   cfg.AutoTag,
 		sandbox:   cfg.Sandbox,
-	}, nil
+	}
+
+	if cfg.Writable {
+		b.writable = true
+		b.writePaths = cfg.WritePaths
+		b.writeMode = write.WriteMode(cfg.WriteMode)
+		if b.writeMode == "" {
+			b.writeMode = write.WriteModeAppend
+		}
+		b.maxEntrySize = cfg.MaxEntrySize
+		b.writer = write.NewFilesystemWriter(write.LockMode(cfg.FileLocking))
+	}
+
+	return b, nil
 }
 
 // Name returns the configured backend name.
@@ -504,5 +533,132 @@ func SliceLines(content string, fromLine, toLine int) string {
 	return strings.Join(lines[fromLine-1:toLine], "\n")
 }
 
+// ───────────────────────── write support (Phase 4) ─────────────────────────
+
+// Writable reports whether this backend accepts Write calls. Backends
+// configured with writable: false return false; the pf_poke dispatcher
+// uses this to short-circuit with an access-violation error before
+// touching any files.
+func (b *FilesystemBackend) Writable() bool { return b.writable }
+
+// WritePaths returns the configured write-path glob allowlist. May be
+// empty, in which case every readable URI is considered writable (the
+// operator's decision — the default config sets explicit patterns).
+func (b *FilesystemBackend) WritePaths() []string { return b.writePaths }
+
+// WriteMode returns the configured write mode ("append" or "any").
+func (b *FilesystemBackend) WriteMode() string { return string(b.writeMode) }
+
+// MaxEntrySize returns the per-write byte cap. Zero means "unlimited"
+// but [config.FilesystemBackendConfig.applyWriteDefaults] sets a
+// safe default (2000) when Writable is enabled.
+func (b *FilesystemBackend) MaxEntrySize() int { return b.maxEntrySize }
+
+// Write appends content to the file identified by uri, enforcing the
+// write_paths allowlist and the include/exclude read filter (so writes
+// can never create a file the backend would refuse to read back).
+//
+// Note: max_entry_size is enforced by the *caller* (the pf_poke tool
+// layer in [internal/tool.HandleWrite]) against the raw caller
+// content, BEFORE entry-template wrapping — see the
+// [model.ErrContentTooLarge] docstring. The backend exposes the limit
+// via [MaxEntrySize] for the tool layer to consult, but does not
+// re-check it here, because by the time content arrives it has
+// already been wrapped and the raw/wrapped distinction is lost.
+//
+// The caller is responsible for formatting content (entry template vs
+// raw) — this method just writes bytes. It returns the number of
+// bytes that hit disk.
+func (b *FilesystemBackend) Write(ctx context.Context, uri string, content string) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	if !b.writable {
+		return 0, fmt.Errorf("%w: backend %q is read-only", model.ErrAccessViolation, b.name)
+	}
+
+	rel, err := b.relPathFromURI(uri)
+	if err != nil {
+		return 0, err
+	}
+	// Writes obey the read include/exclude filter too — a file we
+	// wouldn't read should not magically appear via write.
+	if !b.matchesInclude(rel) {
+		return 0, fmt.Errorf("%w: %q not in include set", model.ErrAccessViolation, uri)
+	}
+	// Write-specific allowlist. Empty == "every readable URI", same as
+	// `include` behaves on reads.
+	if !b.matchesWritePaths(uri) {
+		return 0, fmt.Errorf("%w: %q not in write_paths", model.ErrAccessViolation, uri)
+	}
+
+	abs, err := b.resolveWritePath(rel)
+	if err != nil {
+		return 0, err
+	}
+	if b.writer == nil {
+		// Defensive — Writable is true but writer is nil should never
+		// happen because NewFilesystemBackend constructs it together.
+		return 0, fmt.Errorf("filesystem backend %q: writer not initialized", b.name)
+	}
+	return b.writer.Append(ctx, abs, content)
+}
+
+// matchesWritePaths reports whether uri passes the write_paths
+// allowlist. An empty list means "no restriction beyond include".
+func (b *FilesystemBackend) matchesWritePaths(uri string) bool {
+	if len(b.writePaths) == 0 {
+		return true
+	}
+	for _, pat := range b.writePaths {
+		if ok, _ := doublestar.Match(pat, uri); ok {
+			return true
+		}
+	}
+	return false
+}
+
+// resolveWritePath is like resolvePath but tolerates a non-existent
+// leaf (needed for file creation). It walks up the parent chain to
+// find the first existing component and verifies that its
+// symlink-resolved path is still under root, protecting against an
+// attacker-placed parent symlink that would otherwise escape the
+// sandbox on MkdirAll.
+func (b *FilesystemBackend) resolveWritePath(rel string) (string, error) {
+	joined := filepath.Join(b.root, filepath.FromSlash(rel))
+	clean := filepath.Clean(joined)
+	if b.sandbox && !isUnder(clean, b.root) {
+		return "", fmt.Errorf("%w: path %q escapes root", model.ErrAccessViolation, rel)
+	}
+	if !b.sandbox {
+		return clean, nil
+	}
+
+	// Walk up from the leaf until we find the first existing
+	// component; that's the one we symlink-resolve.
+	probe := clean
+	for {
+		if _, err := os.Lstat(probe); err == nil {
+			resolved, rerr := filepath.EvalSymlinks(probe)
+			if rerr != nil {
+				return "", fmt.Errorf("filesystem backend %q: resolve %q: %w", b.name, probe, rerr)
+			}
+			if !isUnder(resolved, b.root) {
+				return "", fmt.Errorf("%w: symlink %q escapes root", model.ErrAccessViolation, probe)
+			}
+			return clean, nil
+		}
+		parent := filepath.Dir(probe)
+		if parent == probe {
+			return clean, nil
+		}
+		probe = parent
+	}
+}
+
 // Ensure FilesystemBackend satisfies the Backend interface at compile time.
 var _ Backend = (*FilesystemBackend)(nil)
+
+// Ensure FilesystemBackend also satisfies WritableBackend. Callers
+// type-assert to WritableBackend; the check runs at compile time.
+var _ WritableBackend = (*FilesystemBackend)(nil)

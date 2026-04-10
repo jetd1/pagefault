@@ -51,8 +51,8 @@ pagefault/
 │       ├── serve_test.go                 # buildDispatcher tests (minimal, unsupported, full Phase-2 stack)
 │       ├── token.go                      # `token create/ls/revoke` subcommands
 │       ├── token_test.go                 # Token CLI: lifecycle, slugify, maskToken, list/resolve
-│       ├── tools.go                      # `maps`/`load`/`scan`/`peek`/`fault`/`ps` — CLI form of the pf_* tools
-│       └── tools_test.go                 # Tool CLI tests: text/JSON/env/cwd fallback/no-filter/audit redirect/fault/ps
+│       ├── tools.go                      # `maps`/`load`/`scan`/`peek`/`fault`/`ps`/`poke` — CLI form of the pf_* tools
+│       └── tools_test.go                 # Tool CLI tests: text/JSON/env/cwd fallback/no-filter/audit redirect/fault/ps/poke
 │
 ├── internal/
 │   ├── config/
@@ -63,9 +63,10 @@ pagefault/
 │   │   └── model.go                      # Shared types (Caller) and sentinel errors
 │   │
 │   ├── backend/
-│   │   ├── backend.go                    # Backend interface + Resource/SearchResult/ResourceInfo
-│   │   ├── filesystem.go                 # FilesystemBackend: glob, sandbox, auto-tag, search
-│   │   ├── filesystem_test.go            # Filesystem backend tests (21 cases)
+│   │   ├── backend.go                    # Backend / HealthChecker / WritableBackend interfaces + Resource/SearchResult/ResourceInfo
+│   │   ├── filesystem.go                 # FilesystemBackend: glob, sandbox, auto-tag, search, Phase-4 write path
+│   │   ├── filesystem_test.go            # Filesystem backend read-path tests
+│   │   ├── filesystem_write_test.go      # Filesystem backend write-path tests (Phase 4)
 │   │   ├── http_helpers.go               # Shared template/JSON-path helpers (renderTemplate/walkPath/…)
 │   │   ├── http_helpers_test.go          # Helper unit tests (walkPath edge cases, extractResponse variants)
 │   │   ├── subagent.go                   # SubagentBackend interface + AgentInfo
@@ -89,16 +90,22 @@ pagefault/
 │   │   └── auth_test.go                  # Auth provider + middleware + token gen tests
 │   │
 │   ├── filter/
-│   │   ├── filter.go                     # CompositeFilter, PathFilter, TagFilter
-│   │   └── filter_test.go                # Filter allow/deny/composite tests
+│   │   ├── filter.go                     # CompositeFilter, PathFilter (read + Phase-4 write globs), TagFilter, RedactionFilter
+│   │   └── filter_test.go                # Filter allow/deny/composite/AllowWriteURI tests
+│   │
+│   ├── write/
+│   │   ├── writer.go                     # Writer interface + FilesystemWriter (flock, atomic append) — Phase 4
+│   │   ├── writer_test.go                # FilesystemWriter happy-path + concurrency + cancel tests
+│   │   ├── format.go                     # FormatEntry (entry / raw templating) — Phase 4
+│   │   └── format_test.go                # FormatEntry tests (fixed clock, templating edge cases)
 │   │
 │   ├── audit/
 │   │   ├── audit.go                      # JSONL/Stdout/Nop loggers, SanitizeArgs, NewEntry
 │   │   └── audit_test.go                 # Audit logger tests (incl. concurrent writes)
 │   │
 │   ├── dispatcher/
-│   │   ├── dispatcher.go                 # ToolDispatcher: routes tool calls, filter+audit pipeline
-│   │   ├── dispatcher_test.go            # Dispatcher tests with mock backend
+│   │   ├── dispatcher.go                 # ToolDispatcher: routes tool calls (read + write), filter+audit pipeline
+│   │   ├── dispatcher_test.go            # Dispatcher tests with mock backend (incl. writable mock + Write)
 │   │   └── subagent_test.go              # ListAgents + DeepRetrieve tests (mockSubagent)
 │   │
 │   ├── tool/
@@ -109,10 +116,12 @@ pagefault/
 │   │   ├── read.go                       # HandleRead pure function (wire: pf_peek)
 │   │   ├── deep_retrieve.go              # HandleDeepRetrieve pure function (wire: pf_fault)
 │   │   ├── list_agents.go                # HandleListAgents pure function (wire: pf_ps)
+│   │   ├── write.go                      # HandleWrite pure function (wire: pf_poke) — Phase 4
 │   │   ├── mcp.go                        # RegisterMCP: wires pure handlers to mcp-go
 │   │   ├── tool_test.go                  # Pure handler tests
 │   │   ├── deep_retrieve_test.go         # pf_fault handler tests (stubSubagent)
-│   │   └── mcp_test.go                   # MCP registration + toolResult helper tests
+│   │   ├── write_test.go                 # pf_poke direct/agent handler tests — Phase 4
+│   │   └── mcp_test.go                   # MCP registration + toolResult helper tests (incl. pf_poke)
 │   │
 │   └── server/
 │       ├── server.go                     # chi router, MCP mount, REST adapter, /health, structured error envelope
@@ -128,10 +137,10 @@ pagefault/
 │   └── example.yaml                      # Tour of every backend type with inline docs
 │
 ├── docs/
-│   ├── api-doc.md                        # Tool reference (Phase 1–3)
-│   ├── config-doc.md                     # Full YAML config reference
+│   ├── api-doc.md                        # Tool reference (Phase 1–4)
+│   ├── config-doc.md                     # Full YAML config reference (incl. Phase-4 write fields)
 │   ├── architecture.md                   # Architecture deep dive
-│   └── security.md                       # Threat model, auth, filters, audit, rate limit, CORS
+│   └── security.md                       # Threat model, auth, filters, audit, rate limit, CORS, write safety
 │
 ├── demo-data/
 │   ├── README.md                         # Sample content for minimal.yaml
@@ -159,11 +168,12 @@ Client → chi router → auth middleware → tool handler → dispatcher
 
 **Key abstractions:**
 
-- **Backend** — data source plugin interface (`internal/backend/backend.go`). Ships five types: `filesystem` (Phase 1), `subprocess`, `http`, `subagent-cli`, `subagent-http` (Phase 2). `SubagentBackend` extends `Backend` with `Spawn`/`ListAgents` for `pf_fault` and `pf_ps`.
+- **Backend** — data source plugin interface (`internal/backend/backend.go`). Ships five types: `filesystem` (Phase 1, Phase-4 write support), `subprocess`, `http`, `subagent-cli`, `subagent-http` (Phase 2). `SubagentBackend` extends `Backend` with `Spawn`/`ListAgents` for `pf_fault` and `pf_ps`. `WritableBackend` is an optional Phase-4 extension implemented by `FilesystemBackend` when `writable: true`.
 - **Context** — named, pre-composed bundle of backend resources (YAML-defined).
-- **Filter** — optional path/tag/redaction filter. Can be fully disabled.
+- **Filter** — optional path/tag/redaction filter. Can be fully disabled. Phase-4 added `AllowWriteURI` for the write path.
 - **Auth** — bearer token, trusted header, or none.
 - **Dispatcher** — central tool router. Holds backends + contexts + filters + audit logger.
+- **Writer** — `internal/write.FilesystemWriter` is the flock-serialised atomic-append primitive behind `pf_poke` mode:direct.
 - **Tools** — pure `HandleX` functions (`internal/tool/*.go`); the server package wraps them for REST and `tool.RegisterMCP` wraps them for mcp-go.
 
 ## Tool Naming
@@ -183,9 +193,7 @@ for developer clarity; the CLI uses bare verbs because the outer
 | `pf_peek`              | `peek`              | `HandleRead`             | `read.go`                  | 1     |
 | `pf_fault`             | `fault`             | `HandleDeepRetrieve`     | `deep_retrieve.go`         | 2     |
 | `pf_ps`                | `ps`                | `HandleListAgents`       | `list_agents.go`           | 2     |
-| `pf_poke`              | `poke` *            | `HandleWrite` *          | `write.go` *               | 4     |
-
-(*) Planned — not implemented yet.
+| `pf_poke`              | `poke`              | `HandleWrite`            | `write.go`                 | 4     |
 
 The wire name is authoritative for: MCP tool registration, REST routes
 (`/api/{wire_name}`), the `tools:` section of the YAML config, and the

@@ -303,6 +303,116 @@ func TestDecodeFilesystemBackend_WrongType(t *testing.T) {
 	assert.Contains(t, err.Error(), "expected type filesystem")
 }
 
+// ───────────── FilesystemBackend Phase-4 write defaults ─────────────
+
+func TestDecodeFilesystemBackend_WriteDefaults(t *testing.T) {
+	yaml := `
+server:
+  host: "127.0.0.1"
+  port: 8444
+auth:
+  mode: "none"
+backends:
+  - name: fs
+    type: filesystem
+    root: "/tmp"
+    include: ["**/*.md"]
+    uri_scheme: "memory"
+    sandbox: true
+    writable: true
+    write_paths: ["memory://memory/*.md"]
+`
+	cfg, err := Parse([]byte(yaml))
+	require.NoError(t, err)
+
+	fs, err := DecodeFilesystemBackend(cfg.Backends[0])
+	require.NoError(t, err)
+	assert.True(t, fs.Writable)
+	// Unset write_mode/max_entry_size/file_locking → defaults filled in.
+	assert.Equal(t, "append", fs.WriteMode)
+	assert.Equal(t, 2000, fs.MaxEntrySize)
+	assert.Equal(t, "flock", fs.FileLocking)
+	assert.Equal(t, []string{"memory://memory/*.md"}, fs.WritePaths)
+}
+
+func TestDecodeFilesystemBackend_WriteDefaultsSkippedWhenReadOnly(t *testing.T) {
+	// Read-only backend: write fields should stay at zero value even
+	// though applyWriteDefaults runs.
+	cfg, err := Parse([]byte(minimalYAML))
+	require.NoError(t, err)
+	fs, err := DecodeFilesystemBackend(cfg.Backends[0])
+	require.NoError(t, err)
+	assert.False(t, fs.Writable)
+	assert.Equal(t, "", fs.WriteMode)
+	assert.Equal(t, 0, fs.MaxEntrySize)
+	assert.Equal(t, "", fs.FileLocking)
+}
+
+func TestDecodeFilesystemBackend_WriteExplicitOverrides(t *testing.T) {
+	yaml := `
+server:
+  host: "127.0.0.1"
+  port: 8444
+auth:
+  mode: "none"
+backends:
+  - name: fs
+    type: filesystem
+    root: "/tmp"
+    include: ["**/*.md"]
+    uri_scheme: "memory"
+    sandbox: true
+    writable: true
+    write_mode: "any"
+    max_entry_size: 10
+    file_locking: "none"
+`
+	cfg, err := Parse([]byte(yaml))
+	require.NoError(t, err)
+	fs, err := DecodeFilesystemBackend(cfg.Backends[0])
+	require.NoError(t, err)
+	assert.Equal(t, "any", fs.WriteMode)
+	assert.Equal(t, 10, fs.MaxEntrySize)
+	assert.Equal(t, "none", fs.FileLocking)
+}
+
+func TestDecodeFilesystemBackend_InvalidWriteMode(t *testing.T) {
+	yaml := `
+server:
+  host: "127.0.0.1"
+  port: 8444
+auth:
+  mode: "none"
+backends:
+  - name: fs
+    type: filesystem
+    root: "/tmp"
+    include: ["**/*.md"]
+    uri_scheme: "memory"
+    sandbox: true
+    writable: true
+    write_mode: "delete_everything"
+`
+	cfg, err := Parse([]byte(yaml))
+	require.NoError(t, err)
+	_, err = DecodeFilesystemBackend(cfg.Backends[0])
+	require.Error(t, err, "invalid write_mode should fail validation")
+}
+
+func TestToolsConfig_PfPokeEnabled(t *testing.T) {
+	// Not set → default enabled.
+	var tc ToolsConfig
+	assert.True(t, tc.Enabled("pf_poke"))
+	// Explicitly disabled → disabled.
+	f := false
+	tc = ToolsConfig{PfPoke: &f}
+	assert.False(t, tc.Enabled("pf_poke"))
+	// Explicitly enabled → enabled.
+	tr := true
+	tc = ToolsConfig{PfPoke: &tr}
+	assert.True(t, tc.Enabled("pf_poke"))
+}
+
 // parseSingleBackend is a test helper that parses a minimal config
 // containing a single non-filesystem backend defined by the caller's
 // YAML snippet. The helper adds the server/auth/filesystem scaffolding
