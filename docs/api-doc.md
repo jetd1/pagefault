@@ -11,6 +11,94 @@ pagefault exposes its tools over two transports:
 Both transports dispatch to the same handler, so the inputs and outputs are
 identical.
 
+## Tool naming
+
+pagefault tools use a `pf_` prefix and borrow vocabulary from Unix memory
+management / kernel debugging. The short Phase-1 table:
+
+| Wire name  | What it does                                    | Metaphor                         |
+|------------|-------------------------------------------------|----------------------------------|
+| `pf_maps`  | List pre-composed memory regions (contexts)     | `/proc/<pid>/maps`               |
+| `pf_load`  | Load a region into working memory               | Page swap-in                     |
+| `pf_scan`  | Scan backends for content matching a query     | `kswapd`-style page scan         |
+| `pf_peek`  | Read a specific resource (optionally sliced)    | Debugger `PEEKDATA`              |
+
+Later phases add `pf_fault` (deep retrieval — triggers a real subagent),
+`pf_ps` (list configured subagents), and `pf_poke` (writeback, paired with
+`pf_peek`). See `plan.md` for the full roadmap.
+
+## CLI
+
+Every tool is also available as a subcommand of the `pagefault` binary,
+so you can drive it locally without starting the HTTP server. The CLI
+form drops the `pf_` prefix (the outer `pagefault` binary already
+provides the namespace):
+
+```
+pagefault maps                 — list configured memory regions
+pagefault load <name>          — load an assembled region to stdout
+pagefault scan <query...>      — scan backends for a query
+pagefault peek <uri>           — read a resource by URI
+```
+
+**Common flags** (accepted by all four):
+
+| Flag              | Default  | Notes                                                      |
+|-------------------|----------|------------------------------------------------------------|
+| `--config <path>` | see below | path to `pagefault.yaml`                                  |
+| `--no-filter`     | off      | bypass the filter pipeline (operator escape hatch)         |
+| `--json`          | off      | emit machine-readable JSON instead of tabwriter/raw text   |
+
+**Per-command flags:**
+
+- `load`: `--format markdown|json` (overrides the context's configured format)
+- `scan`: `--limit N` (default 10), `--backends a,b` (comma-separated names to restrict to)
+- `peek`: `--from N`, `--to N` (1-indexed, inclusive line range)
+
+**Config lookup order:**
+
+1. explicit `--config <path>` flag
+2. `$PAGEFAULT_CONFIG` environment variable
+3. `./pagefault.yaml` in the current directory
+
+If none resolve to a readable file, the command exits non-zero with a
+clear error.
+
+**Semantics shared with HTTP:**
+
+- Same dispatcher, same `HandleX` functions, so the CLI sees exactly
+  what an MCP client would see — filter pipeline, audit logging, and
+  error mapping are identical.
+- Filters apply by default. `--no-filter` is the explicit operator
+  override when you need to inspect something the filters are hiding.
+- Every CLI call is audit-logged (caller identity is `cli` / `pagefault
+  CLI`). If `audit.mode: stdout` is set in the config, CLI invocations
+  rewrite it to `stderr` so the data stream stays pipe-clean.
+- Positional arguments can appear anywhere on the command line; a local
+  flag-hoisting helper means `pagefault peek memory://foo.md --from 5`
+  works the same as `pagefault peek --from 5 memory://foo.md`.
+
+**Examples:**
+
+```bash
+# List what's configured
+pagefault maps --config pagefault.yaml
+
+# Assemble a context as markdown
+pagefault load demo --config pagefault.yaml
+
+# Search, restricted to one backend, JSON for piping
+pagefault scan "memory leak" --config pagefault.yaml --backends fs --json \
+  | jq -r '.results[].uri'
+
+# Read lines 10-20 of a file
+pagefault peek memory://notes/2026-04-10.md --config pagefault.yaml --from 10 --to 20
+
+# Environment-variable config (no --config flag needed)
+export PAGEFAULT_CONFIG=~/.config/pagefault/pagefault.yaml
+pagefault maps
+```
+
 ## Authentication
 
 All tool endpoints require authentication unless `auth.mode: none` is set in
@@ -40,12 +128,12 @@ Errors:
 
 ---
 
-## `list_contexts`
+## `pf_maps`
 
-Returns every configured context with its name and description. Zero-cost —
-no backend calls.
+Returns every configured memory region (context) with its name and
+description. Zero-cost — no backend calls.
 
-**Endpoint:** `POST /api/list_contexts`
+**Endpoint:** `POST /api/pf_maps`
 
 **Request body:** none (empty `{}` is accepted)
 
@@ -62,19 +150,20 @@ no backend calls.
 
 ---
 
-## `get_context`
+## `pf_load`
 
-Load and return a pre-composed context by name. The dispatcher reads each
-source file, applies the filter pipeline, concatenates the content with
-markdown separators, and truncates if the configured `max_size` is exceeded.
+Load a named memory region (context) into working memory. The dispatcher
+reads each source file, applies the filter pipeline, concatenates the content
+with markdown separators, and truncates if the configured `max_size` is
+exceeded.
 
-**Endpoint:** `POST /api/get_context`
+**Endpoint:** `POST /api/pf_load`
 
 **Request:**
 
 | Field    | Type    | Required | Default     | Notes |
 |----------|---------|----------|-------------|-------|
-| `name`   | string  | yes      | —           | Context name (see `list_contexts`). |
+| `name`   | string  | yes      | —           | Region name (see `pf_maps`). |
 | `format` | string  | no       | `markdown`  | `markdown` or `json`. Phase 1 only implements `markdown`. |
 
 **Response:**
@@ -83,24 +172,33 @@ markdown separators, and truncates if the configured `max_size` is exceeded.
 {
   "name": "demo",
   "format": "markdown",
-  "content": "# memory://README.md\n\n...\n\n---\n\n# memory://notes.md\n\n..."
+  "content": "# memory://README.md\n\n...\n\n---\n\n# memory://notes.md\n\n...",
+  "skipped_sources": [
+    {"uri": "memory://secrets.md", "reason": "blocked by uri filter"}
+  ]
 }
 ```
 
-If the content is larger than the context's `max_size`, it is truncated and
-`"...[truncated]"` is appended.
+If the content is larger than the context's `max_size`, it is truncated at
+the nearest UTF-8 rune boundary (so multi-byte characters are never split)
+and `"...[truncated]"` is appended.
+
+If one or more configured sources were dropped (blocked by a filter, backend
+read failure), they are listed in `skipped_sources` with a human-readable
+reason. The field is omitted entirely when nothing was skipped. Each skip is
+also logged at `WARN` level with the context name, URI, and reason.
 
 **Errors:** 400 (missing name), 404 (unknown context).
 
 ---
 
-## `search`
+## `pf_scan`
 
-Runs a query across one or more backends and returns ranked results.
-Phase-1's filesystem backend uses case-insensitive substring matching and
-returns the first match per file.
+Scans configured backends for content matching a query and returns ranked
+results. Phase-1's filesystem backend uses case-insensitive substring
+matching and returns the first match per file.
 
-**Endpoint:** `POST /api/search`
+**Endpoint:** `POST /api/pf_scan`
 
 **Request:**
 
@@ -134,12 +232,13 @@ Each result's `backend` field is the originating backend name.
 
 ---
 
-## `read`
+## `pf_peek`
 
-Read a resource by URI. The URI's scheme (`memory://`, etc.) determines which
-backend handles the request.
+Peek at a specific resource by URI, optionally slicing a line range. The
+URI's scheme (`memory://`, etc.) determines which backend handles the
+request.
 
-**Endpoint:** `POST /api/read`
+**Endpoint:** `POST /api/pf_peek`
 
 **Request:**
 
@@ -191,6 +290,8 @@ required.
 
 These tools are defined in `plan.md` but **not implemented in Phase 1**:
 
-- `deep_retrieve` — spawn a subagent to do comprehensive retrieval (Phase 2)
-- `list_agents` — list configured subagents (Phase 2)
-- `write` — direct append + agent writeback (Phase 4)
+- `pf_fault` — the real page fault. Spawns a subagent to do comprehensive
+  retrieval from backing store (Phase 2).
+- `pf_ps` — list configured subagents (Phase 2), `ps`-style.
+- `pf_poke` — direct append + agent writeback, the write counterpart to
+  `pf_peek` (Phase 4).

@@ -143,6 +143,8 @@ func NewFromConfig(cfg config.AuditConfig) (Logger, error) {
 		return NopLogger{}, nil
 	case "stdout":
 		return NewStdoutLogger(), nil
+	case "stderr":
+		return NewWriterLogger(os.Stderr), nil
 	case "jsonl":
 		if cfg.LogPath == "" {
 			return nil, fmt.Errorf("audit: jsonl mode requires log_path")

@@ -48,8 +48,11 @@ pagefault/
 │   └── pagefault/
 │       ├── main.go                       # CLI entry, top-level dispatch + --version
 │       ├── serve.go                      # `serve` subcommand: config → dispatcher → http.Server
+│       ├── serve_test.go                 # buildDispatcher tests (minimal + unsupported backend)
 │       ├── token.go                      # `token create/ls/revoke` subcommands
-│       └── token_test.go                 # Token CLI and slugify/maskToken tests
+│       ├── token_test.go                 # Token CLI: lifecycle, slugify, maskToken, list/resolve
+│       ├── tools.go                      # `maps`/`load`/`scan`/`peek` — CLI form of the pf_* tools
+│       └── tools_test.go                 # Tool CLI tests: text/JSON/env/cwd fallback/no-filter/audit redirect
 │
 ├── internal/
 │   ├── config/
@@ -88,12 +91,13 @@ pagefault/
 │   │
 │   ├── tool/
 │   │   ├── tool.go                       # Shared helpers: toolResultJSON, toolResultError
-│   │   ├── list_contexts.go              # HandleListContexts pure function
-│   │   ├── get_context.go                # HandleGetContext pure function
-│   │   ├── search.go                     # HandleSearch pure function
-│   │   ├── read.go                       # HandleRead pure function
+│   │   ├── list_contexts.go              # HandleListContexts pure function (wire: pf_maps)
+│   │   ├── get_context.go                # HandleGetContext pure function (wire: pf_load)
+│   │   ├── search.go                     # HandleSearch pure function (wire: pf_scan)
+│   │   ├── read.go                       # HandleRead pure function (wire: pf_peek)
 │   │   ├── mcp.go                        # RegisterMCP: wires pure handlers to mcp-go
-│   │   └── tool_test.go                  # Tool handler tests
+│   │   ├── tool_test.go                  # Pure handler tests
+│   │   └── mcp_test.go                   # MCP registration + toolResult helper tests
 │   │
 │   └── server/
 │       ├── server.go                     # chi router, MCP mount, REST adapter, /health
@@ -105,7 +109,8 @@ pagefault/
 ├── docs/
 │   ├── api-doc.md                        # Phase-1 tool reference
 │   ├── config-doc.md                     # Full YAML config reference
-│   └── architecture.md                   # Architecture deep dive
+│   ├── architecture.md                   # Architecture deep dive
+│   └── security.md                       # Threat model, auth, filters, audit
 │
 ├── demo-data/
 │   ├── README.md                         # Sample content for minimal.yaml
@@ -140,6 +145,48 @@ Client → chi router → auth middleware → tool handler → dispatcher
 - **Dispatcher** — central tool router. Holds backends + contexts + filters + audit logger.
 - **Tools** — pure `HandleX` functions (`internal/tool/*.go`); the server package wraps them for REST and `tool.RegisterMCP` wraps them for mcp-go.
 
+## Tool Naming
+
+**Wire names are `pf_*`; internal Go names are generic; CLI names drop
+the `pf_` prefix.** The wire surface (MCP/REST/config) uses memorable
+page-fault-themed names that namespace cleanly against other MCP
+servers; the Go code keeps descriptive `HandleListContexts`/etc. names
+for developer clarity; the CLI uses bare verbs because the outer
+`pagefault` binary already provides the namespace. The full mapping:
+
+| Wire (MCP/REST/config) | CLI (`pagefault …`) | Go handler / type prefix | Go file (`internal/tool/`) | Phase |
+|------------------------|---------------------|--------------------------|----------------------------|-------|
+| `pf_maps`              | `maps`              | `HandleListContexts`     | `list_contexts.go`         | 1     |
+| `pf_load`              | `load`              | `HandleGetContext`       | `get_context.go`           | 1     |
+| `pf_scan`              | `scan`              | `HandleSearch`           | `search.go`                | 1     |
+| `pf_peek`              | `peek`              | `HandleRead`             | `read.go`                  | 1     |
+| `pf_fault`             | `fault` *           | `HandleDeepRetrieve` *   | `deep_retrieve.go` *       | 2     |
+| `pf_ps`                | `ps` *              | `HandleListAgents` *     | `list_agents.go` *         | 2     |
+| `pf_poke`              | `poke` *            | `HandleWrite` *          | `write.go` *               | 4     |
+
+(*) Planned — not implemented yet.
+
+The wire name is authoritative for: MCP tool registration, REST routes
+(`/api/{wire_name}`), the `tools:` section of the YAML config, and the
+`tool` field of audit log entries. The CLI subcommand dispatches through
+the same `Handle*` function as REST/MCP, so all three transports share
+filter, audit, and error semantics. Never hand-roll a new tool without
+updating `internal/config/config.go`'s `ToolsConfig` struct, because that
+is how `d.ToolEnabled(name)` finds the toggle.
+
+**CLI semantics:**
+
+- Config lookup: `--config <path>` → `$PAGEFAULT_CONFIG` → `./pagefault.yaml`.
+- Filters apply by default (CLI sees what an MCP client would see).
+  `--no-filter` is the operator escape hatch.
+- Default output is human-readable (tabwriter tables for `maps`/`scan`,
+  raw content for `load`/`peek`); `--json` emits machine-readable JSON.
+- `audit.mode: stdout` is rewritten to `stderr` in CLI context so the
+  data stream stays pipe-clean (`pagefault load demo --json | jq .`).
+- Positional args can appear anywhere on the command line — a local
+  `parseInterspersed` helper hoists flags past positionals before
+  delegating to stdlib `flag`.
+
 ## Common Development Tasks
 
 ### Adding a new backend type
@@ -154,15 +201,23 @@ Client → chi router → auth middleware → tool handler → dispatcher
 
 ### Adding a new tool
 
-1. Create `internal/tool/<tool>.go` with a `HandleX` pure function (transport-agnostic).
-2. Add a dispatcher method if the routing logic doesn't already exist.
-3. Register the tool with the MCP server in `internal/tool/mcp.go`.
-4. Add a REST route in `internal/server/server.go` using `restHandler(d, tool.HandleX)`.
-5. Add the tool name to `ToolsConfig` in `internal/config/config.go` and `Enabled` switch.
-6. Add tests in `internal/tool/<tool>_test.go`.
-7. Update `docs/api-doc.md`.
-8. Update `CLAUDE.md` directory tree.
-9. Bump version (minor) and add CHANGELOG entry.
+Pick a wire name first (`pf_<something>`) — it's what shows up on MCP,
+REST, the config yaml, and the audit log. The CLI form drops the `pf_`
+prefix (`pagefault <something>`). Keep the Go handler name
+generic/descriptive (`HandleX`) — it's internal and doesn't need to carry
+the `pf_` prefix.
+
+1. Create `internal/tool/<descriptive>.go` with a `HandleX` pure function (transport-agnostic).
+2. Add a dispatcher method if the routing logic doesn't already exist (and remember to pass the wire name as the `tool` field to `audit.NewEntry`).
+3. Register the tool with the MCP server in `internal/tool/mcp.go` using `mcppkg.NewTool("pf_<name>", ...)`.
+4. Add a REST route `/api/pf_<name>` in `internal/server/server.go` using `restHandler(d, tool.HandleX)`.
+5. Add a `Pf<Name> *bool` field to `ToolsConfig` in `internal/config/config.go` with `yaml:"pf_<name>,omitempty"` and a case in the `Enabled` switch.
+6. Add a `run<Name>` function and text/JSON formatter in `cmd/pagefault/tools.go`, and a dispatch case in `cmd/pagefault/main.go` + the `usage()` text.
+7. Add the wire ↔ CLI ↔ code row to the "Tool Naming" table in this file.
+8. Add tests: `internal/tool/<descriptive>_test.go` (pure handler), `internal/tool/mcp_test.go` (MCP registration), `cmd/pagefault/tools_test.go` (CLI subcommand).
+9. Update `docs/api-doc.md` (both the HTTP section and the CLI section).
+10. Update `CLAUDE.md` directory tree.
+11. Bump version (minor) and add CHANGELOG entry.
 
 ### Adding a new filter
 
@@ -211,4 +266,5 @@ Client → chi router → auth middleware → tool handler → dispatcher
 - `docs/architecture.md` — architecture deep dive
 - `docs/api-doc.md` — tool reference
 - `docs/config-doc.md` — config reference
+- `docs/security.md` — threat model, auth, filters, audit
 - `README.md` — user-facing quick start

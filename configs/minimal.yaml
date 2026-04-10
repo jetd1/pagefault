@@ -4,10 +4,10 @@
 #
 # Then try:
 #   curl -s localhost:8444/health | jq
-#   curl -s -X POST localhost:8444/api/list_contexts | jq
-#   curl -s -X POST localhost:8444/api/search      -d '{"query":"pagefault"}' | jq
-#   curl -s -X POST localhost:8444/api/read        -d '{"uri":"memory://README.md"}' | jq
-#   curl -s -X POST localhost:8444/api/get_context -d '{"name":"demo"}' | jq
+#   curl -s -X POST localhost:8444/api/pf_maps | jq
+#   curl -s -X POST localhost:8444/api/pf_scan -d '{"query":"pagefault"}' | jq
+#   curl -s -X POST localhost:8444/api/pf_peek -d '{"uri":"memory://README.md"}' | jq
+#   curl -s -X POST localhost:8444/api/pf_load -d '{"name":"demo"}' | jq
 
 server:
   host: "127.0.0.1"
@@ -37,10 +37,10 @@ contexts:
     max_size: 4000
 
 tools:
-  list_contexts: true
-  get_context: true
-  search: true
-  read: true
+  pf_maps: true
+  pf_load: true
+  pf_scan: true
+  pf_peek: true
 
 filters:
   enabled: false

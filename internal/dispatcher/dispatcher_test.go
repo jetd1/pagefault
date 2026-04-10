@@ -5,6 +5,7 @@ import (
 	"errors"
 	"path/filepath"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -151,8 +152,9 @@ func TestDispatcher_ListContexts(t *testing.T) {
 
 func TestDispatcher_GetContext_Concatenates(t *testing.T) {
 	d, _ := newTestDispatcher(t)
-	out, err := d.GetContext(context.Background(), "greeting", "", model.AnonymousCaller)
+	out, skipped, err := d.GetContext(context.Background(), "greeting", "", model.AnonymousCaller)
 	require.NoError(t, err)
+	assert.Empty(t, skipped)
 	assert.Contains(t, out, "memory://foo.md")
 	assert.Contains(t, out, "hello world")
 	assert.Contains(t, out, "memory://bar.md")
@@ -162,7 +164,7 @@ func TestDispatcher_GetContext_Concatenates(t *testing.T) {
 
 func TestDispatcher_GetContext_UnknownName(t *testing.T) {
 	d, _ := newTestDispatcher(t)
-	_, err := d.GetContext(context.Background(), "nope", "", model.AnonymousCaller)
+	_, _, err := d.GetContext(context.Background(), "nope", "", model.AnonymousCaller)
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, model.ErrContextNotFound))
 }
@@ -174,10 +176,38 @@ func TestDispatcher_GetContext_Truncates(t *testing.T) {
 	cfg.MaxSize = 50
 	d.contexts["greeting"] = cfg
 
-	out, err := d.GetContext(context.Background(), "greeting", "", model.AnonymousCaller)
+	out, _, err := d.GetContext(context.Background(), "greeting", "", model.AnonymousCaller)
 	require.NoError(t, err)
 	assert.Contains(t, out, "[truncated]")
 	assert.LessOrEqual(t, len(out), 70) // 50 + suffix length
+}
+
+func TestDispatcher_GetContext_TruncatesUTF8Safely(t *testing.T) {
+	// "你好世界" is four 3-byte runes (12 bytes total). With MaxSize=7,
+	// the byte-level cut lands mid-rune; rune-boundary truncation must
+	// back up so the output remains valid UTF-8.
+	mb := &mockBackend{
+		name:   "memory",
+		scheme: "memory",
+		resources: map[string]*backend.Resource{
+			"memory://cn.md": {URI: "memory://cn.md", Content: "你好世界"},
+		},
+	}
+	d, err := New(Options{
+		Backends: []backend.Backend{mb},
+		Contexts: []config.ContextConfig{
+			{
+				Name:    "cn",
+				Sources: []config.ContextSource{{Backend: "memory", URI: "memory://cn.md"}},
+				MaxSize: 20, // small enough to force truncation past the header
+			},
+		},
+	})
+	require.NoError(t, err)
+	out, _, err := d.GetContext(context.Background(), "cn", "", model.AnonymousCaller)
+	require.NoError(t, err)
+	assert.True(t, utf8.ValidString(out), "truncated output must be valid UTF-8")
+	assert.Contains(t, out, "[truncated]")
 }
 
 func TestDispatcher_GetContext_SkipsMissing(t *testing.T) {
@@ -202,10 +232,13 @@ func TestDispatcher_GetContext_SkipsMissing(t *testing.T) {
 		},
 	})
 	require.NoError(t, err)
-	out, err := d.GetContext(context.Background(), "mixed", "", model.AnonymousCaller)
+	out, skipped, err := d.GetContext(context.Background(), "mixed", "", model.AnonymousCaller)
 	require.NoError(t, err)
 	assert.Contains(t, out, "aaa")
 	assert.NotContains(t, out, "missing.md")
+	require.Len(t, skipped, 1)
+	assert.Equal(t, "memory://missing.md", skipped[0].URI)
+	assert.Contains(t, skipped[0].Reason, "read error")
 }
 
 func TestDispatcher_Search_Basic(t *testing.T) {
@@ -330,6 +363,6 @@ func TestDispatcher_SortedBackendNames(t *testing.T) {
 
 func TestDispatcher_ToolEnabled(t *testing.T) {
 	d, _ := newTestDispatcher(t)
-	assert.True(t, d.ToolEnabled("search"))
+	assert.True(t, d.ToolEnabled("pf_scan"))
 	assert.False(t, d.ToolEnabled("unknown_tool"))
 }

@@ -47,11 +47,11 @@ func TestSanitizeArgs_DoesNotMutate(t *testing.T) {
 func TestNewEntry_PopulatesFields(t *testing.T) {
 	caller := model.Caller{ID: "laptop", Label: "Laptop"}
 	start := time.Now().Add(-50 * time.Millisecond)
-	e := NewEntry(caller, "search", map[string]any{"query": "x"}, start, 512, nil)
+	e := NewEntry(caller, "pf_scan", map[string]any{"query": "x"}, start, 512, nil)
 
 	assert.Equal(t, "laptop", e.CallerID)
 	assert.Equal(t, "Laptop", e.CallerLabel)
-	assert.Equal(t, "search", e.Tool)
+	assert.Equal(t, "pf_scan", e.Tool)
 	assert.Equal(t, "x", e.Args["query"])
 	assert.Equal(t, 512, e.ResultSize)
 	assert.GreaterOrEqual(t, e.DurationMS, int64(0))
@@ -60,7 +60,7 @@ func TestNewEntry_PopulatesFields(t *testing.T) {
 
 func TestNewEntry_WithError(t *testing.T) {
 	caller := model.Caller{ID: "x"}
-	e := NewEntry(caller, "read", nil, time.Now(), 0, errors.New("boom"))
+	e := NewEntry(caller, "pf_peek", nil, time.Now(), 0, errors.New("boom"))
 	assert.Equal(t, "boom", e.Error)
 }
 
@@ -74,7 +74,7 @@ func TestJSONLLogger_WritesLine(t *testing.T) {
 	lg.Log(Entry{
 		Timestamp: time.Date(2026, 4, 10, 12, 0, 0, 0, time.UTC),
 		CallerID:  "laptop",
-		Tool:      "search",
+		Tool:      "pf_scan",
 		Args:      map[string]any{"query": "x"},
 	})
 	require.NoError(t, lg.Close())
@@ -87,7 +87,7 @@ func TestJSONLLogger_WritesLine(t *testing.T) {
 	var parsed Entry
 	require.NoError(t, json.Unmarshal([]byte(lines[0]), &parsed))
 	assert.Equal(t, "laptop", parsed.CallerID)
-	assert.Equal(t, "search", parsed.Tool)
+	assert.Equal(t, "pf_scan", parsed.Tool)
 }
 
 func TestJSONLLogger_Appends(t *testing.T) {
@@ -112,11 +112,11 @@ func TestJSONLLogger_Appends(t *testing.T) {
 func TestStdoutLogger_WritesToWriter(t *testing.T) {
 	var buf bytes.Buffer
 	lg := NewWriterLogger(&buf)
-	lg.Log(Entry{Tool: "read", CallerID: "x"})
+	lg.Log(Entry{Tool: "pf_peek", CallerID: "x"})
 
 	var parsed Entry
 	require.NoError(t, json.Unmarshal([]byte(strings.TrimSpace(buf.String())), &parsed))
-	assert.Equal(t, "read", parsed.Tool)
+	assert.Equal(t, "pf_peek", parsed.Tool)
 	assert.Equal(t, "x", parsed.CallerID)
 }
 
@@ -135,6 +135,16 @@ func TestNewFromConfig_Off(t *testing.T) {
 
 func TestNewFromConfig_Stdout(t *testing.T) {
 	lg, err := NewFromConfig(config.AuditConfig{Mode: "stdout"})
+	require.NoError(t, err)
+	_, ok := lg.(*StdoutLogger)
+	assert.True(t, ok)
+}
+
+func TestNewFromConfig_Stderr(t *testing.T) {
+	// Stderr mode returns the same underlying StdoutLogger type
+	// (NewWriterLogger shares the type) but targets os.Stderr. Used by
+	// CLI invocations so audit lines don't pollute stdout pipelines.
+	lg, err := NewFromConfig(config.AuditConfig{Mode: "stderr"})
 	require.NoError(t, err)
 	_, ok := lg.(*StdoutLogger)
 	assert.True(t, ok)

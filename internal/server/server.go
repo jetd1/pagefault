@@ -20,6 +20,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
@@ -96,19 +97,22 @@ func New(cfg *config.Config, d *dispatcher.ToolDispatcher, authP auth.AuthProvid
 		pr.Handle("/mcp", streamable)
 		pr.Handle("/mcp/*", streamable)
 
-		// REST transport: one handler per enabled tool.
+		// REST transport: one handler per enabled tool. The wire names
+		// follow the page-fault scheme (pf_maps, pf_load, pf_scan,
+		// pf_peek); the handler Go names retain their generic form for
+		// developer clarity — see CLAUDE.md for the mapping.
 		pr.Route("/api", func(ar chi.Router) {
-			if d.ToolEnabled("list_contexts") {
-				ar.Post("/list_contexts", restHandler(d, tool.HandleListContexts))
+			if d.ToolEnabled("pf_maps") {
+				ar.Post("/pf_maps", restHandler(d, tool.HandleListContexts))
 			}
-			if d.ToolEnabled("get_context") {
-				ar.Post("/get_context", restHandler(d, tool.HandleGetContext))
+			if d.ToolEnabled("pf_load") {
+				ar.Post("/pf_load", restHandler(d, tool.HandleGetContext))
 			}
-			if d.ToolEnabled("search") {
-				ar.Post("/search", restHandler(d, tool.HandleSearch))
+			if d.ToolEnabled("pf_scan") {
+				ar.Post("/pf_scan", restHandler(d, tool.HandleSearch))
 			}
-			if d.ToolEnabled("read") {
-				ar.Post("/read", restHandler(d, tool.HandleRead))
+			if d.ToolEnabled("pf_peek") {
+				ar.Post("/pf_peek", restHandler(d, tool.HandleRead))
 			}
 		})
 	})
@@ -142,10 +146,10 @@ func (s *Server) handleRoot(w http.ResponseWriter, _ *http.Request) {
 	_, _ = io.WriteString(w, "Endpoints:\n")
 	_, _ = io.WriteString(w, "  GET  /health           — health probe\n")
 	_, _ = io.WriteString(w, "  POST /mcp              — MCP streamable-http\n")
-	_, _ = io.WriteString(w, "  POST /api/list_contexts\n")
-	_, _ = io.WriteString(w, "  POST /api/get_context\n")
-	_, _ = io.WriteString(w, "  POST /api/search\n")
-	_, _ = io.WriteString(w, "  POST /api/read\n")
+	_, _ = io.WriteString(w, "  POST /api/pf_maps        — list memory regions (contexts)\n")
+	_, _ = io.WriteString(w, "  POST /api/pf_load        — load a region by name\n")
+	_, _ = io.WriteString(w, "  POST /api/pf_scan        — scan backends for content\n")
+	_, _ = io.WriteString(w, "  POST /api/pf_peek        — peek at a resource by URI\n")
 }
 
 // ───────────────── REST handler adapter ─────────────────
@@ -211,11 +215,10 @@ func writeError(w http.ResponseWriter, status int, err error) {
 }
 
 // requestLogger is a lightweight slog-backed request logger. It records
-// method, path, status, and duration.
+// method, path, status, bytes, duration, and remote addr.
 func requestLogger(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		start := r.Context().Value(middleware.RequestIDKey)
-		_ = start
+		start := time.Now()
 		ww := middleware.NewWrapResponseWriter(w, r.ProtoMajor)
 		next.ServeHTTP(ww, r)
 		slog.Info("request",
@@ -223,6 +226,7 @@ func requestLogger(next http.Handler) http.Handler {
 			"path", r.URL.Path,
 			"status", ww.Status(),
 			"bytes", ww.BytesWritten(),
+			"duration_ms", time.Since(start).Milliseconds(),
 			"remote", r.RemoteAddr,
 		)
 	})

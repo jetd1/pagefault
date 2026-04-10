@@ -14,11 +14,14 @@ type GetContextInput struct {
 	Format string `json:"format,omitempty"`
 }
 
-// GetContextOutput is the response shape for get_context.
+// GetContextOutput is the response shape for get_context. SkippedSources is
+// populated when one or more configured sources were omitted (e.g., blocked
+// by a filter or unreadable) so the caller can tell the bundle is partial.
 type GetContextOutput struct {
-	Name    string `json:"name"`
-	Format  string `json:"format"`
-	Content string `json:"content"`
+	Name           string                     `json:"name"`
+	Format         string                     `json:"format"`
+	Content        string                     `json:"content"`
+	SkippedSources []dispatcher.SkippedSource `json:"skipped_sources,omitempty"`
 }
 
 // HandleGetContext loads a named context from the dispatcher.
@@ -26,7 +29,7 @@ func HandleGetContext(ctx context.Context, d *dispatcher.ToolDispatcher, in GetC
 	if in.Name == "" {
 		return GetContextOutput{}, fmt.Errorf("%w: name is required", model.ErrInvalidRequest)
 	}
-	content, err := d.GetContext(ctx, in.Name, in.Format, caller)
+	content, skipped, err := d.GetContext(ctx, in.Name, in.Format, caller)
 	if err != nil {
 		return GetContextOutput{}, err
 	}
@@ -35,8 +38,9 @@ func HandleGetContext(ctx context.Context, d *dispatcher.ToolDispatcher, in GetC
 		format = "markdown"
 	}
 	return GetContextOutput{
-		Name:    in.Name,
-		Format:  format,
-		Content: content,
+		Name:           in.Name,
+		Format:         format,
+		Content:        content,
+		SkippedSources: skipped,
 	}, nil
 }

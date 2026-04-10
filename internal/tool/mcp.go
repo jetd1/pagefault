@@ -15,24 +15,29 @@ import (
 // RegisterMCP registers every enabled Phase-1 tool on the given MCP server.
 // The caller provides a helper to extract the pagefault Caller from the
 // request context — the dispatcher uses this for filters and audit.
+//
+// Phase-1 wire names: pf_maps, pf_load, pf_scan, pf_peek. Internal Go names
+// retain their generic form (HandleListContexts, etc.) — see CLAUDE.md for
+// the wire-name ↔ code-name mapping.
 func RegisterMCP(srv *mcpserver.MCPServer, d *dispatcher.ToolDispatcher) {
-	if d.ToolEnabled("list_contexts") {
+	if d.ToolEnabled("pf_maps") {
 		registerListContexts(srv, d)
 	}
-	if d.ToolEnabled("get_context") {
+	if d.ToolEnabled("pf_load") {
 		registerGetContext(srv, d)
 	}
-	if d.ToolEnabled("search") {
+	if d.ToolEnabled("pf_scan") {
 		registerSearch(srv, d)
 	}
-	if d.ToolEnabled("read") {
+	if d.ToolEnabled("pf_peek") {
 		registerRead(srv, d)
 	}
 }
 
+// registerListContexts wires the pf_maps tool.
 func registerListContexts(srv *mcpserver.MCPServer, d *dispatcher.ToolDispatcher) {
-	t := mcppkg.NewTool("list_contexts",
-		mcppkg.WithDescription("List all pre-composed memory contexts available on this pagefault server. Returns each context's name and description."),
+	t := mcppkg.NewTool("pf_maps",
+		mcppkg.WithDescription("List the memory regions (contexts) pre-mapped by this pagefault server. Returns each region's name and description. Use pf_load to fetch a region's content."),
 	)
 	srv.AddTool(t, func(ctx context.Context, _ mcppkg.CallToolRequest) (*mcppkg.CallToolResult, error) {
 		caller := auth.CallerFromContext(ctx)
@@ -44,11 +49,12 @@ func registerListContexts(srv *mcpserver.MCPServer, d *dispatcher.ToolDispatcher
 	})
 }
 
+// registerGetContext wires the pf_load tool.
 func registerGetContext(srv *mcpserver.MCPServer, d *dispatcher.ToolDispatcher) {
-	t := mcppkg.NewTool("get_context",
-		mcppkg.WithDescription("Load and return a pre-composed context by name. Contexts are defined in the server config and bundle one or more backend sources."),
+	t := mcppkg.NewTool("pf_load",
+		mcppkg.WithDescription("Load a named memory region (context) into working memory. Assembles the region from its configured sources, applies filters, and returns the concatenated content."),
 		mcppkg.WithString("name",
-			mcppkg.Description("The context name (see list_contexts)"),
+			mcppkg.Description("The region name (see pf_maps)"),
 			mcppkg.Required(),
 		),
 		mcppkg.WithString("format",
@@ -70,9 +76,10 @@ func registerGetContext(srv *mcpserver.MCPServer, d *dispatcher.ToolDispatcher) 
 	})
 }
 
+// registerSearch wires the pf_scan tool.
 func registerSearch(srv *mcpserver.MCPServer, d *dispatcher.ToolDispatcher) {
-	t := mcppkg.NewTool("search",
-		mcppkg.WithDescription("Search across configured backends. Returns ranked results with snippets."),
+	t := mcppkg.NewTool("pf_scan",
+		mcppkg.WithDescription("Scan configured backends for content matching a query. Returns ranked results with snippets."),
 		mcppkg.WithString("query",
 			mcppkg.Description("Search query (keywords, phrase, or natural language)"),
 			mcppkg.Required(),
@@ -100,9 +107,10 @@ func registerSearch(srv *mcpserver.MCPServer, d *dispatcher.ToolDispatcher) {
 	})
 }
 
+// registerRead wires the pf_peek tool.
 func registerRead(srv *mcpserver.MCPServer, d *dispatcher.ToolDispatcher) {
-	t := mcppkg.NewTool("read",
-		mcppkg.WithDescription("Read a specific resource by URI. Supports optional line-range slicing for text resources."),
+	t := mcppkg.NewTool("pf_peek",
+		mcppkg.WithDescription("Peek at a specific resource by URI. Returns the resource content with optional line-range slicing for text resources."),
 		mcppkg.WithString("uri",
 			mcppkg.Description("Resource URI (e.g. memory://2026-04-10.md)"),
 			mcppkg.Required(),

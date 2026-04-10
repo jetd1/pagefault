@@ -51,11 +51,11 @@ check() {
   echo "smoke: $label OK ($code)"
 }
 
-check "health"        "/health"
-check "list_contexts" "/api/list_contexts" "{}"
-check "search"        "/api/search"        '{"query":"pagefault"}'
-check "read"          "/api/read"          '{"uri":"memory://README.md"}'
-check "get_context"   "/api/get_context"   '{"name":"demo"}'
+check "health"  "/health"
+check "pf_maps" "/api/pf_maps" "{}"
+check "pf_scan" "/api/pf_scan" '{"query":"pagefault"}'
+check "pf_peek" "/api/pf_peek" '{"uri":"memory://README.md"}'
+check "pf_load" "/api/pf_load" '{"name":"demo"}'
 
 # MCP initialize smoke
 curl -s -o "$ROOT/bin/smoke.resp" \

@@ -136,11 +136,11 @@ func TestServer_Root_Landing(t *testing.T) {
 	assert.Contains(t, string(body), "/mcp")
 }
 
-// ───────────────── REST /api/list_contexts ─────────────────
+// ───────────────── REST /api/pf_maps ─────────────────
 
 func TestServer_ListContexts_NoAuth(t *testing.T) {
 	ts, _ := newTestServer(t, "none", "")
-	resp, body := post(t, ts, "/api/list_contexts", nil, "")
+	resp, body := post(t, ts, "/api/pf_maps", nil, "")
 	assert.Equal(t, http.StatusOK, resp.StatusCode)
 
 	var out struct {
@@ -154,33 +154,33 @@ func TestServer_ListContexts_NoAuth(t *testing.T) {
 	assert.Equal(t, "welcome", out.Contexts[0].Name)
 }
 
-// ───────────────── REST /api/get_context ─────────────────
+// ───────────────── REST /api/pf_load ─────────────────
 
 func TestServer_GetContext(t *testing.T) {
 	ts, _ := newTestServer(t, "none", "")
-	resp, body := post(t, ts, "/api/get_context", map[string]any{"name": "welcome"}, "")
+	resp, body := post(t, ts, "/api/pf_load", map[string]any{"name": "welcome"}, "")
 	assert.Equal(t, http.StatusOK, resp.StatusCode)
 	assert.Contains(t, string(body), "hello world")
 }
 
 func TestServer_GetContext_MissingName(t *testing.T) {
 	ts, _ := newTestServer(t, "none", "")
-	resp, body := post(t, ts, "/api/get_context", map[string]any{}, "")
+	resp, body := post(t, ts, "/api/pf_load", map[string]any{}, "")
 	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
 	assert.Contains(t, string(body), "invalid request")
 }
 
 func TestServer_GetContext_UnknownName(t *testing.T) {
 	ts, _ := newTestServer(t, "none", "")
-	resp, _ := post(t, ts, "/api/get_context", map[string]any{"name": "nope"}, "")
+	resp, _ := post(t, ts, "/api/pf_load", map[string]any{"name": "nope"}, "")
 	assert.Equal(t, http.StatusNotFound, resp.StatusCode)
 }
 
-// ───────────────── REST /api/search ─────────────────
+// ───────────────── REST /api/pf_scan ─────────────────
 
 func TestServer_Search(t *testing.T) {
 	ts, _ := newTestServer(t, "none", "")
-	resp, body := post(t, ts, "/api/search", map[string]any{"query": "hello"}, "")
+	resp, body := post(t, ts, "/api/pf_scan", map[string]any{"query": "hello"}, "")
 	assert.Equal(t, http.StatusOK, resp.StatusCode)
 
 	var out struct {
@@ -197,15 +197,15 @@ func TestServer_Search(t *testing.T) {
 
 func TestServer_Search_EmptyQuery(t *testing.T) {
 	ts, _ := newTestServer(t, "none", "")
-	resp, _ := post(t, ts, "/api/search", map[string]any{"query": ""}, "")
+	resp, _ := post(t, ts, "/api/pf_scan", map[string]any{"query": ""}, "")
 	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
 }
 
-// ───────────────── REST /api/read ─────────────────
+// ───────────────── REST /api/pf_peek ─────────────────
 
 func TestServer_Read(t *testing.T) {
 	ts, _ := newTestServer(t, "none", "")
-	resp, body := post(t, ts, "/api/read", map[string]any{"uri": "memory://hello.md"}, "")
+	resp, body := post(t, ts, "/api/pf_peek", map[string]any{"uri": "memory://hello.md"}, "")
 	assert.Equal(t, http.StatusOK, resp.StatusCode)
 
 	var out struct {
@@ -219,13 +219,13 @@ func TestServer_Read(t *testing.T) {
 
 func TestServer_Read_Missing(t *testing.T) {
 	ts, _ := newTestServer(t, "none", "")
-	resp, _ := post(t, ts, "/api/read", map[string]any{"uri": "memory://nope.md"}, "")
+	resp, _ := post(t, ts, "/api/pf_peek", map[string]any{"uri": "memory://nope.md"}, "")
 	assert.Equal(t, http.StatusNotFound, resp.StatusCode)
 }
 
 func TestServer_Read_UnknownScheme(t *testing.T) {
 	ts, _ := newTestServer(t, "none", "")
-	resp, _ := post(t, ts, "/api/read", map[string]any{"uri": "other://x.md"}, "")
+	resp, _ := post(t, ts, "/api/pf_peek", map[string]any{"uri": "other://x.md"}, "")
 	assert.Equal(t, http.StatusNotFound, resp.StatusCode)
 }
 
@@ -242,19 +242,19 @@ func writeTestTokens(t *testing.T) string {
 
 func TestServer_Bearer_AllowsValidToken(t *testing.T) {
 	ts, _ := newTestServer(t, "bearer", writeTestTokens(t))
-	resp, _ := post(t, ts, "/api/list_contexts", nil, "pf_test_secret")
+	resp, _ := post(t, ts, "/api/pf_maps", nil, "pf_test_secret")
 	assert.Equal(t, http.StatusOK, resp.StatusCode)
 }
 
 func TestServer_Bearer_RejectsMissingToken(t *testing.T) {
 	ts, _ := newTestServer(t, "bearer", writeTestTokens(t))
-	resp, _ := post(t, ts, "/api/list_contexts", nil, "")
+	resp, _ := post(t, ts, "/api/pf_maps", nil, "")
 	assert.Equal(t, http.StatusUnauthorized, resp.StatusCode)
 }
 
 func TestServer_Bearer_RejectsBadToken(t *testing.T) {
 	ts, _ := newTestServer(t, "bearer", writeTestTokens(t))
-	resp, _ := post(t, ts, "/api/list_contexts", nil, "wrong-token")
+	resp, _ := post(t, ts, "/api/pf_maps", nil, "wrong-token")
 	assert.Equal(t, http.StatusUnauthorized, resp.StatusCode)
 }
 

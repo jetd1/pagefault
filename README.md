@@ -11,8 +11,10 @@ when they need context they don't have, they fault to this server, which
 loads the right information from configured backends.
 
 Phase 1 is a minimal, working slice: a Go binary that serves markdown files
-from a directory, with four tools (`list_contexts`, `get_context`, `search`,
-`read`), bearer-token auth, path/tag filters, and JSONL audit logging.
+from a directory, with four tools (`pf_maps`, `pf_load`, `pf_scan`,
+`pf_peek`), bearer-token auth, path/tag filters, and JSONL audit logging.
+Tool names follow a `pf_*` scheme borrowed from Unix memory management and
+kernel debugging — see `docs/api-doc.md` for the mapping.
 
 ## Quick start
 
@@ -20,21 +22,26 @@ from a directory, with four tools (`list_contexts`, `get_context`, `search`,
 # Build
 make build
 
-# Run with the bundled minimal config (no auth, demo data)
-./bin/pagefault serve --config configs/minimal.yaml
+# Drive the tools directly from the CLI — no server needed
+./bin/pagefault maps --config configs/minimal.yaml
+./bin/pagefault scan pagefault --config configs/minimal.yaml
+./bin/pagefault peek memory://README.md --config configs/minimal.yaml
+./bin/pagefault load demo --config configs/minimal.yaml
 
-# In another terminal
+# Or run the server and hit it over HTTP
+./bin/pagefault serve --config configs/minimal.yaml
+# (in another terminal)
 curl -s http://127.0.0.1:8444/health | jq
-curl -s -X POST http://127.0.0.1:8444/api/list_contexts | jq
-curl -s -X POST http://127.0.0.1:8444/api/search \
+curl -s -X POST http://127.0.0.1:8444/api/pf_maps | jq
+curl -s -X POST http://127.0.0.1:8444/api/pf_scan \
   -H 'Content-Type: application/json' \
   -d '{"query":"pagefault"}' | jq
-curl -s -X POST http://127.0.0.1:8444/api/read \
-  -H 'Content-Type: application/json' \
-  -d '{"uri":"memory://README.md"}' | jq
 ```
 
-The MCP endpoint is available at `POST /mcp` (streamable-http transport).
+The MCP endpoint is available at `POST /mcp` (streamable-http transport)
+when running `serve`. The CLI form (`pagefault peek`, `pagefault scan`, …)
+is the same vocabulary minus the `pf_` prefix — see `docs/api-doc.md` for
+the full reference.
 
 ## Creating a production config
 
@@ -70,6 +77,21 @@ bash scripts/smoke.sh   # end-to-end smoke test
 - **`CLAUDE.md`** — developer guide for AI agents working on this repo
 
 ## Recent Changes
+
+### 0.2.0 — 2026-04-10
+
+- **Tool rename (breaking).** Wire surface now uses `pf_*` names:
+  `list_contexts → pf_maps`, `get_context → pf_load`, `search → pf_scan`,
+  `read → pf_peek` (plus `pf_fault` / `pf_ps` / `pf_poke` for Phases 2/4).
+- **CLI subcommands.** `pagefault maps` / `load` / `scan` / `peek` drive the
+  same dispatchers as the HTTP/MCP transports. Common flags: `--config`,
+  `--no-filter`, `--json`. Config lookup: `--config → $PAGEFAULT_CONFIG →
+  ./pagefault.yaml`.
+- **`pf_load` skipped-source visibility.** Sources dropped by filters or
+  backend errors are returned in `skipped_sources` with a reason, and
+  logged at WARN. UTF-8 truncation now walks back to a rune boundary.
+- **`docs/security.md`** added (threat model, filter/audit notes, known
+  limitations, deployment checklist) — previously missing from the spec.
 
 ### 0.1.0 — 2026-04-10
 

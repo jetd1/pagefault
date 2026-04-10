@@ -27,8 +27,8 @@ MCP and REST.
 │       ▼                                          │
 │  ┌───────────────────────────────┐               │
 │  │ Tool layer                    │               │
-│  │  list_contexts / get_context  │               │
-│  │  search / read                │               │
+│  │  pf_maps / pf_load            │               │
+│  │  pf_scan / pf_peek            │               │
 │  └────────────┬──────────────────┘               │
 │               │                                  │
 │               ▼                                  │
@@ -213,7 +213,7 @@ the config — see `docs/config-doc.md`.
 
 See `plan.md` §10 for the full roadmap. Short version:
 
-- **Phase 2:** subagent / subprocess / http backends, `deep_retrieve`, `list_agents`
+- **Phase 2:** subagent / subprocess / http backends, `pf_fault` (deep retrieval), `pf_ps` (list agents)
 - **Phase 3:** redaction filter, OpenAPI spec, CORS, rate limiting
 - **Phase 4:** write support (direct append + agent writeback)
 - **Phase 5:** OAuth2, caching, streaming, metrics

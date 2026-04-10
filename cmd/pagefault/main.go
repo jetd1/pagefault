@@ -4,9 +4,19 @@
 //
 //	pagefault serve --config <path> [--host HOST] [--port PORT]
 //	pagefault token create --label <label> [--config <path>] [--tokens-file <path>]
-//	pagefault token ls [--config <path>] [--tokens-file <path>]
-//	pagefault token revoke <id> [--config <path>] [--tokens-file <path>]
+//	pagefault token ls                     [--config <path>] [--tokens-file <path>]
+//	pagefault token revoke <id>            [--config <path>] [--tokens-file <path>]
+//
+//	pagefault maps        [--config] [--no-filter] [--json]
+//	pagefault load <name> [--config] [--format markdown|json] [--no-filter] [--json]
+//	pagefault scan <query...> [--config] [--limit N] [--backends a,b] [--no-filter] [--json]
+//	pagefault peek <uri>  [--config] [--from N] [--to N] [--no-filter] [--json]
+//
 //	pagefault --version
+//
+// The tool subcommands (maps, load, scan, peek) are the CLI form of the
+// pf_maps / pf_load / pf_scan / pf_peek tools exposed over MCP and REST.
+// See CLAUDE.md §Tool Naming for the wire ↔ CLI ↔ code mapping.
 package main
 
 import (
@@ -37,6 +47,26 @@ func main() {
 			fmt.Fprintf(os.Stderr, "token: %v\n", err)
 			os.Exit(1)
 		}
+	case "maps":
+		if err := runMaps(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "maps: %v\n", err)
+			os.Exit(1)
+		}
+	case "load":
+		if err := runLoad(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "load: %v\n", err)
+			os.Exit(1)
+		}
+	case "scan":
+		if err := runScan(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "scan: %v\n", err)
+			os.Exit(1)
+		}
+	case "peek":
+		if err := runPeek(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "peek: %v\n", err)
+			os.Exit(1)
+		}
 	case "-h", "--help", "help":
 		usage()
 	default:
@@ -49,12 +79,24 @@ func main() {
 func usage() {
 	fmt.Fprintln(os.Stderr, `pagefault — personal memory service
 
-Usage:
+Server:
   pagefault serve --config <path> [--host HOST] [--port PORT]
+
+Tokens:
   pagefault token create --label <label> [--config <path>] [--tokens-file <path>]
-  pagefault token ls [--config <path>] [--tokens-file <path>]
-  pagefault token revoke <id> [--config <path>] [--tokens-file <path>]
+  pagefault token ls                     [--config <path>] [--tokens-file <path>]
+  pagefault token revoke <id>            [--config <path>] [--tokens-file <path>]
+
+Tools (local CLI form of pf_maps / pf_load / pf_scan / pf_peek):
+  pagefault maps                 — list configured memory regions
+  pagefault load <name>          — load an assembled region to stdout
+  pagefault scan <query...>      — scan backends for a query
+  pagefault peek <uri>           — read a resource by URI
+
+  Common flags: --config <path>, --no-filter, --json
+  Config lookup: --config → $PAGEFAULT_CONFIG → ./pagefault.yaml
+
   pagefault --version
 
-Run "pagefault <command> --help" for more information on a command.`)
+Run "pagefault <command> --help" for per-command flags.`)
 }

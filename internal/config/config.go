@@ -119,18 +119,20 @@ type ContextSource struct {
 	Params  map[string]any `yaml:"params,omitempty"`
 }
 
-// ToolsConfig toggles individual tools on or off.
+// ToolsConfig toggles individual tools on or off. Tool names follow the
+// page-fault naming scheme — pf_maps, pf_load, pf_scan, pf_peek (Phase 1)
+// and pf_fault, pf_ps, pf_poke (later phases).
 //
 // All *bool-valued fields default to enabled (true) when absent. Using *bool
 // lets us distinguish "not set" from "set to false".
 type ToolsConfig struct {
-	ListContexts *bool `yaml:"list_contexts,omitempty"`
-	GetContext   *bool `yaml:"get_context,omitempty"`
-	Search       *bool `yaml:"search,omitempty"`
-	Read         *bool `yaml:"read,omitempty"`
-	DeepRetrieve *bool `yaml:"deep_retrieve,omitempty"`
-	ListAgents   *bool `yaml:"list_agents,omitempty"`
-	Write        *bool `yaml:"write,omitempty"`
+	PfMaps  *bool `yaml:"pf_maps,omitempty"`
+	PfLoad  *bool `yaml:"pf_load,omitempty"`
+	PfScan  *bool `yaml:"pf_scan,omitempty"`
+	PfPeek  *bool `yaml:"pf_peek,omitempty"`
+	PfFault *bool `yaml:"pf_fault,omitempty"`
+	PfPs    *bool `yaml:"pf_ps,omitempty"`
+	PfPoke  *bool `yaml:"pf_poke,omitempty"`
 }
 
 // Enabled returns whether the named tool is enabled. Unknown names default to
@@ -143,20 +145,20 @@ func (t ToolsConfig) Enabled(name string) bool {
 		return *p
 	}
 	switch name {
-	case "list_contexts":
-		return pick(t.ListContexts)
-	case "get_context":
-		return pick(t.GetContext)
-	case "search":
-		return pick(t.Search)
-	case "read":
-		return pick(t.Read)
-	case "deep_retrieve":
-		return pick(t.DeepRetrieve)
-	case "list_agents":
-		return pick(t.ListAgents)
-	case "write":
-		return pick(t.Write)
+	case "pf_maps":
+		return pick(t.PfMaps)
+	case "pf_load":
+		return pick(t.PfLoad)
+	case "pf_scan":
+		return pick(t.PfScan)
+	case "pf_peek":
+		return pick(t.PfPeek)
+	case "pf_fault":
+		return pick(t.PfFault)
+	case "pf_ps":
+		return pick(t.PfPs)
+	case "pf_poke":
+		return pick(t.PfPoke)
 	default:
 		return false
 	}

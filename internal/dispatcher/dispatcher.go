@@ -9,9 +9,11 @@ package dispatcher
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/jet/pagefault/internal/audit"
 	"github.com/jet/pagefault/internal/backend"
@@ -132,32 +134,44 @@ func (d *ToolDispatcher) ListContexts(ctx context.Context, caller model.Caller) 
 	for _, c := range d.contextsOrdered {
 		out = append(out, ContextSummary{Name: c.Name, Description: c.Description})
 	}
-	d.auditLog.Log(audit.NewEntry(caller, "list_contexts", nil, start, len(out), nil))
+	d.auditLog.Log(audit.NewEntry(caller, "pf_maps", nil, start, len(out), nil))
 	return out, nil
 }
 
 // ───────────────────── get_context ─────────────────────
 
+// SkippedSource records a context source that was omitted during GetContext
+// and the reason why. Callers should surface this so users can tell why a
+// context bundle is incomplete.
+type SkippedSource struct {
+	URI    string `json:"uri"`
+	Reason string `json:"reason"`
+}
+
 // GetContext loads the named context, concatenates its sources (applying
-// filters), and truncates to max_size if necessary.
+// filters), and truncates to max_size if necessary. Any sources that were
+// dropped along the way (blocked by filters, backend read error) are
+// returned in the skipped slice — the caller is responsible for surfacing
+// them to the user.
 //
 // format overrides the context's configured format when non-empty. Phase 1
 // supports "markdown" (concatenate with separators).
-func (d *ToolDispatcher) GetContext(ctx context.Context, name string, format string, caller model.Caller) (string, error) {
+func (d *ToolDispatcher) GetContext(ctx context.Context, name string, format string, caller model.Caller) (string, []SkippedSource, error) {
 	start := time.Now()
 
 	var out string
+	var skipped []SkippedSource
 	var err error
 	defer func() {
-		d.auditLog.Log(audit.NewEntry(caller, "get_context",
-			map[string]any{"name": name, "format": format},
+		d.auditLog.Log(audit.NewEntry(caller, "pf_load",
+			map[string]any{"name": name, "format": format, "skipped": len(skipped)},
 			start, len(out), err))
 	}()
 
 	cfg, ok := d.contexts[name]
 	if !ok {
 		err = fmt.Errorf("%w: %q", model.ErrContextNotFound, name)
-		return "", err
+		return "", nil, err
 	}
 
 	if format == "" {
@@ -167,23 +181,39 @@ func (d *ToolDispatcher) GetContext(ctx context.Context, name string, format str
 		format = "markdown"
 	}
 
+	addSkip := func(uri, reason string) {
+		skipped = append(skipped, SkippedSource{URI: uri, Reason: reason})
+		slog.Warn("get_context: source skipped",
+			"context", name,
+			"uri", uri,
+			"reason", reason,
+			"caller", caller.ID,
+		)
+	}
+
 	var parts []string
 	for _, src := range cfg.Sources {
 		be, ok := d.backends[src.Backend]
 		if !ok {
+			// Context references a backend we don't have — configuration
+			// error, fail hard instead of silently dropping.
 			err = fmt.Errorf("%w: context %q references unknown backend %q", model.ErrBackendNotFound, name, src.Backend)
-			return "", err
+			return "", nil, err
 		}
 		if !d.filter.AllowURI(src.URI, &caller) {
-			continue // filtered out — skip silently
+			addSkip(src.URI, "blocked by uri filter")
+			continue
 		}
 		res, rerr := be.Read(ctx, src.URI)
 		if rerr != nil {
-			// Skip individual source errors rather than failing the whole
-			// context; a missing file shouldn't break the whole bundle.
+			// Per-source errors don't break the whole bundle — a missing
+			// file shouldn't poison the context — but we record what we
+			// dropped so the caller isn't left guessing.
+			addSkip(src.URI, fmt.Sprintf("read error: %s", rerr.Error()))
 			continue
 		}
 		if !d.filter.AllowTags(res.URI, resourceTags(res), &caller) {
+			addSkip(res.URI, "blocked by tag filter")
 			continue
 		}
 		content := d.filter.FilterContent(res.Content, res.URI)
@@ -192,10 +222,16 @@ func (d *ToolDispatcher) GetContext(ctx context.Context, name string, format str
 
 	joined := strings.Join(parts, "\n\n---\n\n")
 	if cfg.MaxSize > 0 && len(joined) > cfg.MaxSize {
-		joined = joined[:cfg.MaxSize] + "\n\n...[truncated]"
+		// Walk back from the byte-level cut point to the nearest rune
+		// boundary so we never split a multi-byte UTF-8 sequence.
+		cut := cfg.MaxSize
+		for cut > 0 && !utf8.RuneStart(joined[cut]) {
+			cut--
+		}
+		joined = joined[:cut] + "\n\n...[truncated]"
 	}
 	out = joined
-	return out, nil
+	return out, skipped, nil
 }
 
 // ───────────────────── search ─────────────────────
@@ -216,7 +252,7 @@ func (d *ToolDispatcher) Search(ctx context.Context, query string, limit int, ba
 	var out []SearchResult
 	var rootErr error
 	defer func() {
-		d.auditLog.Log(audit.NewEntry(caller, "search",
+		d.auditLog.Log(audit.NewEntry(caller, "pf_scan",
 			map[string]any{"query": query, "limit": limit, "backends": backendNames},
 			start, len(out), rootErr))
 	}()
@@ -304,7 +340,7 @@ func (d *ToolDispatcher) Read(ctx context.Context, uri string, fromLine, toLine 
 		if res != nil {
 			size = len(res.Content)
 		}
-		d.auditLog.Log(audit.NewEntry(caller, "read",
+		d.auditLog.Log(audit.NewEntry(caller, "pf_peek",
 			map[string]any{"uri": uri, "from_line": fromLine, "to_line": toLine},
 			start, size, err))
 	}()

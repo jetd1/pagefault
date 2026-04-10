@@ -136,17 +136,19 @@ contexts:
 
 | Field          | Type     | Required | Default    | Notes |
 |----------------|----------|----------|------------|-------|
-| `name`         | string   | yes      | —          | Context name (unique). |
-| `description`  | string   | no       | —          | Shown by `list_contexts`. |
+| `name`         | string   | yes      | —          | Region name (unique). |
+| `description`  | string   | no       | —          | Shown by `pf_maps`. |
 | `sources`      | [object] | yes      | —          | At least one source required. |
 | `sources[].backend` | string | yes    | —          | Backend name from the `backends` section. |
 | `sources[].uri`     | string | yes    | —          | URI to load. |
 | `sources[].params`  | object | no     | —          | Reserved for dynamic sources (Phase 2). |
 | `format`       | string   | no       | `markdown` | Output format: `markdown` or `json`. |
-| `max_size`     | int      | no       | `16000`    | Max characters before truncation. |
+| `max_size`     | int      | no       | `16000`    | Max characters before truncation. Truncation is UTF-8-safe (rune-aligned). |
 
 When a source cannot be read (missing file, filter block), the source is
-silently skipped; the context is not aborted.
+dropped from the concatenated output but recorded in the `pf_load` response
+under `skipped_sources` (with a reason) and logged at `WARN` level. The
+request as a whole is not aborted.
 
 ---
 
@@ -156,13 +158,13 @@ Enable or disable individual tools. All tools default to enabled.
 
 ```yaml
 tools:
-  list_contexts: true
-  get_context:   true
-  search:        true
-  read:          true
-  deep_retrieve: false   # Phase 2 — ignored in Phase 1
-  list_agents:   false   # Phase 2 — ignored in Phase 1
-  write:         false   # Phase 4 — ignored in Phase 1
+  pf_maps:  true    # list_contexts: memory regions / contexts
+  pf_load:  true    # get_context: load a region
+  pf_scan:  true    # search across backends
+  pf_peek:  true    # read a resource by URI
+  pf_fault: false   # deep_retrieve — Phase 2, ignored in Phase 1
+  pf_ps:    false   # list_agents  — Phase 2, ignored in Phase 1
+  pf_poke:  false   # write        — Phase 4, ignored in Phase 1
 ```
 
 ---

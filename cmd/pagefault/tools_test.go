@@ -1,0 +1,418 @@
+package main
+
+import (
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/jet/pagefault/internal/tool"
+)
+
+// ─────────────────── resolveConfigPath ───────────────────
+
+func TestResolveConfigPath_ExplicitFlag(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "pagefault.yaml")
+	require.NoError(t, os.WriteFile(path, []byte("x"), 0o600))
+	got, err := resolveConfigPath(path)
+	require.NoError(t, err)
+	assert.Equal(t, path, got)
+}
+
+func TestResolveConfigPath_EnvFallback(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "from-env.yaml")
+	require.NoError(t, os.WriteFile(path, []byte("x"), 0o600))
+
+	t.Setenv("PAGEFAULT_CONFIG", path)
+	got, err := resolveConfigPath("")
+	require.NoError(t, err)
+	assert.Equal(t, path, got)
+}
+
+func TestResolveConfigPath_CwdFallback(t *testing.T) {
+	// Chdir into a tempdir that contains ./pagefault.yaml. Clear the
+	// env var so it doesn't short-circuit.
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "pagefault.yaml"), []byte("x"), 0o600))
+	t.Setenv("PAGEFAULT_CONFIG", "")
+	t.Chdir(dir)
+
+	got, err := resolveConfigPath("")
+	require.NoError(t, err)
+	// resolveConfigPath returns the literal "./pagefault.yaml" (cwd
+	// fallback), not an absolute path.
+	assert.Equal(t, "./pagefault.yaml", got)
+}
+
+func TestResolveConfigPath_NotFound(t *testing.T) {
+	t.Setenv("PAGEFAULT_CONFIG", "")
+	t.Chdir(t.TempDir()) // empty dir, no pagefault.yaml
+	_, err := resolveConfigPath("")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "config not found")
+}
+
+// ─────────────────── maps ───────────────────
+
+func TestRunMaps_Text(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := writeTestConfig(t, dir)
+
+	out := captureStdout(t, func() {
+		require.NoError(t, runMaps([]string{"--config", cfgPath}))
+	})
+	assert.Contains(t, out, "NAME")
+	assert.Contains(t, out, "DESCRIPTION")
+	assert.Contains(t, out, "demo")
+}
+
+func TestRunMaps_JSON(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := writeTestConfig(t, dir)
+
+	out := captureStdout(t, func() {
+		require.NoError(t, runMaps([]string{"--config", cfgPath, "--json"}))
+	})
+	var decoded tool.ListContextsOutput
+	require.NoError(t, json.Unmarshal([]byte(out), &decoded))
+	require.Len(t, decoded.Contexts, 1)
+	assert.Equal(t, "demo", decoded.Contexts[0].Name)
+}
+
+func TestRunMaps_ConfigNotFound(t *testing.T) {
+	t.Setenv("PAGEFAULT_CONFIG", "")
+	t.Chdir(t.TempDir())
+	err := runMaps(nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "config not found")
+}
+
+// ─────────────────── load ───────────────────
+
+func TestRunLoad_Text(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := writeTestConfig(t, dir)
+
+	out := captureStdout(t, func() {
+		require.NoError(t, runLoad([]string{"--config", cfgPath, "demo"}))
+	})
+	// writeTestConfig seeds data/README.md with "# hello\n\nworld\n".
+	assert.Contains(t, out, "hello")
+	assert.Contains(t, out, "world")
+	// pf_load prefixes each source with a "# <uri>" header.
+	assert.Contains(t, out, "memory://README.md")
+}
+
+func TestRunLoad_JSON(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := writeTestConfig(t, dir)
+
+	out := captureStdout(t, func() {
+		require.NoError(t, runLoad([]string{"--config", cfgPath, "--json", "demo"}))
+	})
+	var decoded tool.GetContextOutput
+	require.NoError(t, json.Unmarshal([]byte(out), &decoded))
+	assert.Equal(t, "demo", decoded.Name)
+	assert.Contains(t, decoded.Content, "hello")
+}
+
+func TestRunLoad_MissingName(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := writeTestConfig(t, dir)
+	err := runLoad([]string{"--config", cfgPath})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "usage")
+}
+
+func TestRunLoad_UnknownName(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := writeTestConfig(t, dir)
+	err := runLoad([]string{"--config", cfgPath, "does-not-exist"})
+	require.Error(t, err)
+}
+
+// ─────────────────── scan ───────────────────
+
+func TestRunScan_Text(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := writeTestConfig(t, dir)
+
+	out := captureStdout(t, func() {
+		require.NoError(t, runScan([]string{"--config", cfgPath, "hello"}))
+	})
+	assert.Contains(t, out, "BACKEND")
+	assert.Contains(t, out, "URI")
+	assert.Contains(t, out, "fs")
+	assert.Contains(t, out, "memory://README.md")
+}
+
+func TestRunScan_JSON(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := writeTestConfig(t, dir)
+
+	out := captureStdout(t, func() {
+		require.NoError(t, runScan([]string{"--config", cfgPath, "--json", "hello"}))
+	})
+	var decoded tool.SearchOutput
+	require.NoError(t, json.Unmarshal([]byte(out), &decoded))
+	require.NotEmpty(t, decoded.Results)
+	assert.Equal(t, "fs", decoded.Results[0].Backend)
+}
+
+func TestRunScan_MultiWordQuery(t *testing.T) {
+	// Positional args should be joined with spaces so the user can type
+	// `pagefault scan <multi word phrase>` without quoting. writeTestConfig
+	// seeds README.md with "# hello\n\nworld\n"; "# hello" is a two-token
+	// phrase that appears literally on line 1.
+	dir := t.TempDir()
+	cfgPath := writeTestConfig(t, dir)
+	out := captureStdout(t, func() {
+		require.NoError(t, runScan([]string{"--config", cfgPath, "#", "hello"}))
+	})
+	assert.Contains(t, out, "memory://README.md")
+}
+
+func TestRunScan_NoMatches(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := writeTestConfig(t, dir)
+	out := captureStdout(t, func() {
+		require.NoError(t, runScan([]string{"--config", cfgPath, "zzzzz-no-such-term-zzzzz"}))
+	})
+	assert.Contains(t, out, "no matches")
+}
+
+func TestRunScan_BackendRestriction(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := writeTestConfig(t, dir)
+	// Restricting to an unknown backend should surface an error.
+	err := runScan([]string{"--config", cfgPath, "--backends", "nope", "hello"})
+	require.Error(t, err)
+}
+
+func TestRunScan_MissingQuery(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := writeTestConfig(t, dir)
+	err := runScan([]string{"--config", cfgPath})
+	require.Error(t, err)
+}
+
+// ─────────────────── peek ───────────────────
+
+func TestRunPeek_Text(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := writeTestConfig(t, dir)
+
+	out := captureStdout(t, func() {
+		require.NoError(t, runPeek([]string{"--config", cfgPath, "memory://README.md"}))
+	})
+	assert.Contains(t, out, "hello")
+	assert.Contains(t, out, "world")
+}
+
+func TestRunPeek_LineRange(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := writeTestConfig(t, dir)
+
+	out := captureStdout(t, func() {
+		require.NoError(t, runPeek([]string{"--config", cfgPath, "--from", "1", "--to", "1", "memory://README.md"}))
+	})
+	// Line 1 of the seeded README is "# hello"; line 3 is "world".
+	assert.Contains(t, out, "# hello")
+	assert.NotContains(t, out, "world")
+}
+
+func TestRunPeek_JSON(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := writeTestConfig(t, dir)
+
+	out := captureStdout(t, func() {
+		require.NoError(t, runPeek([]string{"--config", cfgPath, "--json", "memory://README.md"}))
+	})
+	var decoded tool.ReadOutput
+	require.NoError(t, json.Unmarshal([]byte(out), &decoded))
+	require.NotNil(t, decoded.Resource)
+	assert.Equal(t, "memory://README.md", decoded.Resource.URI)
+}
+
+func TestRunPeek_MissingURI(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := writeTestConfig(t, dir)
+	err := runPeek([]string{"--config", cfgPath})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "usage")
+}
+
+func TestRunPeek_UnknownResource(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := writeTestConfig(t, dir)
+	err := runPeek([]string{"--config", cfgPath, "memory://nope.md"})
+	require.Error(t, err)
+}
+
+// ─────────────────── env + cwd fallback end-to-end ───────────────────
+
+func TestRunMaps_UsesEnvConfig(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := writeTestConfig(t, dir)
+	t.Setenv("PAGEFAULT_CONFIG", cfgPath)
+
+	out := captureStdout(t, func() {
+		require.NoError(t, runMaps(nil))
+	})
+	assert.Contains(t, out, "demo")
+}
+
+// ─────────────────── --no-filter ───────────────────
+
+func TestRunPeek_NoFilterBypassesFilters(t *testing.T) {
+	// Write a config that denies the seeded file via a path filter.
+	// Without --no-filter the peek should fail; with --no-filter it
+	// should succeed.
+	dir := t.TempDir()
+	dataDir := filepath.Join(dir, "data")
+	require.NoError(t, os.MkdirAll(dataDir, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(dataDir, "README.md"), []byte("# hello\n\nworld\n"), 0o600))
+
+	yaml := "" +
+		"server:\n" +
+		"  host: \"127.0.0.1\"\n" +
+		"  port: 8444\n" +
+		"auth:\n" +
+		"  mode: \"none\"\n" +
+		"backends:\n" +
+		"  - name: fs\n" +
+		"    type: filesystem\n" +
+		"    root: \"" + dataDir + "\"\n" +
+		"    include: [\"**/*.md\"]\n" +
+		"    uri_scheme: \"memory\"\n" +
+		"    sandbox: true\n" +
+		"contexts:\n" +
+		"  - name: demo\n" +
+		"    sources:\n" +
+		"      - backend: fs\n" +
+		"        uri: \"memory://README.md\"\n" +
+		"    max_size: 4000\n" +
+		"filters:\n" +
+		"  enabled: true\n" +
+		"  path:\n" +
+		"    deny: [\"memory://README.md\"]\n" +
+		"audit:\n" +
+		"  enabled: false\n"
+	cfgPath := filepath.Join(dir, "pagefault.yaml")
+	require.NoError(t, os.WriteFile(cfgPath, []byte(yaml), 0o600))
+
+	// Without --no-filter: blocked.
+	err := runPeek([]string{"--config", cfgPath, "memory://README.md"})
+	require.Error(t, err, "peek should be denied by path filter")
+
+	// With --no-filter: allowed.
+	out := captureStdout(t, func() {
+		require.NoError(t, runPeek([]string{"--config", cfgPath, "--no-filter", "memory://README.md"}))
+	})
+	assert.Contains(t, out, "hello")
+}
+
+// ─────────────────── parseInterspersed / positional ordering ───────────────────
+
+func TestRunPeek_PositionalBeforeFlags(t *testing.T) {
+	// Regression: Go's stdlib flag.Parse stops at the first non-flag
+	// token. parseInterspersed hoists flags past positionals, so
+	// `peek <uri> --config X` works the same as `peek --config X <uri>`.
+	dir := t.TempDir()
+	cfgPath := writeTestConfig(t, dir)
+
+	out := captureStdout(t, func() {
+		require.NoError(t, runPeek([]string{"memory://README.md", "--config", cfgPath, "--from", "1", "--to", "1"}))
+	})
+	assert.Contains(t, out, "# hello")
+	assert.NotContains(t, out, "world")
+}
+
+func TestRunScan_FlagsAfterQuery(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := writeTestConfig(t, dir)
+
+	out := captureStdout(t, func() {
+		require.NoError(t, runScan([]string{"hello", "--config", cfgPath, "--limit", "5"}))
+	})
+	assert.Contains(t, out, "memory://README.md")
+}
+
+func TestRunPeek_DoubleDashTerminator(t *testing.T) {
+	// Everything after `--` should be treated as positional, even
+	// flag-looking tokens. A URI that starts with `--` is bizarre but the
+	// terminator must still work.
+	dir := t.TempDir()
+	cfgPath := writeTestConfig(t, dir)
+	// `--no-filter` after `--` should NOT set the flag; the peek should
+	// be treated as a URI and fail with "not found".
+	err := runPeek([]string{"--config", cfgPath, "--", "--no-filter"})
+	require.Error(t, err)
+	// Not an "unknown flag" error — the token reached the URI slot.
+	assert.NotContains(t, err.Error(), "flag provided but not defined")
+}
+
+// ─────────────────── audit stdout → stderr redirect ───────────────────
+
+func TestLoadDispatcherForCLI_RedirectsStdoutAudit(t *testing.T) {
+	// A config with audit.mode: stdout would normally pollute stdout
+	// with JSON audit lines. loadDispatcherForCLI must rewrite
+	// mode → "stderr" so `pagefault load … | jq .` works.
+	dir := t.TempDir()
+	dataDir := filepath.Join(dir, "data")
+	require.NoError(t, os.MkdirAll(dataDir, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(dataDir, "README.md"), []byte("# hello\n\nworld\n"), 0o600))
+	yaml := "" +
+		"server:\n" +
+		"  host: \"127.0.0.1\"\n" +
+		"  port: 8444\n" +
+		"auth:\n" +
+		"  mode: \"none\"\n" +
+		"backends:\n" +
+		"  - name: fs\n" +
+		"    type: filesystem\n" +
+		"    root: \"" + dataDir + "\"\n" +
+		"    include: [\"**/*.md\"]\n" +
+		"    uri_scheme: \"memory\"\n" +
+		"    sandbox: true\n" +
+		"contexts:\n" +
+		"  - name: demo\n" +
+		"    sources:\n" +
+		"      - backend: fs\n" +
+		"        uri: \"memory://README.md\"\n" +
+		"    max_size: 4000\n" +
+		"filters:\n" +
+		"  enabled: false\n" +
+		"audit:\n" +
+		"  enabled: true\n" +
+		"  mode: \"stdout\"\n"
+	cfgPath := filepath.Join(dir, "pagefault.yaml")
+	require.NoError(t, os.WriteFile(cfgPath, []byte(yaml), 0o600))
+
+	// Run with --json so we can cleanly assert stdout contains only the
+	// payload, not an audit line.
+	out := captureStdout(t, func() {
+		require.NoError(t, runMaps([]string{"--config", cfgPath, "--json"}))
+	})
+	// Stdout must be parseable as a single JSON object matching the
+	// maps payload shape — no audit-line contamination.
+	var decoded tool.ListContextsOutput
+	require.NoError(t, json.Unmarshal([]byte(out), &decoded), "stdout should be clean payload, got: %q", out)
+	require.NotContains(t, out, "caller_id", "audit line must not leak onto stdout")
+}
+
+// ─────────────────── singleLine helper ───────────────────
+
+func TestSingleLine(t *testing.T) {
+	assert.Equal(t, "a b c", singleLine("a\nb\nc"))
+	assert.Equal(t, "a b c", singleLine("a\tb\tc"))
+	assert.Equal(t, "a", singleLine("  a\n"))
+	assert.Equal(t, "", singleLine(""))
+	// Mixed tabs and newlines collapse + trim.
+	assert.Equal(t, "x y z", singleLine("x\ty\nz\n"))
+}

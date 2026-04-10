@@ -172,20 +172,20 @@ func TestLoad_FileNotFound(t *testing.T) {
 
 func TestToolsConfig_Enabled_DefaultEnabled(t *testing.T) {
 	var t0 ToolsConfig // all nil
-	assert.True(t, t0.Enabled("list_contexts"))
-	assert.True(t, t0.Enabled("get_context"))
-	assert.True(t, t0.Enabled("search"))
-	assert.True(t, t0.Enabled("read"))
-	assert.True(t, t0.Enabled("write"))
+	assert.True(t, t0.Enabled("pf_maps"))
+	assert.True(t, t0.Enabled("pf_load"))
+	assert.True(t, t0.Enabled("pf_scan"))
+	assert.True(t, t0.Enabled("pf_peek"))
+	assert.True(t, t0.Enabled("pf_poke"))
 	assert.False(t, t0.Enabled("nonexistent"))
 }
 
 func TestToolsConfig_Enabled_ExplicitlyDisabled(t *testing.T) {
 	f := false
-	tc := ToolsConfig{Search: &f, Write: &f}
-	assert.False(t, tc.Enabled("search"))
-	assert.False(t, tc.Enabled("write"))
-	assert.True(t, tc.Enabled("read"), "unset tools should default to enabled")
+	tc := ToolsConfig{PfScan: &f, PfPoke: &f}
+	assert.False(t, tc.Enabled("pf_scan"))
+	assert.False(t, tc.Enabled("pf_poke"))
+	assert.True(t, tc.Enabled("pf_peek"), "unset tools should default to enabled")
 }
 
 func TestDecodeFilesystemBackend(t *testing.T) {
