@@ -550,9 +550,22 @@ scheme or resource not found).
 ## `pf_fault`
 
 The real page fault. Spawns a subagent (a full external process with its
-own tool access) to carry out a natural-language retrieval task and
-returns the agent's final response. Use when `pf_scan` / `pf_peek` miss
-and you need something smarter than substring matching.
+own tool access) to carry out a natural-language retrieval task. Use
+when `pf_scan` / `pf_peek` miss and you need something smarter than
+substring matching.
+
+**Async by default (0.10.0+).** `pf_fault` returns *immediately* with a
+`task_id` and `status: "running"`; the subagent runs on a **detached
+goroutine** inside pagefault's in-memory task manager, so an HTTP
+disconnect or a middleware timeout no longer kills the spawn. Callers
+must **poll `pf_ps(task_id=...)`** for the result — the canonical
+cadence is **30 seconds × 6 (≈3 minutes)** for the default
+`timeout_seconds: 120`; raise the poll count proportionally for
+larger timeouts. Set `wait: true` to restore the old synchronous
+behaviour (the handler blocks until the task is terminal and returns
+the full answer inline). Sync mode is bounded by `timeout_seconds`
+and is vulnerable to HTTP-middleware timeouts — use it for CLI
+scripts and tests, not for MCP agent clients.
 
 **Server-side prompt framing.** Pagefault wraps the caller's raw
 `query` with a prompt template *before* passing it to the subagent
@@ -576,59 +589,109 @@ already does that.
 |--------------------|--------|----------|---------|-----------------------------------------------------------------------|
 | `query`            | string | yes      | —       | The user's question in natural language. Include concrete entity names, topics, and dates. Do not rephrase as "search for X" — the server-side prompt template already frames the subagent as a memory retriever. |
 | `agent`            | string | no       | first   | Subagent id to spawn. **When more than one agent is configured, call `pf_ps` first and pick by description** — the "first configured" fallback silently picks the wrong scope (e.g. a work agent for a personal question). Only omit in single-agent setups. |
-| `timeout_seconds`  | int    | no       | 120     | Max seconds to wait for the agent before returning a partial result. **120 is a floor**, not an average — real deep-retrieval runs typically take 20-40s to produce their first token and can exceed a minute when fanning out across multiple sources. Raise to 180-300 for hard lookups; never go below 120. On timeout the response is `200 OK` with `timed_out: true`. |
+| `timeout_seconds`  | int    | no       | 120     | Max seconds the subagent is allowed to run before the task is marked `timed_out`. **120 is a floor**, not an average — real deep-retrieval runs typically take 20-40s to produce their first token and can exceed a minute when fanning out across multiple sources. Raise to 180-300 for hard lookups; never go below 120. On timeout the poll response carries `status: "timed_out"` with any partial output the backend captured in `partial_result`. |
 | `time_range_start` | string | no       | —       | Optional free-form earliest date/time. Pagefault does not parse the value; it is formatted into a hint line and passed through to the subagent via the prompt template's `{time_range}` placeholder. Any human-readable form works (ISO 8601, "last Tuesday", "Q1 2026"). |
 | `time_range_end`   | string | no       | —       | Optional free-form latest date/time. Same rules. Combine with `time_range_start` for a window, or set only one for "from X onwards" / "up to Y". |
+| `wait`             | bool   | no       | false   | Synchronous compatibility flag. Default (false) returns immediately with `{task_id, status: "running"}` and the caller polls `pf_ps(task_id)` for the result. Set to `true` to block the HTTP call until the task is terminal and return the full `{answer, elapsed_seconds, ...}` inline. Sync mode is bounded by `timeout_seconds` and can be killed by HTTP-middleware timeouts — MCP agent clients should leave this unset and use the polling pattern; CLI scripts and tests are the main sync-mode consumers. |
 
-**Response (success):**
+**Response (async, default — `wait` omitted or false):**
 
 ```json
 {
-  "answer": "The agent's synthesized response...",
+  "task_id": "pf_tk_2qK1s5E9fG8rP0xV4tT9Dg",
+  "status": "running",
   "agent": "wocha",
   "backend": "openclaw",
+  "spawn_id": "pf_sp_Jk4pP9tS4mH2fL8nR3wZ5Q"
+}
+```
+
+The caller then polls `pf_ps` with the returned `task_id` every 30
+seconds until `status` is `done`, `failed`, or `timed_out`. See
+`pf_ps` below for the poll response shape.
+
+**Response (sync, `wait: true`):** the handler blocks on the task and
+returns the terminal snapshot inline. On success:
+
+```json
+{
+  "task_id": "pf_tk_2qK1s5E9fG8rP0xV4tT9Dg",
+  "status": "done",
+  "agent": "wocha",
+  "backend": "openclaw",
+  "spawn_id": "pf_sp_Jk4pP9tS4mH2fL8nR3wZ5Q",
+  "answer": "The agent's synthesised response...",
   "elapsed_seconds": 47.3
 }
 ```
 
-**Response (timeout):** timeouts are NOT HTTP errors — the structured
-response carries a `timed_out` flag and any partial output the backend
-captured before the kill:
+On timeout (still not an HTTP error):
 
 ```json
 {
+  "task_id": "pf_tk_...",
+  "status": "timed_out",
   "agent": "wocha",
   "backend": "openclaw",
-  "elapsed_seconds": 120.0,
   "timed_out": true,
-  "partial_result": "...text captured before the deadline, if any..."
+  "partial_result": "...text captured before the deadline, if any...",
+  "elapsed_seconds": 120.0
 }
 ```
 
+On backend failure:
+
+```json
+{
+  "task_id": "pf_tk_...",
+  "status": "failed",
+  "agent": "wocha",
+  "backend": "openclaw",
+  "error": "subagent crashed: exit status 1",
+  "elapsed_seconds": 3.1
+}
+```
+
+**`spawn_id` (session isolation).** Every call is assigned a
+cryptographically random `pf_sp_*` token that pagefault substitutes
+into the subagent backend's command / URL / body template wherever
+the operator put `{spawn_id}`. Wiring this into an agent runner's
+session flag (e.g. `openclaw agent run --session-id {spawn_id}`)
+gives one fresh session per `pf_fault` call and prevents cross-call
+context bleed. See `docs/config-doc.md` → "Subagent backends:
+`{spawn_id}` placeholder" for the canonical openclaw wiring.
+
 **Errors:** 400 (empty query), 404 (unknown agent / no subagent backend
-configured), 500 (backend spawn error).
+configured), 429 (task manager at `max_concurrent` — retry after
+~30s), 500 (backend spawn error).
 
 ---
 
 ## `pf_ps`
 
-List every subagent exposed by every configured `SubagentBackend`. Zero
-cost — agents are read from config, no process/network I/O.
+`ps`-style inspection of **what's happening with your agents** —
+serves two modes:
 
-**Call this before `pf_fault` and `pf_poke` mode:agent whenever more
-than one agent is configured.** The descriptions are how you route a
-query to the right agent (work vs personal, short-term vs long-term,
-journal vs project, etc.). The "first configured agent" fallback on
-`pf_fault.agent` and `pf_poke.agent` exists for single-agent configs;
-relying on it in a multi-agent setup silently routes to the wrong
-scope. If the user's question straddles scopes, make two `pf_fault`
-calls and merge the results.
+- **Mode A — list agents** (default, `task_id` empty): returns every
+  configured subagent (id, description, backend). Zero cost; the
+  classic use. **Call this before `pf_fault` / `pf_poke` mode:agent
+  whenever more than one agent is configured** so you can route by
+  description. The "first configured agent" fallback on
+  `pf_fault.agent` exists for single-agent configs; relying on it in
+  a multi-agent setup silently routes to the wrong scope.
+- **Mode B — poll a task** (`task_id` set, 0.10.0+): returns a
+  snapshot of one in-flight or recently-completed `pf_fault` task.
+  This is how you drive the async `pf_fault` polling pattern.
 
 **Endpoint:** `POST /api/pf_ps`
 
-**Request body:** none (empty `{}` is accepted)
+**Request:**
 
-**Response:**
+| Field     | Type   | Required | Default | Notes                                                                 |
+|-----------|--------|----------|---------|-----------------------------------------------------------------------|
+| `task_id` | string | no       | —       | Task id from a previous `pf_fault` call (format `pf_tk_*`). When set, `pf_ps` returns a task snapshot instead of the agent list. Unknown or TTL-expired ids return 404 `resource_not_found`. Task snapshots are kept in memory for `server.tasks.ttl_seconds` (default 600s ≈ 10 min) after the task reaches a terminal state. |
+
+**Response (Mode A — list agents):**
 
 ```json
 {
@@ -647,6 +710,42 @@ routing ("summarise my medical history" going to the work agent).
 Each entry's `backend` is the name of the `SubagentBackend` that hosts
 the agent. Multiple backends may expose agents with the same id — always
 disambiguate via `backend` when that happens.
+
+**Response (Mode B — poll a task):** the snapshot shape mirrors
+`pf_fault`'s sync response — callers can feed either through the same
+decoder.
+
+```json
+{
+  "task_id": "pf_tk_2qK1s5E9fG8rP0xV4tT9Dg",
+  "status": "done",
+  "agent": "wocha",
+  "backend": "openclaw",
+  "spawn_id": "pf_sp_Jk4pP9tS4mH2fL8nR3wZ5Q",
+  "answer": "The agent's synthesised response...",
+  "elapsed_seconds": 47.3
+}
+```
+
+While the task is still running:
+
+```json
+{
+  "task_id": "pf_tk_...",
+  "status": "running",
+  "agent": "wocha",
+  "backend": "openclaw",
+  "spawn_id": "pf_sp_..."
+}
+```
+
+**Canonical polling loop:** after `pf_fault` returns a `task_id`,
+sleep 30 seconds, call `pf_ps(task_id=...)`, and repeat up to 6
+times (for the default 120s `timeout_seconds`). Stop polling the
+moment `status` is terminal (`done`, `failed`, `timed_out`). Raise
+the poll count proportionally for larger `timeout_seconds` values.
+Do not poll faster than 30s — the subagent is mid-work and pagefault
+does nothing useful between polls.
 
 ---
 

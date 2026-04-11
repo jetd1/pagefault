@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -14,6 +16,7 @@ import (
 	"github.com/jet/pagefault/internal/backend"
 	"github.com/jet/pagefault/internal/filter"
 	"github.com/jet/pagefault/internal/model"
+	"github.com/jet/pagefault/internal/task"
 )
 
 // mockSubagent implements backend.SubagentBackend for dispatcher tests.
@@ -21,6 +24,11 @@ import (
 // a timeout, or an error. The recorded request lets tests assert that
 // the dispatcher populated the purpose / time range / target fields
 // correctly before calling into the backend.
+//
+// The mock takes an internal mutex because 0.10.0's task manager
+// runs Spawn on a background goroutine — tests that inspect
+// lastReq under -race need the write and read to happen under the
+// same lock.
 type mockSubagent struct {
 	name      string
 	agents    []backend.AgentInfo
@@ -28,6 +36,7 @@ type mockSubagent struct {
 	spawnOut  string
 	spawnWait time.Duration
 
+	mu      sync.Mutex
 	lastReq backend.SpawnRequest
 	spawns  int
 }
@@ -46,15 +55,28 @@ func (m *mockSubagent) ListAgents() []backend.AgentInfo {
 	return append([]backend.AgentInfo(nil), m.agents...)
 }
 func (m *mockSubagent) Spawn(ctx context.Context, req backend.SpawnRequest) (string, error) {
+	m.mu.Lock()
 	m.spawns++
 	m.lastReq = req
-	if m.spawnWait > 0 {
+	wait := m.spawnWait
+	out := m.spawnOut
+	err := m.spawnErr
+	m.mu.Unlock()
+	if wait > 0 {
 		select {
-		case <-time.After(m.spawnWait):
+		case <-time.After(wait):
 		case <-ctx.Done():
 		}
 	}
-	return m.spawnOut, m.spawnErr
+	return out, err
+}
+
+// snapshot returns the last recorded Spawn request under the mutex.
+// Tests must use this instead of touching m.lastReq directly.
+func (m *mockSubagent) snapshot() (backend.SpawnRequest, int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.lastReq, m.spawns
 }
 
 func newSubagentDispatcher(t *testing.T, subs ...backend.Backend) *ToolDispatcher {
@@ -103,7 +125,7 @@ func TestDispatcher_ListAgents_AcrossBackends(t *testing.T) {
 
 func TestDispatcher_DeepRetrieve_NoSubagent(t *testing.T) {
 	d, _ := newTestDispatcher(t)
-	_, err := d.DeepRetrieve(context.Background(), "q", "", time.Second, model.AnonymousCaller, DeepRetrieveOptions{})
+	_, err := d.DeepRetrieve(context.Background(), "q", "", time.Second, model.AnonymousCaller, DeepRetrieveOptions{Wait: true})
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, model.ErrAgentNotFound))
 	assert.Contains(t, err.Error(), "no subagent backend")
@@ -116,11 +138,13 @@ func TestDispatcher_DeepRetrieve_UnknownAgent(t *testing.T) {
 	}
 	d := newSubagentDispatcher(t, a)
 
-	_, err := d.DeepRetrieve(context.Background(), "q", "does-not-exist", time.Second, model.AnonymousCaller, DeepRetrieveOptions{})
+	_, err := d.DeepRetrieve(context.Background(), "q", "does-not-exist", time.Second, model.AnonymousCaller, DeepRetrieveOptions{Wait: true})
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, model.ErrAgentNotFound))
 }
 
+// TestDispatcher_DeepRetrieve_DefaultAgent — happy-path sync (Wait=true)
+// call picks the first agent and returns the subagent's answer inline.
 func TestDispatcher_DeepRetrieve_DefaultAgent(t *testing.T) {
 	a := &mockSubagent{
 		name:     "sa",
@@ -129,16 +153,24 @@ func TestDispatcher_DeepRetrieve_DefaultAgent(t *testing.T) {
 	}
 	d := newSubagentDispatcher(t, a)
 
-	res, err := d.DeepRetrieve(context.Background(), "say hi", "", 5*time.Second, model.AnonymousCaller, DeepRetrieveOptions{})
+	res, err := d.DeepRetrieve(context.Background(), "say hi", "", 5*time.Second, model.AnonymousCaller, DeepRetrieveOptions{Wait: true})
 	require.NoError(t, err)
 	assert.Equal(t, "hello from alpha", res.Answer)
 	assert.Equal(t, "alpha", res.Agent)
 	assert.Equal(t, "sa", res.Backend)
+	assert.Equal(t, "done", res.Status)
 	assert.False(t, res.TimedOut)
 	assert.Empty(t, res.PartialResult)
-	assert.Equal(t, "alpha", a.lastReq.AgentID)
-	assert.Equal(t, "say hi", a.lastReq.Task)
-	assert.Equal(t, backend.SpawnPurposeRetrieve, a.lastReq.Purpose)
+	assert.NotEmpty(t, res.TaskID, "sync path still records the task_id")
+	assert.NotEmpty(t, res.SpawnID, "spawn id is surfaced to the caller")
+	assert.True(t, strings.HasPrefix(res.SpawnID, "pf_sp_"))
+
+	gotReq, gotSpawns := a.snapshot()
+	assert.Equal(t, "alpha", gotReq.AgentID)
+	assert.Equal(t, "say hi", gotReq.Task)
+	assert.Equal(t, backend.SpawnPurposeRetrieve, gotReq.Purpose)
+	assert.Equal(t, res.SpawnID, gotReq.SpawnID, "spawn_id plumbs through to the backend")
+	assert.Equal(t, 1, gotSpawns)
 }
 
 func TestDispatcher_DeepRetrieve_ExplicitAgentOnSecondBackend(t *testing.T) {
@@ -153,13 +185,15 @@ func TestDispatcher_DeepRetrieve_ExplicitAgentOnSecondBackend(t *testing.T) {
 	}
 	d := newSubagentDispatcher(t, a, b)
 
-	res, err := d.DeepRetrieve(context.Background(), "q", "beta", 5*time.Second, model.AnonymousCaller, DeepRetrieveOptions{})
+	res, err := d.DeepRetrieve(context.Background(), "q", "beta", 5*time.Second, model.AnonymousCaller, DeepRetrieveOptions{Wait: true})
 	require.NoError(t, err)
 	assert.Equal(t, "from beta", res.Answer)
 	assert.Equal(t, "beta", res.Agent)
 	assert.Equal(t, "http", res.Backend)
-	assert.Equal(t, 0, a.spawns, "alpha backend should not have been spawned")
-	assert.Equal(t, 1, b.spawns)
+	_, aSpawns := a.snapshot()
+	_, bSpawns := b.snapshot()
+	assert.Equal(t, 0, aSpawns, "alpha backend should not have been spawned")
+	assert.Equal(t, 1, bSpawns)
 }
 
 func TestDispatcher_DeepRetrieve_Timeout(t *testing.T) {
@@ -171,9 +205,10 @@ func TestDispatcher_DeepRetrieve_Timeout(t *testing.T) {
 	}
 	d := newSubagentDispatcher(t, a)
 
-	res, err := d.DeepRetrieve(context.Background(), "q", "", time.Second, model.AnonymousCaller, DeepRetrieveOptions{})
+	res, err := d.DeepRetrieve(context.Background(), "q", "", time.Second, model.AnonymousCaller, DeepRetrieveOptions{Wait: true})
 	require.NoError(t, err, "timeout should not propagate as error")
 	assert.True(t, res.TimedOut)
+	assert.Equal(t, "timed_out", res.Status)
 	assert.Equal(t, "partial", res.PartialResult)
 	assert.Empty(t, res.Answer)
 	assert.Equal(t, "alpha", res.Agent)
@@ -187,9 +222,14 @@ func TestDispatcher_DeepRetrieve_BackendError(t *testing.T) {
 	}
 	d := newSubagentDispatcher(t, a)
 
-	_, err := d.DeepRetrieve(context.Background(), "q", "", time.Second, model.AnonymousCaller, DeepRetrieveOptions{})
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "kaboom")
+	// In 0.10.0 a non-timeout backend error no longer propagates
+	// as a Go-level error from DeepRetrieve — it is recorded on
+	// the task with Status=failed. The caller reads .Error on the
+	// result instead of relying on the `err` return.
+	res, err := d.DeepRetrieve(context.Background(), "q", "", time.Second, model.AnonymousCaller, DeepRetrieveOptions{Wait: true})
+	require.NoError(t, err)
+	assert.Equal(t, "failed", res.Status)
+	assert.Contains(t, res.Error, "kaboom")
 }
 
 func TestDispatcher_DeepRetrieve_EmptyQuery(t *testing.T) {
@@ -199,7 +239,7 @@ func TestDispatcher_DeepRetrieve_EmptyQuery(t *testing.T) {
 	}
 	d := newSubagentDispatcher(t, a)
 
-	_, err := d.DeepRetrieve(context.Background(), "", "", time.Second, model.AnonymousCaller, DeepRetrieveOptions{})
+	_, err := d.DeepRetrieve(context.Background(), "", "", time.Second, model.AnonymousCaller, DeepRetrieveOptions{Wait: true})
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, model.ErrInvalidRequest))
 }
@@ -218,9 +258,56 @@ func TestDispatcher_DeepRetrieve_TimeRangePassthrough(t *testing.T) {
 	d := newSubagentDispatcher(t, a)
 
 	_, err := d.DeepRetrieve(context.Background(), "q", "", time.Second, model.AnonymousCaller,
-		DeepRetrieveOptions{TimeRange: "2026-04-01 to 2026-04-11"})
+		DeepRetrieveOptions{Wait: true, TimeRange: "2026-04-01 to 2026-04-11"})
 	require.NoError(t, err)
-	assert.Equal(t, "2026-04-01 to 2026-04-11", a.lastReq.TimeRange)
+	gotReq, _ := a.snapshot()
+	assert.Equal(t, "2026-04-01 to 2026-04-11", gotReq.TimeRange)
+}
+
+// TestDispatcher_DeepRetrieve_Async — the 0.10.0 default: no Wait
+// flag, so DeepRetrieve returns immediately with a running snapshot
+// and the caller must poll GetTask for the final answer.
+func TestDispatcher_DeepRetrieve_Async(t *testing.T) {
+	a := &mockSubagent{
+		name:      "sa",
+		agents:    []backend.AgentInfo{{ID: "alpha"}},
+		spawnOut:  "async answer",
+		spawnWait: 50 * time.Millisecond,
+	}
+	d := newSubagentDispatcher(t, a)
+
+	res, err := d.DeepRetrieve(context.Background(), "q", "", 5*time.Second, model.AnonymousCaller, DeepRetrieveOptions{})
+	require.NoError(t, err)
+	assert.Equal(t, "running", res.Status)
+	assert.NotEmpty(t, res.TaskID)
+	assert.True(t, strings.HasPrefix(res.TaskID, "pf_tk_"))
+	assert.NotEmpty(t, res.SpawnID)
+	assert.Empty(t, res.Answer, "async path must not block for the answer")
+
+	// Wait for completion via the manager, then poll GetTask.
+	final, err := d.TaskManager().Wait(context.Background(), res.TaskID)
+	require.NoError(t, err)
+	assert.Equal(t, task.StatusDone, final.Status)
+
+	polled, err := d.GetTask(context.Background(), res.TaskID, model.AnonymousCaller)
+	require.NoError(t, err)
+	assert.Equal(t, "done", polled.Status)
+	assert.Equal(t, "async answer", polled.Answer)
+	assert.Equal(t, res.SpawnID, polled.SpawnID, "spawn_id persists across submit → poll")
+}
+
+// TestDispatcher_GetTask_Unknown — polling a task id that was never
+// submitted (or aged out past the TTL) returns ErrResourceNotFound.
+func TestDispatcher_GetTask_Unknown(t *testing.T) {
+	a := &mockSubagent{
+		name:   "sa",
+		agents: []backend.AgentInfo{{ID: "alpha"}},
+	}
+	d := newSubagentDispatcher(t, a)
+
+	_, err := d.GetTask(context.Background(), "pf_tk_ghost", model.AnonymousCaller)
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, model.ErrResourceNotFound))
 }
 
 // TestDispatcher_DelegateWrite drives the pf_poke mode:agent path
@@ -239,12 +326,15 @@ func TestDispatcher_DelegateWrite(t *testing.T) {
 	res, err := d.DelegateWrite(context.Background(),
 		"fixed the auth regression at 3pm",
 		"", 5*time.Second, model.AnonymousCaller,
-		DelegateWriteOptions{Target: "daily"})
+		DelegateWriteOptions{Wait: true, Target: "daily"})
 	require.NoError(t, err)
 	assert.Equal(t, "persisted to notes/foo.md", res.Answer)
-	assert.Equal(t, backend.SpawnPurposeWrite, a.lastReq.Purpose)
-	assert.Equal(t, "daily", a.lastReq.Target)
-	assert.Equal(t, "fixed the auth regression at 3pm", a.lastReq.Task)
+	assert.Equal(t, "done", res.Status)
+	gotReq, _ := a.snapshot()
+	assert.Equal(t, backend.SpawnPurposeWrite, gotReq.Purpose)
+	assert.Equal(t, "daily", gotReq.Target)
+	assert.Equal(t, "fixed the auth regression at 3pm", gotReq.Task)
+	assert.NotEmpty(t, gotReq.SpawnID)
 }
 
 // TestDispatcher_DelegateWrite_EmptyContent — validation guard.
@@ -255,7 +345,7 @@ func TestDispatcher_DelegateWrite_EmptyContent(t *testing.T) {
 	}
 	d := newSubagentDispatcher(t, a)
 
-	_, err := d.DelegateWrite(context.Background(), "", "", time.Second, model.AnonymousCaller, DelegateWriteOptions{})
+	_, err := d.DelegateWrite(context.Background(), "", "", time.Second, model.AnonymousCaller, DelegateWriteOptions{Wait: true})
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, model.ErrInvalidRequest))
 }

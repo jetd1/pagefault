@@ -338,6 +338,11 @@ func runPeek(args []string) error {
 // runFault implements `pagefault fault <query>` — the CLI face of
 // pf_fault. It spawns a subagent to perform deep retrieval and prints
 // the answer (or the partial result + a notice on timeout).
+//
+// Unlike the wire / MCP surface, the CLI form defaults to synchronous
+// (Wait=true) because a human at a shell expects the command to block
+// until done. Pass --async to get the 0.10.0 async return (task_id +
+// status=running); useful for scripting or smoke-testing the poll path.
 func runFault(args []string) error {
 	fs := flag.NewFlagSet("fault", flag.ContinueOnError)
 	configPath, noFilter, asJSON := registerCommonFlags(fs)
@@ -348,11 +353,12 @@ func runFault(args []string) error {
 	// hints. Separate names avoid the subcommand collision.
 	after := fs.String("after", "", "optional earliest date/time for the subagent's search (free-form)")
 	before := fs.String("before", "", "optional latest date/time for the subagent's search (free-form)")
+	async := fs.Bool("async", false, "return immediately with a task_id instead of blocking (poll with `pagefault ps <task_id>`)")
 	if err := parseInterspersed(fs, args); err != nil {
 		return err
 	}
 	if fs.NArg() < 1 {
-		return errors.New("usage: pagefault fault <query...> [--config PATH] [--agent ID] [--timeout N] [--after DATE] [--before DATE] [--no-filter] [--json]")
+		return errors.New("usage: pagefault fault <query...> [--config PATH] [--agent ID] [--timeout N] [--after DATE] [--before DATE] [--async] [--no-filter] [--json]")
 	}
 	query := strings.Join(fs.Args(), " ")
 
@@ -368,6 +374,7 @@ func runFault(args []string) error {
 		TimeoutSeconds: *timeoutSec,
 		TimeRangeStart: *after,
 		TimeRangeEnd:   *before,
+		Wait:           !*async,
 	}, cliCaller)
 	if err != nil {
 		return err
@@ -377,6 +384,18 @@ func runFault(args []string) error {
 		return printJSON(out)
 	}
 
+	if *async {
+		fmt.Printf("task_id: %s\n", out.TaskID)
+		fmt.Printf("status:  %s\n", out.Status)
+		fmt.Printf("agent:   %s\n", out.Agent)
+		fmt.Printf("backend: %s\n", out.Backend)
+		if out.SpawnID != "" {
+			fmt.Printf("spawn:   %s\n", out.SpawnID)
+		}
+		fmt.Fprintf(os.Stderr, "\nPoll with: pagefault ps %s\n", out.TaskID)
+		return nil
+	}
+
 	if out.TimedOut {
 		fmt.Fprintf(os.Stderr, "(timed out after %.1fs — showing partial result)\n", out.ElapsedSeconds)
 		fmt.Print(out.PartialResult)
@@ -384,6 +403,9 @@ func runFault(args []string) error {
 			fmt.Println()
 		}
 		return nil
+	}
+	if out.Error != "" {
+		return fmt.Errorf("subagent failed: %s", out.Error)
 	}
 	fmt.Print(out.Answer)
 	if !strings.HasSuffix(out.Answer, "\n") {
@@ -471,8 +493,12 @@ func runPoke(args []string) error {
 
 // ─────────────────── ps (pf_ps) ───────────────────
 
-// runPs implements `pagefault ps` — the CLI face of pf_ps. It lists
-// every subagent exposed by every configured SubagentBackend.
+// runPs implements `pagefault ps` — the CLI face of pf_ps. With no
+// positional argument it lists every subagent (Mode A — the ps-style
+// default). With a `pf_tk_*` task id it polls that task's status
+// (Mode B — the 0.10.0 async pf_fault companion), printing the
+// terminal result when done or the running snapshot when still in
+// flight.
 func runPs(args []string) error {
 	fs := flag.NewFlagSet("ps", flag.ContinueOnError)
 	configPath, noFilter, asJSON := registerCommonFlags(fs)
@@ -485,6 +511,46 @@ func runPs(args []string) error {
 		return err
 	}
 	defer func() { _ = closer() }()
+
+	// If the operator passed a positional task id, switch to
+	// Mode B — task polling. Otherwise fall through to the
+	// classic agent list.
+	if fs.NArg() > 0 {
+		taskID := fs.Arg(0)
+		status, err := tool.HandleTaskStatus(context.Background(), d, tool.ListAgentsInput{TaskID: taskID}, cliCaller)
+		if err != nil {
+			return err
+		}
+		if *asJSON {
+			return printJSON(status)
+		}
+		fmt.Printf("task_id: %s\n", status.TaskID)
+		fmt.Printf("status:  %s\n", status.Status)
+		fmt.Printf("agent:   %s\n", status.Agent)
+		fmt.Printf("backend: %s\n", status.Backend)
+		if status.SpawnID != "" {
+			fmt.Printf("spawn:   %s\n", status.SpawnID)
+		}
+		switch status.Status {
+		case "done":
+			fmt.Fprintf(os.Stderr, "\n(elapsed %.1fs)\n", status.ElapsedSeconds)
+			fmt.Print(status.Answer)
+			if !strings.HasSuffix(status.Answer, "\n") {
+				fmt.Println()
+			}
+		case "timed_out":
+			fmt.Fprintf(os.Stderr, "\n(timed out after %.1fs — showing partial result)\n", status.ElapsedSeconds)
+			fmt.Print(status.PartialResult)
+			if !strings.HasSuffix(status.PartialResult, "\n") {
+				fmt.Println()
+			}
+		case "failed":
+			return fmt.Errorf("subagent failed: %s", status.Error)
+		case "running":
+			fmt.Fprintln(os.Stderr, "\n(still running — poll again in ~30s)")
+		}
+		return nil
+	}
 
 	out, err := tool.HandleListAgents(context.Background(), d, tool.ListAgentsInput{}, cliCaller)
 	if err != nil {

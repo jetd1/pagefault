@@ -154,8 +154,15 @@ func handleWriteAgent(ctx context.Context, d *dispatcher.ToolDispatcher, in Writ
 		timeout = defaultDeepRetrieveTimeout
 	}
 
+	// pf_poke mode:agent is synchronous-by-default — clients expect
+	// the call to return with placement confirmed, not with a bare
+	// task id to poll. The 0.10.0 async task manager still runs the
+	// Spawn on a detached goroutine so HTTP disconnects do not kill
+	// the subagent, but the dispatcher blocks on task completion
+	// and surfaces the final result inline.
 	res, err := d.DelegateWrite(ctx, in.Content, in.Agent, timeout, caller, dispatcher.DelegateWriteOptions{
 		Target: target,
+		Wait:   true,
 	})
 	if err != nil {
 		return WriteOutput{}, err

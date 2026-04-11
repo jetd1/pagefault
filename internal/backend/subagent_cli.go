@@ -182,14 +182,17 @@ func (b *SubagentCLIBackend) Spawn(ctx context.Context, req SpawnRequest) (strin
 	})
 
 	// Substitute placeholders in the pre-tokenized argv. {task} is the
-	// fully-wrapped prompt; {agent_id} and {timeout} come through
-	// from the request.
+	// fully-wrapped prompt; {agent_id}, {timeout}, and {spawn_id}
+	// come through from the request. Unknown or unused
+	// placeholders in the template are left untouched — operators
+	// who do not include {spawn_id} still work unchanged.
 	args := make([]string, len(b.argv))
 	timeoutStr := fmt.Sprintf("%d", int(timeout.Seconds()))
 	for i, tok := range b.argv {
 		tok = strings.ReplaceAll(tok, "{agent_id}", agentID)
 		tok = strings.ReplaceAll(tok, "{task}", wrapped)
 		tok = strings.ReplaceAll(tok, "{timeout}", timeoutStr)
+		tok = strings.ReplaceAll(tok, "{spawn_id}", req.SpawnID)
 		args[i] = tok
 	}
 

@@ -19,6 +19,7 @@ import (
 	"github.com/jet/pagefault/internal/dispatcher"
 	"github.com/jet/pagefault/internal/filter"
 	"github.com/jet/pagefault/internal/server"
+	"github.com/jet/pagefault/internal/task"
 )
 
 // runServe parses flags, loads config, wires every subsystem together, and
@@ -183,20 +184,33 @@ func buildDispatcher(cfg *config.Config) (*dispatcher.ToolDispatcher, func() err
 		return nil, nil, fmt.Errorf("audit: %w", err)
 	}
 
+	// Construct the 0.10.0 async task manager from server.tasks
+	// config. Zero-value config falls through to the documented
+	// defaults (ttl=600s, max_concurrent=16), so operators who
+	// do not care about tuning get a sensible baseline.
+	tasks := task.NewManager(task.Config{
+		TTLSeconds:    cfg.Server.Tasks.TasksTTLOrDefault(),
+		MaxConcurrent: cfg.Server.Tasks.TasksMaxConcurrentOrDefault(),
+	})
+
 	d, err := dispatcher.New(dispatcher.Options{
 		Backends: backends,
 		Contexts: cfg.Contexts,
 		Filter:   f,
 		Audit:    auditLog,
 		Tools:    cfg.Tools,
+		Tasks:    tasks,
 	})
 	if err != nil {
 		_ = auditLog.Close()
 		return nil, nil, err
 	}
 
+	// The dispatcher owns both the task manager and the audit
+	// logger — closing it cancels every in-flight task and flushes
+	// the audit sink in the right order.
 	closer := func() error {
-		return auditLog.Close()
+		return d.Close()
 	}
 	return d, closer, nil
 }

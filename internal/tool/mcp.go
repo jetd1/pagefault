@@ -150,22 +150,25 @@ func registerRead(srv *mcpserver.MCPServer, d *dispatcher.ToolDispatcher) {
 // registerDeepRetrieve wires the pf_fault tool.
 func registerDeepRetrieve(srv *mcpserver.MCPServer, d *dispatcher.ToolDispatcher) {
 	t := mcppkg.NewTool("pf_fault",
-		mcppkg.WithDescription("Trigger a page fault — spawn a subagent that reasons over the user's memory store and returns a synthesised answer. This is the heaviest and slowest tool in pagefault: the agent has its own tools and can make several lookups before replying. **Use sparingly** — only when pf_scan misses and the question genuinely needs intelligent retrieval (cross-reference, summarisation, fuzzy semantic lookup). The subagent is automatically framed as a memory-retrieval specialist by the server-side prompt template, so you do not need to rephrase the query as a search instruction — a plain user question is correct input."),
+		mcppkg.WithDescription("Trigger a page fault — spawn a subagent that reasons over the user's memory store and returns a synthesised answer. This is the heaviest and slowest tool in pagefault: the agent has its own tools and can make several lookups before replying. **Use sparingly** — only when pf_scan misses and the question genuinely needs intelligent retrieval (cross-reference, summarisation, fuzzy semantic lookup).\n\n**Async by default (0.10.0+).** This call returns immediately with `{task_id, status: \"running\"}` and the subagent runs on a background goroutine that survives HTTP disconnects. You MUST poll for the result: call `pf_ps` with `task_id` set to the returned id every ~30 seconds; the answer is ready when `status` is `done`, `timed_out`, or `failed`. The canonical polling budget is **30 seconds × 6 (≈3 minutes)**; stop earlier on a terminal status, and raise the count only for large `timeout_seconds` values (≥240) where the subagent genuinely needs more wall-clock. Do NOT poll faster than 30s — the subagent is mid-work and pagefault does nothing useful between polls. Set `wait: true` to get the old synchronous behaviour (blocks until terminal, bounded by `timeout_seconds`); MCP clients should generally prefer async + poll because HTTP middleware timeouts kill long sync calls.\n\nThe subagent is automatically framed as a memory-retrieval specialist by the server-side prompt template, so you do not need to rephrase the query as a search instruction — a plain user question is correct input."),
 		mcppkg.WithString("query",
 			mcppkg.Description("The user's question in natural language, framed around what they want to recall. Examples: \"what did I note about the pagefault SSE fix?\", \"which projects touched the auth middleware last quarter?\", \"summarise every journal entry mentioning wocha\". Include concrete entity names, topics, and dates where the user supplied them — the subagent uses these to guide its search, so a vague query produces a vague answer. Do NOT rephrase into \"search for X in my memory\"; the server-side prompt template already tells the agent it is a memory-retrieval worker."),
 			mcppkg.Required(),
 		),
 		mcppkg.WithString("agent",
-			mcppkg.Description("Subagent id to spawn. **If pf_ps returns more than one agent, you MUST call pf_ps first and pick by description** — common splits include work vs personal, short-term vs long-term, or journal vs project notes, and the \"first configured agent\" fallback will silently pick the wrong one. Only leave empty when pf_ps shows exactly one agent (single-agent configs). If the user's question straddles scopes, make two pf_fault calls with different agents and merge the results yourself."),
+			mcppkg.Description("Subagent id to spawn. **If pf_ps returns more than one agent, you MUST call pf_ps first (in list mode, no task_id) and pick by description** — common splits include work vs personal, short-term vs long-term, or journal vs project notes, and the \"first configured agent\" fallback will silently pick the wrong one. Only leave empty when pf_ps shows exactly one agent (single-agent configs). If the user's question straddles scopes, make two pf_fault calls with different agents and merge the results yourself."),
 		),
 		mcppkg.WithNumber("timeout_seconds",
-			mcppkg.Description("Maximum seconds to wait for the subagent before returning a partial result. Default 120, and that is already a minimum — real deep-retrieval runs typically take 20-40 seconds just to produce their first token and can exceed a minute when fanning out across multiple memory sources (MEMORY.md, daily notes, LCM/sqlite, etc.). **Do not set this below 120.** Raise to 180-300 for hard lookups (cross-source summarisation, long time ranges, whole-project recall). On timeout the tool returns `timed_out: true` with whatever the agent produced, not an error — but a too-short timeout truncates the run before the agent can even finish reading its sources, so prefer a longer budget over a shorter one."),
+			mcppkg.Description("Maximum seconds the subagent is allowed to run before the task is marked timed_out. Default 120, and that is already a minimum — real deep-retrieval runs typically take 20-40 seconds just to produce their first token and can exceed a minute when fanning out across multiple memory sources (MEMORY.md, daily notes, LCM/sqlite, etc.). **Do not set this below 120.** Raise to 180-300 for hard lookups (cross-source summarisation, long time ranges, whole-project recall). On timeout the poll eventually returns `status: \"timed_out\"` with whatever the agent produced in `partial_result`, not an error — but a too-short timeout truncates the run before the agent can even finish reading its sources, so prefer a longer budget over a shorter one. When you raise `timeout_seconds` above 180, raise your poll budget proportionally (e.g. 30s × 8 for 240s; 30s × 12 for 360s)."),
 		),
 		mcppkg.WithString("time_range_start",
 			mcppkg.Description("Optional earliest date/time to include in the subagent's search. Free-form — any human-readable form works (ISO 8601 like \"2026-04-01\", \"last Tuesday\", \"Q1 2026\"). Pagefault does not parse the value; it is passed through to the subagent via the prompt template's {time_range} placeholder so the agent can interpret it in context. Pair with time_range_end to scope to a window, or leave time_range_end empty for \"from X onwards\"."),
 		),
 		mcppkg.WithString("time_range_end",
 			mcppkg.Description("Optional latest date/time to include in the subagent's search. Same free-form rules as time_range_start — pagefault does not validate, the subagent interprets. Leave time_range_start empty for \"up to Y\"; set both for a closed window."),
+		),
+		mcppkg.WithBoolean("wait",
+			mcppkg.Description("Synchronous compatibility flag. Default (false) is the 0.10.0 async path: returns immediately with `{task_id, status: \"running\"}` and you poll `pf_ps(task_id=...)` every 30 seconds (×6) for the result. Set to true to block the call until the subagent reaches a terminal state and return the full `{answer, elapsed_seconds, ...}` inline. Sync mode is bounded by `timeout_seconds` and is vulnerable to HTTP-level middleware timeouts (proxies, load balancers) that can kill long connections — use it only for short, deterministic calls (CLI scripts, tests). MCP agent clients should leave this unset and use the polling pattern."),
 		),
 	)
 	srv.AddTool(t, func(ctx context.Context, req mcppkg.CallToolRequest) (*mcppkg.CallToolResult, error) {
@@ -176,6 +179,7 @@ func registerDeepRetrieve(srv *mcpserver.MCPServer, d *dispatcher.ToolDispatcher
 			TimeoutSeconds: asInt(args["timeout_seconds"]),
 			TimeRangeStart: asString(args["time_range_start"]),
 			TimeRangeEnd:   asString(args["time_range_end"]),
+			Wait:           asBool(args["wait"]),
 		}
 		caller := auth.CallerFromContext(ctx)
 		out, err := HandleDeepRetrieve(ctx, d, in, caller)
@@ -189,11 +193,25 @@ func registerDeepRetrieve(srv *mcpserver.MCPServer, d *dispatcher.ToolDispatcher
 // registerListAgents wires the pf_ps tool.
 func registerListAgents(srv *mcpserver.MCPServer, d *dispatcher.ToolDispatcher) {
 	t := mcppkg.NewTool("pf_ps",
-		mcppkg.WithDescription("List configured subagents that pf_fault (and pf_poke mode:agent) can spawn, ps-style. Returns each agent's id, description, and host backend. **Call this before pf_fault or pf_poke mode:agent whenever more than one agent is configured** — the descriptions are how you route a query to the right agent (work vs personal, short-term vs long-term, journal vs project notes, etc.). Cheap and local; no subagent spawn. A single-agent config can skip this step."),
+		mcppkg.WithDescription("List configured subagents **or** poll a running pf_fault task — `pf_ps` is the `ps` of pagefault, answering the question \"what's happening with my agents\".\n\n**Mode A — list agents** (default, `task_id` empty): returns every configured subagent with id, description, and host backend. **Call this before pf_fault or pf_poke mode:agent whenever more than one agent is configured** — the descriptions are how you route a query to the right agent (work vs personal, short-term vs long-term, journal vs project notes). Cheap and local; no subagent spawn.\n\n**Mode B — poll a task** (`task_id` set): returns a snapshot of one pf_fault task with `{status, answer?, partial_result?, error?, elapsed_seconds, agent, backend}`. Status is `running` while the subagent is still working, and `done` / `timed_out` / `failed` once terminal. **Use this to poll pf_fault's async return**: after pf_fault gives you a task id, call `pf_ps` with `task_id` set every 30 seconds (up to 6 times for the default 120s pf_fault budget). Stop polling the moment `status` becomes terminal. Unknown or expired (TTL ~10min) task ids return resource_not_found."),
+		mcppkg.WithString("task_id",
+			mcppkg.Description("Task id returned by a previous pf_fault call (format `pf_tk_...`). When set, pf_ps returns the task snapshot instead of the agent list. Leave empty to list configured agents. Unknown or expired ids return resource_not_found — task snapshots are kept in memory for ~10 minutes after completion, so polling within that window is safe but long-gone tasks are gone."),
+		),
 	)
-	srv.AddTool(t, func(ctx context.Context, _ mcppkg.CallToolRequest) (*mcppkg.CallToolResult, error) {
+	srv.AddTool(t, func(ctx context.Context, req mcppkg.CallToolRequest) (*mcppkg.CallToolResult, error) {
+		args := req.GetArguments()
+		in := ListAgentsInput{
+			TaskID: asString(args["task_id"]),
+		}
 		caller := auth.CallerFromContext(ctx)
-		out, err := HandleListAgents(ctx, d, ListAgentsInput{}, caller)
+		if in.TaskID != "" {
+			status, err := HandleTaskStatus(ctx, d, in, caller)
+			if err != nil {
+				return toolResultError(err), nil
+			}
+			return toolResultJSON(status)
+		}
+		out, err := HandleListAgents(ctx, d, in, caller)
 		if err != nil {
 			return toolResultError(err), nil
 		}
@@ -313,5 +331,25 @@ func asStringSlice(v any) []string {
 		return out
 	default:
 		return nil
+	}
+}
+
+// asBool coerces MCP tool argument values into bool. Accepts native
+// bool, the strings "true"/"false" (case-insensitive), and treats
+// any other shape — nil, empty string, number, etc. — as false.
+func asBool(v any) bool {
+	switch t := v.(type) {
+	case nil:
+		return false
+	case bool:
+		return t
+	case string:
+		switch {
+		case t == "true", t == "True", t == "TRUE":
+			return true
+		}
+		return false
+	default:
+		return false
 	}
 }

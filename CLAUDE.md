@@ -52,7 +52,7 @@ pagefault/
 ├── cmd/
 │   └── pagefault/
 │       ├── main.go                       # CLI entry, top-level dispatch + --version
-│       ├── serve.go                      # `serve` subcommand: config → dispatcher → http.Server (wires every backend type)
+│       ├── serve.go                      # `serve` subcommand: config → task.Manager → dispatcher → http.Server (wires every backend type; 0.10.0 constructs the async task manager from server.tasks config and routes shutdown through dispatcher.Close)
 │       ├── serve_test.go                 # buildDispatcher tests (minimal, unsupported, full Phase-2 stack)
 │       ├── token.go                      # `token create/ls/revoke` subcommands
 │       ├── token_test.go                 # Token CLI: lifecycle, slugify, maskToken, list/resolve
@@ -77,12 +77,12 @@ pagefault/
 │   │   ├── http_helpers.go               # Shared template/JSON-path helpers (renderTemplate/walkPath/…)
 │   │   ├── http_helpers_test.go          # Helper unit tests (walkPath edge cases, extractResponse variants)
 │   │   ├── subagent.go                   # SubagentBackend interface + AgentInfo + SpawnRequest
-│   │   ├── prompt.go                     # SpawnRequest / SpawnPurpose, default retrieve+write prompt templates, ResolvePromptTemplate + WrapTask
+│   │   ├── prompt.go                     # SpawnRequest / SpawnPurpose (0.10.0 added SpawnID field), default retrieve+write prompt templates, ResolvePromptTemplate + WrapTask
 │   │   ├── prompt_test.go                # Template precedence, placeholder substitution, end-to-end default-template echo
-│   │   ├── subagent_cli.go               # CLI-spawned subagent (exec.CommandContext + argv template)
-│   │   ├── subagent_cli_test.go          # Tokenizer + spawn/timeout/default-agent tests (passthroughTmpl-based plumbing tests)
-│   │   ├── subagent_http.go              # HTTP-spawned subagent (POST + response_path extraction)
-│   │   ├── subagent_http_test.go         # httptest-backed tests: auth, body template, timeout
+│   │   ├── subagent_cli.go               # CLI-spawned subagent (exec.CommandContext + argv template, 0.10.0 added {spawn_id} substitution)
+│   │   ├── subagent_cli_test.go          # Tokenizer + spawn/timeout/default-agent tests (passthroughTmpl-based plumbing tests, 0.10.0 added spawn_id passthrough + unused-when-absent)
+│   │   ├── subagent_http.go              # HTTP-spawned subagent (POST + response_path extraction, 0.10.0 added {spawn_id} substitution in URL path + body template)
+│   │   ├── subagent_http_test.go         # httptest-backed tests: auth, body template, timeout, 0.10.0 spawn_id round-trip
 │   │   ├── subprocess.go                 # Generic subprocess search backend (rg/grep/plain parse)
 │   │   ├── subprocess_test.go            # Parser + exit-code + command-not-found tests
 │   │   ├── http.go                       # Generic HTTP search backend (body template, response_path)
@@ -114,10 +114,14 @@ pagefault/
 │   │   ├── audit.go                      # JSONL/Stdout/Nop loggers, SanitizeArgs, NewEntry
 │   │   └── audit_test.go                 # Audit logger tests (incl. concurrent writes)
 │   │
+│   ├── task/
+│   │   ├── task.go                       # 0.10.0 in-memory async task manager: Task/Status/Config, Manager with Submit/Get/Wait/Close/sweep, TimeoutError sentinel, GenerateSpawnID (pf_sp_* token). Runs every pf_fault / pf_poke mode:agent spawn on a background goroutine detached from the caller's HTTP request; max_concurrent backpressure → ErrBackpressure; TTL sweep on Submit/Get/Wait.
+│   │   └── task_test.go                  # Happy/failure/timeout/detached-context/max-concurrent/unknown/close-cancels-in-flight/sweep-expired/sweep-keeps-running/concurrent-stress/GenerateSpawnID/defaults tests (all under -race)
+│   │
 │   ├── dispatcher/
-│   │   ├── dispatcher.go                 # ToolDispatcher: routes tool calls (read + write), filter+audit pipeline
+│   │   ├── dispatcher.go                 # ToolDispatcher: routes tool calls (read + write), filter+audit pipeline, 0.10.0 async DeepRetrieve/DelegateWrite via task.Manager with Wait flag + GetTask poll entry point; dispatcher.Close now shuts the task manager first
 │   │   ├── dispatcher_test.go            # Dispatcher tests with mock backend (incl. writable mock + Write)
-│   │   └── subagent_test.go              # ListAgents + DeepRetrieve tests (mockSubagent)
+│   │   └── subagent_test.go              # ListAgents + DeepRetrieve tests (mockSubagent with mutex-guarded lastReq); 0.10.0 Async + GetTask tests
 │   │
 │   ├── tool/
 │   │   ├── tool.go                       # Shared helpers: toolResultJSON, toolResultError
@@ -125,13 +129,13 @@ pagefault/
 │   │   ├── get_context.go                # HandleGetContext pure function (wire: pf_load)
 │   │   ├── search.go                     # HandleSearch pure function (wire: pf_scan)
 │   │   ├── read.go                       # HandleRead pure function (wire: pf_peek)
-│   │   ├── deep_retrieve.go              # HandleDeepRetrieve pure function (wire: pf_fault)
-│   │   ├── list_agents.go                # HandleListAgents pure function (wire: pf_ps)
-│   │   ├── write.go                      # HandleWrite pure function (wire: pf_poke) — Phase 4
-│   │   ├── mcp.go                        # RegisterMCP: wires pure handlers to mcp-go
+│   │   ├── deep_retrieve.go              # HandleDeepRetrieve pure function (wire: pf_fault; 0.10.0 reshape: async-by-default with Wait:true sync compat flag, output carries task_id/status/spawn_id)
+│   │   ├── list_agents.go                # HandleListAgents + HandleTaskStatus pure functions (wire: pf_ps; 0.10.0 extended with optional TaskID — empty = list agents, set = poll task snapshot)
+│   │   ├── write.go                      # HandleWrite pure function (wire: pf_poke) — Phase 4; pf_poke mode:agent passes Wait:true so writes return synchronously
+│   │   ├── mcp.go                        # RegisterMCP: wires pure handlers to mcp-go. 0.10.0 added wait flag to pf_fault + task_id to pf_ps + routing between HandleListAgents/HandleTaskStatus, plus asBool coercion helper
 │   │   ├── instructions.go               # DefaultInstructions — server-level MCP initialize text
 │   │   ├── tool_test.go                  # Pure handler tests
-│   │   ├── deep_retrieve_test.go         # pf_fault handler tests (stubSubagent)
+│   │   ├── deep_retrieve_test.go         # pf_fault handler tests (stubSubagent with mutex-guarded snapshot); 0.10.0 added async-default, task-status-unknown, sync-wait variants
 │   │   ├── write_test.go                 # pf_poke direct/agent handler tests — Phase 4
 │   │   └── mcp_test.go                   # MCP registration + toolResult helper tests (incl. pf_poke)
 │   │
@@ -183,11 +187,12 @@ Client → chi router → auth middleware → tool handler → dispatcher
 **Key abstractions:**
 
 - **Backend** — data source plugin interface (`internal/backend/backend.go`). Ships five types: `filesystem` (Phase 1, Phase-4 write support), `subprocess`, `http`, `subagent-cli`, `subagent-http` (Phase 2). `SubagentBackend` extends `Backend` with `Spawn(ctx, SpawnRequest)` / `ListAgents` for `pf_fault` and `pf_ps`. `WritableBackend` is an optional Phase-4 extension implemented by `FilesystemBackend` when `writable: true`.
-- **SpawnRequest / prompt templates** — `internal/backend/prompt.go` defines the `SpawnRequest` struct (agent id, task, purpose, time range, target, timeout), the `SpawnPurpose` enum (`retrieve` / `write`), the two default templates, and `ResolvePromptTemplate` + `WrapTask`. Every subagent backend wraps the raw caller content with a resolved template **before** substituting into its command / body template, so fresh subagents are framed as memory retrievers/placers rather than generic Q&A. Three-layer override precedence: per-agent → per-backend → built-in default.
+- **SpawnRequest / prompt templates** — `internal/backend/prompt.go` defines the `SpawnRequest` struct (agent id, task, purpose, time range, target, spawn id, timeout), the `SpawnPurpose` enum (`retrieve` / `write`), the two default templates, and `ResolvePromptTemplate` + `WrapTask`. Every subagent backend wraps the raw caller content with a resolved template **before** substituting into its command / body template, so fresh subagents are framed as memory retrievers/placers rather than generic Q&A. Three-layer override precedence: per-agent → per-backend → built-in default. 0.10.0 added the `{spawn_id}` placeholder (a fresh `pf_sp_*` random token per call) that `subagent-cli` substitutes into argv and `subagent-http` substitutes into URL path + body template, so operators can wire it into their agent runner's session flag (e.g. `openclaw agent run --session-id {spawn_id}`) to force session isolation per call.
+- **Task manager (0.10.0+)** — `internal/task.Manager` runs every `pf_fault` / `pf_poke mode:agent` subagent spawn on a goroutine detached from the caller's HTTP request context. `dispatcher.DeepRetrieve` submits to the manager by default and returns `{task_id, status: "running"}` immediately; callers poll via `pf_ps(task_id=...)` → `dispatcher.GetTask`. The dispatcher's `DeepRetrieveOptions.Wait: true` flag (set by CLI and `pf_poke mode:agent`) routes through `Manager.Wait` instead so the call blocks on terminal status. Config lives under `server.tasks.{ttl_seconds, max_concurrent}`; defaults are 600s TTL and 16 concurrent. Manager is in-memory only — restart loses in-flight tasks.
 - **Context** — named, pre-composed bundle of backend resources (YAML-defined).
 - **Filter** — optional path/tag/redaction filter. Can be fully disabled. Phase-4 added `AllowWriteURI` for the write path.
 - **Auth** — bearer token, trusted header, OAuth2 (0.7.0+, `internal/auth/oauth2.go`), or none. OAuth2 supports two grants: **client_credentials** (0.7.0) for programmatic clients with a bcrypt-hashed secret, and **authorization_code + PKCE (S256-only)** (0.8.0) for browser-based clients like Claude Desktop. OAuth2 mode mounts four public endpoints (`/.well-known/oauth-protected-resource`, `/.well-known/oauth-authorization-server`, `POST /oauth/token`, `GET+POST /oauth/authorize`) plus an optional fifth — `POST /register` (RFC 7591 Dynamic Client Registration, 0.9.0, opt-in via `dcr_enabled`) — and runs as a compound provider: it validates issued access tokens first, then falls back to `BearerTokenAuth` when `bearer.tokens_file` is also configured. Clients are registered via `pagefault oauth-client create` (confidential by default, `--public --redirect-uris` for PKCE-only public clients) or dynamically via DCR (public-only, `pf_dcr_` prefix).
-- **Dispatcher** — central tool router. Holds backends + contexts + filters + audit logger. Exposes `ListContexts`, `GetContext`, `Search`, `Read`, `DeepRetrieve`, `ListAgents`, `Write`, and `DelegateWrite` (Phase-4 write-side twin of `DeepRetrieve` that spawns a subagent with `Purpose=write` so the write-framed prompt template is picked).
+- **Dispatcher** — central tool router. Holds backends + contexts + filters + audit logger + **task manager** (0.10.0+). Exposes `ListContexts`, `GetContext`, `Search`, `Read`, `DeepRetrieve` (async-by-default with `Wait:true` compat), `ListAgents`, `GetTask` (0.10.0+, returns the snapshot behind `pf_ps(task_id=...)`), `Write`, and `DelegateWrite` (Phase-4 write-side twin of `DeepRetrieve` that spawns a subagent with `Purpose=write` so the write-framed prompt template is picked; `pf_poke` mode:agent sets `Wait:true` to preserve synchronous return semantics).
 - **Writer** — `internal/write.FilesystemWriter` is the flock-serialised atomic-append primitive behind `pf_poke` mode:direct.
 - **Tools** — pure `HandleX` functions (`internal/tool/*.go`); the server package wraps them for REST and `tool.RegisterMCP` wraps them for mcp-go.
 - **Instructions** — `internal/tool/instructions.go` holds `DefaultInstructions`, the server-level text advertised in the MCP `initialize` response (via `mcpserver.WithInstructions`). Operators override via `server.mcp.instructions` in YAML. This is the highest-leverage lever for teaching cold agents when to reach for `pf_*` tools vs their built-ins; it covers chat-history framing, a core "don't claim no memory" rule, cross-language signal phrases, multi-agent routing, and a 120s timeout floor. Edit with care — the server-wide test suite pins several phrases in place.

@@ -24,8 +24,8 @@ const (
 
 // SpawnRequest collects every input a SubagentBackend needs to run
 // one agent turn. It replaces the old positional Spawn signature so
-// new fields (purpose, time range, target hint) can be added without
-// churn at every call site.
+// new fields (purpose, time range, target hint, spawn id) can be
+// added without churn at every call site.
 //
 // Task carries the *raw* caller content — the user's query for
 // retrieve, or the content to persist for write. The backend is
@@ -52,6 +52,20 @@ type SpawnRequest struct {
 	// where the subagent should prefer to place the content
 	// ("daily", "long-term", "auto", etc.). Ignored for retrieve.
 	Target string
+	// SpawnID is a cryptographically random pf_sp_* token generated
+	// by the dispatcher per call. Exposed to backend command /
+	// HTTP-body templates as the {spawn_id} placeholder so external
+	// agent runtimes (openclaw's gateway, etc.) can use it as an
+	// isolated session key — by default an openclaw CLI run fixes
+	// the session to agent:main:main and every pf_fault call
+	// pollutes that shared session. Operators who wire {spawn_id}
+	// into their command (e.g. `openclaw ... --session-id
+	// {spawn_id}`) get one fresh session per call and no cross-
+	// call context bleed. When the operator does not include
+	// {spawn_id} in the template the value is silently ignored,
+	// so the placeholder is backwards compatible with 0.9.x
+	// configs.
+	SpawnID string
 	// Timeout caps the agent turn. Zero means "use the backend's
 	// configured default".
 	Timeout time.Duration

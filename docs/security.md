@@ -397,6 +397,11 @@ Properties:
 - Bearer tokens themselves never appear in the audit log; only the token
   record's `id` and `label` do.
 - Stdout and nop loggers are available for dev / test.
+- **0.10.0+ `pf_fault` args map** includes `task_id`, `spawn_id`,
+  `status`, and `wait` — so operators can correlate a pagefault
+  call to a downstream session log (e.g. openclaw gateway) via
+  `spawn_id`, and to the async poll trail via `task_id`. `pf_ps`
+  entries with a `task_id` argument are logged as polls.
 
 If the audit log disk fills up, writes will error and the tool call will
 return a `500`. This is intentional — the alternative is losing audit
@@ -627,6 +632,61 @@ Bottom line: treat `pf_fault` callers as *users of the configured
 subagent*, not as sandboxed memory clients. If you wouldn't let them
 run the agent directly, don't give them pagefault access either.
 
+## Task manager (0.10.0+)
+
+`pf_fault` and `pf_poke` mode:agent flow through `internal/task.Manager`,
+which runs every subagent spawn on a detached goroutine (see
+`docs/architecture.md` → "Task manager" for the full lifecycle).
+The security posture of the manager itself:
+
+- **Detached context by design.** The goroutine's context is derived
+  from `context.Background` with the task's own timeout — **not**
+  from the HTTP request context. This means a caller disconnect,
+  proxy idle timeout, or middleware cancellation does *not* kill the
+  subagent. The upside is reliable long-retrieval runs; the downside
+  is that a client that repeatedly fires-and-forgets `pf_fault` calls
+  can tie up `max_concurrent` goroutine slots until the per-task
+  timeout fires. Mitigation: the `max_concurrent` cap (default 16)
+  plus auth-gated access.
+- **`max_concurrent` backpressure.** Submit calls past the cap
+  return `ErrBackpressure` → HTTP 429 `rate_limited`. The manager
+  does **not** queue; clients retry after ~30s. This makes the
+  attack surface bounded even if an attacker holds a valid
+  credential: at most 16 subagent goroutines (times the
+  subagent-process memory footprint) at any instant.
+- **In-memory only, no persistence.** Task state lives in a
+  `sync.Mutex`-guarded map on the running process. A restart loses
+  every in-flight task; clients that were mid-poll receive
+  `resource_not_found` and have to re-issue `pf_fault`. This is a
+  documented limitation, not a security boundary — no secrets live
+  in the task record besides what an audited `pf_fault` call
+  already carries.
+- **TTL sweep.** Terminal task entries are reclaimed after
+  `server.tasks.ttl_seconds` (default 600s / 10 min) on the next
+  Submit / Get / Wait. The sweep is best-effort; long-idle
+  deployments do not accumulate stale entries because every
+  poll triggers a pass.
+- **`spawn_id` as correlation key, not credential.** Each call
+  gets a fresh `pf_sp_*` random token that pagefault substitutes
+  into the subagent command / URL / body template. Operators who
+  wire it into `openclaw agent run --session-id {spawn_id}` (or
+  similar) get one fresh upstream session per call, with no
+  cross-call context bleed. The spawn_id is **not** a secret — it
+  is included in the tool response, the audit entry, and any
+  downstream session logs the operator configures. Treat it as a
+  correlation id, not as an authentication token.
+- **Graceful shutdown.** `Manager.Close` cancels every in-flight
+  task's context and waits for the goroutines to exit before
+  returning. The server's shutdown path calls `dispatcher.Close`,
+  which closes both the task manager and the audit logger in the
+  right order. No subagent outlives the pagefault process.
+
+**Audit trail changes.** Every `pf_fault` audit entry now includes
+`task_id`, `spawn_id`, and the final `status` (running / done /
+failed / timed_out) in its args map, so operators can correlate a
+pagefault call to an openclaw gateway session log without extra
+wiring.
+
 ## Threats and mitigations
 
 | Threat                                    | Mitigation                                                                                          |
@@ -640,8 +700,10 @@ run the agent directly, don't give them pagefault access either.
 | Log poisoning via tool args               | `SanitizeArgs` strips known-sensitive keys before writing to the audit log.                         |
 | Partial context with silent data loss     | `skipped_sources` surfaced in `pf_load` output; skips logged at `WARN`.                             |
 | Shell injection via subagent task         | `subagent-cli` uses argv-per-token, no shell; `subagent-http` JSON-escapes the task before substitution. |
-| Subagent hang / runaway                   | Per-call timeout enforced by `exec.CommandContext` (CLI) or request context (HTTP); partial stdout captured. |
+| Subagent hang / runaway                   | Per-call timeout enforced by `exec.CommandContext` (CLI) or request context (HTTP); partial stdout captured. **0.10.0+**: the timeout fires on a detached goroutine context, not the HTTP request context, so a caller disconnect does not short-circuit the deadline. |
 | Unbounded access via subagent             | Acknowledged: subagents run outside pagefault's sandbox. Treat `pf_fault` callers as users of the configured agent. |
+| Task-manager goroutine exhaustion         | `server.tasks.max_concurrent` caps in-flight task goroutines (default 16); submissions past the cap return HTTP 429 `rate_limited`. Task entries are bounded (~400 bytes each) and terminal tasks age out after `ttl_seconds` (default 600s). |
+| Cross-call subagent session bleed         | **0.10.0+**: `{spawn_id}` placeholder on subagent backend templates; pagefault mints a fresh `pf_sp_*` random token per call so wiring e.g. `openclaw agent run --session-id {spawn_id}` gives one isolated upstream session per `pf_fault`. Opt-in — operators must add the placeholder to their command template. |
 | Per-caller request floods                 | `server.rate_limit` enforces a per-caller token bucket keyed on `caller.id`; over-budget requests get 429 + `Retry-After`. |
 | Browser cross-origin abuse                | `server.cors` is opt-in with an explicit origin allowlist; disabled by default. |
 | Unauthorized writes (`pf_poke` direct)    | Backends default to `writable: false`; a write must pass the tool enable flag, the server-wide write filter, the backend `Writable()` flag, `write_paths`, and the `max_entry_size` cap — five independent gates. |

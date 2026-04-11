@@ -147,6 +147,12 @@ func openapiSchemas() map[string]any {
 	intProp := func(desc string) map[string]any {
 		return map[string]any{"type": "integer", "description": desc}
 	}
+	boolProp := func(desc string) map[string]any {
+		return map[string]any{"type": "boolean", "description": desc}
+	}
+	numberProp := func(desc string) map[string]any {
+		return map[string]any{"type": "number", "description": desc}
+	}
 	stringArray := func(desc string) map[string]any {
 		return map[string]any{
 			"type":        "array",
@@ -289,33 +295,45 @@ func openapiSchemas() map[string]any {
 
 		// pf_fault
 		"DeepRetrieveInput": map[string]any{
-			"type": "object",
+			"type":        "object",
+			"description": "Async by default (0.10.0+): returns {task_id, status:\"running\"} immediately and the caller polls pf_ps(task_id=...). Set wait:true for synchronous behavior.",
 			"properties": map[string]any{
 				"query":            stringProp("Natural-language task for the subagent — what to find or understand. Include concrete entity names, topics, and dates where the user supplied them."),
 				"agent":            stringProp("Agent id (default: first configured; see pf_ps for the list)"),
-				"timeout_seconds":  intProp("Per-call timeout in seconds; default 120. On timeout the response carries timed_out:true and whatever partial output the subagent produced."),
+				"timeout_seconds":  intProp("Per-call timeout in seconds; default 120. On timeout the poll response carries status:\"timed_out\" and whatever partial output the subagent produced."),
 				"time_range_start": stringProp("Optional free-form earliest date/time. Passed through to the subagent via the prompt template's {time_range} placeholder; pagefault does not parse the value."),
 				"time_range_end":   stringProp("Optional free-form latest date/time. Same rules as time_range_start."),
+				"wait":             boolProp("0.10.0+. Sync compatibility flag. Default (false) returns immediately with {task_id, status:\"running\"} and the caller polls pf_ps(task_id=...). Set to true to block until the task is terminal and return the full answer inline. MCP agent clients should leave this unset and use the polling pattern (30s × 6)."),
 			},
 			"required": []any{"query"},
 		},
 		"DeepRetrieveOutput": map[string]any{
-			"type": "object",
+			"type":        "object",
+			"description": "Task snapshot. In async mode (wait omitted) only task_id/status/agent/backend/spawn_id are populated. In sync mode (wait:true) the terminal fields (answer, elapsed_seconds, etc.) are populated as well.",
 			"properties": map[string]any{
-				"answer":          stringProp("Subagent response on success"),
-				"agent":           stringProp("Agent that ran the task"),
-				"backend":         stringProp("Subagent backend name"),
-				"elapsed_seconds": map[string]any{"type": "number", "description": "Wall-clock elapsed seconds"},
-				"timed_out":       map[string]any{"type": "boolean", "description": "True if the deadline fired"},
-				"partial_result":  stringProp("Stdout captured before timeout"),
+				"task_id":         stringProp("pf_tk_* task identifier. Always populated — feed into pf_ps(task_id=...) to poll (async mode) or correlate with audit entries (sync mode)."),
+				"status":          stringProp("Task lifecycle state: \"running\", \"done\", \"failed\", or \"timed_out\"."),
+				"agent":           stringProp("Subagent id the task is running."),
+				"backend":         stringProp("Subagent backend name."),
+				"spawn_id":        stringProp("pf_sp_* random token minted per call. Included in the response so callers can correlate against downstream session logs when the operator wired {spawn_id} into their subagent command template."),
+				"answer":          stringProp("Subagent response on success (populated when status is terminal)."),
+				"elapsed_seconds": numberProp("Wall-clock elapsed seconds from task submission to terminal state."),
+				"timed_out":       boolProp("True when status is \"timed_out\"."),
+				"partial_result":  stringProp("Stdout captured before a timeout fired."),
+				"error":           stringProp("Stringified failure message when status is \"failed\"."),
 			},
-			"required": []any{"agent", "backend", "elapsed_seconds"},
+			"required": []any{"task_id", "status", "agent", "backend"},
 		},
 
-		// pf_ps
+		// pf_ps — polymorphic: agent list when task_id is empty, task
+		// snapshot otherwise. OpenAPI does not model the polymorphism
+		// cleanly, so we document both shapes in the description.
 		"ListAgentsInput": map[string]any{
 			"type":        "object",
-			"description": "Empty body — pf_ps takes no arguments.",
+			"description": "Empty body lists configured agents (Mode A). Set task_id to poll a pf_fault task snapshot (Mode B, 0.10.0+) — the response then matches DeepRetrieveOutput instead of ListAgentsOutput.",
+			"properties": map[string]any{
+				"task_id": stringProp("0.10.0+. Task id from a previous pf_fault call. When set, pf_ps returns a DeepRetrieveOutput snapshot (status, answer, elapsed, ...) instead of the agent list. Unknown or TTL-expired ids return 404 resource_not_found."),
+			},
 		},
 		"ListAgentsOutput": map[string]any{
 			"type": "object",

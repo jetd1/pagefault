@@ -90,6 +90,42 @@ A caller that exceeds its budget receives HTTP 429 with a
 {"error": {"code": "rate_limited", "status": 429, "message": "rate limit exceeded"}}
 ```
 
+### `server.tasks`
+
+Tunes the in-memory async task manager that backs `pf_fault` (and
+`pf_poke` mode:agent). Every subagent spawn runs on a goroutine
+owned by the manager, **detached** from the caller's HTTP request,
+so a client disconnect or a reverse-proxy idle timeout no longer
+kills the subagent. `pf_fault` returns a `pf_tk_*` task id
+immediately; the caller polls `pf_ps(task_id=...)` until the task
+reaches a terminal state.
+
+| Field             | Type | Default | Notes |
+|-------------------|------|---------|-------|
+| `ttl_seconds`     | int  | `600`   | How long a terminal task (done / failed / timed_out) is kept in memory before the sweep reclaims it. Polling clients must fetch the result within this window; an expired id returns 404 `resource_not_found`. Raise for long-running workflows where the operator wants to inspect historical tasks; lower for deployments where memory pressure matters more than post-mortem visibility. |
+| `max_concurrent`  | int  | `16`    | Cap on the number of in-flight task goroutines. `pf_fault` calls past the cap return HTTP 429 `rate_limited` immediately — pagefault does **not** queue; the client is expected to retry after ~30s. Raise for deployments with many concurrent agents; lower if memory headroom is tight. |
+
+> **In-memory only for 0.10.0.** Task state lives in a
+> `sync.Mutex`-guarded map on the running process — it does not
+> survive a restart. A client polling for a task that was in flight
+> when pagefault restarted gets `resource_not_found` and must
+> re-issue the `pf_fault`. Persistence (write-through to JSONL, like
+> the OAuth clients file) is feasible but intentionally deferred
+> because the failure mode is already well-defined and the
+> complexity / lock-contention trade-off isn't worth it for the
+> target workload. Revisit if operators start reporting real
+> pain here.
+
+> **Security bound.** Each running task occupies one goroutine plus
+> a `Task` struct (~400 bytes) for as long as the subagent spawn
+> lasts. At `max_concurrent: 16` that's ~6.4 KB of manager state
+> plus the subagent process memory itself — bounded. Terminal
+> tasks occupy roughly the same per-task bytes until the TTL
+> sweep reclaims them; at `ttl_seconds: 600` and 1 completed task
+> per second (an aggressive ceiling for pf_fault), the cap is
+> ~240 KB. This is comfortably smaller than a single filesystem
+> read, so the manager is not a practical DoS vector.
+
 ### `server.mcp`
 
 Controls the MCP transports and the initialize-time metadata advertised
@@ -601,7 +637,7 @@ pagefault just runs the command and waits for stdout.
 |--------------|----------|----------|---------|-------|
 | `name`       | string   | yes      | —       | Backend name. |
 | `type`       | string   | yes      | —       | Must be `subagent-cli`. |
-| `command`    | string   | yes      | —       | Tokenized command template. Placeholders: `{agent_id}`, `{task}`, `{timeout}`. Same non-shell tokenization as `subprocess`. `{task}` is substituted with the *prompt-wrapped* task, not the raw caller input — see the prompt template section below. |
+| `command`    | string   | yes      | —       | Tokenized command template. Placeholders: `{agent_id}`, `{task}`, `{timeout}`, `{spawn_id}`. Same non-shell tokenization as `subprocess`. `{task}` is substituted with the *prompt-wrapped* task, not the raw caller input — see the prompt template section below. `{spawn_id}` is a fresh `pf_sp_*` random token per call (0.10.0+) — wire it into your agent runner's session flag to force session isolation, see the "Session isolation" subsection below. |
 | `timeout`    | int      | no       | `300`   | Default seconds before the child is killed. Overridden per call by `pf_fault.timeout_seconds`. |
 | `retrieve_prompt_template` | string | no | built-in default | Backend-wide prompt template for `pf_fault` calls. See the "Subagent prompt templates" subsection below for placeholders and rationale. Empty uses `internal/backend.DefaultRetrievePromptTemplate`. |
 | `write_prompt_template`    | string | no | built-in default | Backend-wide prompt template for `pf_poke` mode:agent calls. Empty uses `internal/backend.DefaultWritePromptTemplate`. |
@@ -641,9 +677,9 @@ agents live behind a gateway.
 | `auth.mode`            | string   | no       | none    | `bearer` supported. |
 | `auth.token`           | string   | required for bearer | — | Bearer token (supports `${ENV}`). |
 | `spawn.method`         | string   | no       | `POST`  | HTTP method. |
-| `spawn.path`           | string   | yes      | —       | Appended to `base_url`. `{agent_id}` in the path is substituted. |
+| `spawn.path`           | string   | yes      | —       | Appended to `base_url`. `{agent_id}` and `{spawn_id}` in the path are substituted. |
 | `spawn.headers`        | map      | no       | —       | Extra request headers. |
-| `spawn.body_template`  | string   | no       | —       | Body template with `{agent_id}`, `{task}`, `{timeout}`. `{task}` is substituted with the prompt-wrapped task (see below) *and then* JSON-escaped, so newlines and quotes in the default templates survive unchanged. |
+| `spawn.body_template`  | string   | no       | —       | Body template with `{agent_id}`, `{task}`, `{timeout}`, `{spawn_id}`. `{task}` is substituted with the prompt-wrapped task (see below) *and then* JSON-escaped, so newlines and quotes in the default templates survive unchanged. `{spawn_id}` is a fresh `pf_sp_*` random token per call (0.10.0+) — wire it into your gateway's session key, see the "Session isolation" subsection below. |
 | `spawn.response_path`  | string   | no       | —       | Dotted path to the agent's response string. Non-string leaves are re-encoded as JSON. Empty means "the whole response body is the answer". |
 | `timeout`              | int      | no       | `300`   | Default seconds. Overridden per call. |
 | `retrieve_prompt_template` | string | no | built-in default | Same semantics as on the CLI backend — see "Subagent prompt templates" below. |
@@ -718,6 +754,62 @@ specific sources the default enumeration does not mention (e.g.
 case, fork the default template and extend the "use every
 memory source" bullet list. Do not strip the "do not fall back
 to world knowledge" framing — that is the whole point.
+
+### Subagent backends: `{spawn_id}` placeholder (session isolation)
+
+Shipped in **0.10.0**. The dispatcher generates a cryptographically
+random `pf_sp_*` token per `pf_fault` / `pf_poke mode:agent` call
+and substitutes it wherever the backend's command template
+references `{spawn_id}`. This is the fix for the class of bugs
+where every subagent spawn runs against the same upstream session —
+e.g. `openclaw agent run` keys the session on agent id, so without
+`{spawn_id}` every pagefault call ends up in `agent:main:main` and
+previous calls' context bleeds into the next.
+
+**Canonical openclaw wiring** (`subagent-cli`):
+
+```yaml
+- name: openclaw
+  type: subagent-cli
+  command: "openclaw agent run --session-id {spawn_id} --agent {agent_id} --task {task} --timeout {timeout}"
+  timeout: 300
+  agents:
+    - id: wocha
+      description: "..."
+```
+
+With this wiring, every `pf_fault` call creates a fresh openclaw
+session, and the gateway's session store sees a new key
+(`pf_sp_xxxxx` instead of `agent:main:main`) per pagefault call.
+Cross-call context bleed goes to zero.
+
+**HTTP-gateway wiring** (`subagent-http`):
+
+```yaml
+- name: openclaw-gateway
+  type: subagent-http
+  base_url: "https://gateway.example.com"
+  spawn:
+    method: "POST"
+    path: "/sessions/{spawn_id}/spawn"
+    body_template: '{"session_id":"{spawn_id}","agent":"{agent_id}","task":"{task}"}'
+    response_path: "result.answer"
+```
+
+Both URL path and body template support `{spawn_id}`, so operators
+can route to a session-keyed endpoint either way.
+
+**Backwards compatibility.** A command / template that does not
+reference `{spawn_id}` is unaffected — the substitution is a
+silent no-op. 0.9.x configs keep working unchanged. The spawn id
+is also returned in the `pf_fault` tool response and logged in
+the audit entry, so operators who adopt `{spawn_id}` can
+correlate a pagefault call with a downstream session log without
+extra wiring.
+
+**Audit visibility.** Every `pf_fault` / `pf_poke mode:agent`
+audit entry includes `spawn_id` and `task_id` in its args map —
+see `docs/security.md` → "Audit".
 
 ---
 

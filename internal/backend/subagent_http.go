@@ -176,14 +176,16 @@ func (b *SubagentHTTPBackend) Spawn(ctx context.Context, req SpawnRequest) (stri
 	defer cancel()
 
 	// Render the URL with the same placeholders — many HTTP agent APIs
-	// put the agent id in the path.
+	// put the agent id (or the spawn/session id) in the path.
 	urlPath := strings.ReplaceAll(b.spawn.Path, "{agent_id}", agentID)
+	urlPath = strings.ReplaceAll(urlPath, "{spawn_id}", req.SpawnID)
 	url := b.baseURL + urlPath
 
 	body := renderTemplate(b.spawn.BodyTemplate, map[string]string{
 		"agent_id": agentID,
 		"task":     jsonEscape(wrapped),
 		"timeout":  fmt.Sprintf("%d", int(timeout.Seconds())),
+		"spawn_id": req.SpawnID,
 	})
 
 	method := b.spawn.Method

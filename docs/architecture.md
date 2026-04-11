@@ -68,8 +68,9 @@ MCP (streamable-http *and* legacy SSE) and a REST / OpenAPI transport.
 | `internal/filter`       | `Filter` interface, `CompositeFilter`, PathFilter (read + write allowlists), TagFilter, RedactionFilter (P3) |
 | `internal/write`        | `Writer` interface + `FilesystemWriter` (flock + atomic append), entry-format templating — Phase 4 |
 | `internal/audit`        | `Logger` interface, JSONL/stdout/nop sinks, arg sanitization |
-| `internal/dispatcher`   | Central tool router: filter + backend + audit pipeline, markdown / markdown-with-metadata / json context formats, direct-write routing (P4) |
-| `internal/tool`         | Per-tool Handle\* functions and MCP registrations (including `HandleWrite` for `pf_poke`) |
+| `internal/task`         | **0.10.0+** async task manager that owns every `pf_fault` / `pf_poke mode:agent` subagent spawn on a detached goroutine, with TTL-based sweep and `max_concurrent` backpressure |
+| `internal/dispatcher`   | Central tool router: filter + backend + audit pipeline, markdown / markdown-with-metadata / json context formats, direct-write routing (P4), async task submission (0.10.0) |
+| `internal/tool`         | Per-tool Handle\* functions and MCP registrations (including `HandleWrite` for `pf_poke` and the 0.10.0 `HandleTaskStatus` poll path for `pf_ps`) |
 | `internal/server`       | chi router, MCP mount, REST adapter, health probes, CORS + rate limit middleware, OpenAPI spec |
 
 ## Request flow
@@ -369,16 +370,98 @@ The dispatcher owns:
 - `filter`    — `*CompositeFilter`
 - `auditLog`  — `audit.Logger`
 - `toolsCfg`  — enable/disable flags
+- `tasks`     — `*task.Manager` (0.10.0+), the in-memory async task
+  manager that runs every subagent spawn on a detached goroutine
 
 Tool handlers in `internal/tool` are thin wrappers over the dispatcher's
 `ListContexts`, `GetContext`, `Search`, `Read`, `DeepRetrieve`,
-`ListAgents`, `Write`, and `DelegateWrite` methods. `DelegateWrite`
-is the write-side twin of `DeepRetrieve` — both spawn a subagent,
-but `DelegateWrite` tags the `SpawnRequest` with
+`ListAgents`, `GetTask` (0.10.0+), `Write`, and `DelegateWrite` methods.
+`DelegateWrite` is the write-side twin of `DeepRetrieve` — both spawn
+a subagent, but `DelegateWrite` tags the `SpawnRequest` with
 `Purpose=write` so the subagent picks up the write-framed prompt
 template instead of the retrieve-framed one, and passes a free-form
 `Target` hint ("daily", "long-term", "auto", …) through the
 template's `{target}` placeholder.
+
+`GetTask(taskID)` is the poll entry point — `pf_ps` with a `task_id`
+set reads through it to return a task snapshot. See "Task manager"
+below.
+
+## Task manager (async pf_fault, 0.10.0+)
+
+`pf_fault` and `pf_poke` mode:agent no longer block on
+`SubagentBackend.Spawn` inside the HTTP request handler. Every
+call flows through `internal/task.Manager`, which runs the Spawn
+on a **goroutine detached from the caller's HTTP context**.
+
+The lifecycle:
+
+1. **Submit.** `dispatcher.DeepRetrieve` validates the request,
+   generates a `pf_sp_*` spawn id, and calls `manager.Submit` with
+   a `Run` closure wrapping `target.Spawn`. Submit assigns a
+   `pf_tk_*` task id, stashes a `Task{Status:Running, ...}` entry
+   in a sync-mutex-guarded map, and launches the goroutine with a
+   `context.WithTimeout(context.Background(), timeout)` — crucially
+   derived from Background, not from the HTTP request context, so
+   a client disconnect does not kill the spawn.
+2. **Wait or return.** When `DeepRetrieveOptions.Wait` is true, the
+   dispatcher calls `manager.Wait(ctx, id)` which blocks on a
+   per-task done channel until the task reaches a terminal state
+   (or `ctx` fires — e.g. the HTTP request is cancelled, in which
+   case Wait returns `ctx.Err()` and the current running snapshot
+   is returned instead of an error). When Wait is false (the
+   default), Submit's running snapshot is returned immediately.
+3. **Terminal transition.** The Run goroutine invokes the closure,
+   captures the result / error, acquires the manager lock, updates
+   the Task entry with `Status:done|failed|timed_out`, and closes
+   the per-task done channel so any waiting caller wakes up. A
+   `*task.TimeoutError` return translates to StatusTimedOut with
+   the partial preserved; any other non-nil error is StatusFailed.
+4. **Poll.** `pf_ps(task_id=...)` flows through
+   `dispatcher.GetTask` which calls `manager.Get(id)`. The
+   snapshot includes status, answer / partial_result / error
+   (depending on terminal state), elapsed seconds, and the
+   spawn_id so callers can correlate downstream session logs.
+5. **Sweep.** Every Submit / Get / Wait triggers a best-effort
+   `sweepLocked` pass that deletes terminal tasks older than
+   `config.TTL()`. Running tasks are never swept regardless of
+   age.
+6. **Close.** `dispatcher.Close` (called on server shutdown)
+   calls `manager.Close` which cancels every running task's
+   context and waits for the goroutines to exit before returning.
+   Subsequent Submit calls get `ErrManagerClosed`.
+
+**In-memory only** — state lives on the running process. A restart
+loses every in-flight task; clients that were mid-poll get
+`resource_not_found` and must re-issue the pf_fault. Persistence
+is deliberately deferred: write-through to JSONL is feasible but
+adds lock contention and a replay story for partially-complete
+spawns, and the failure mode is already well-defined.
+
+**Backpressure.** `max_concurrent` (default 16) caps the number
+of running goroutines. Submissions past the cap return
+`ErrBackpressure`, which the dispatcher translates to
+`model.ErrRateLimited` — the HTTP response is a 429 instead of
+an opaque queue. Clients should retry after ~30s.
+
+**Why detached context?** The 0.9.x-and-earlier synchronous path
+ran `target.Spawn` on the HTTP request context directly. Any
+client disconnect (proxy idle timeout, browser tab close, MCP
+client network blip) cancelled `runCtx`, which cancelled the
+subagent command, which returned a partial / empty result. The
+detached-context model means the subagent sees a Background-derived
+context and keeps running until **its own** timeout fires — giving
+the caller a clean "poll later" path instead of a dead run.
+
+**Why `{spawn_id}` plumbing?** Without a per-call unique token,
+upstream agent runtimes (openclaw's gateway, LCM, anything with
+a session store keyed on agent id) end up reusing the same
+session across every pf_fault call. Pagefault mints a fresh
+`pf_sp_*` random token per Submit, exposes it as `{spawn_id}` in
+the backend command / URL / body template, and passes it through
+the Task record for audit correlation. Operators wire it into
+their agent runner's session flag once and every subsequent call
+is isolated.
 
 ## Transport details
 
@@ -455,6 +538,14 @@ already in the tree:
   authorization_code + PKCE with public clients (0.8.0), security
   hardening on the authorize endpoint (0.8.1), RFC 7591 Dynamic
   Client Registration (0.9.0).
+- **Async task manager (0.10.0):** `pf_fault` returns a `task_id`
+  immediately; subagent spawns run on a detached goroutine inside
+  `internal/task.Manager` so HTTP disconnects no longer kill them.
+  `pf_ps(task_id=...)` polls for the result on a 30s × 6 cadence.
+  New `{spawn_id}` placeholder on subagent backends gives each
+  call a fresh upstream session key so per-call state no longer
+  bleeds through `agent:main:main`. See "Task manager" section
+  above.
 
 ## Not yet shipped
 

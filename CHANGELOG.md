@@ -7,6 +7,98 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+## 0.10.0 (2026-04-11)
+
+Two architectural changes motivated by real-world openclaw integration:
+pf_fault is now async-by-default, and subagent backends can mint a
+fresh per-call session token via a new `{spawn_id}` placeholder.
+Together they fix the "every pf_fault pollutes the main session"
+class of bugs — previously `openclaw agent run` with `--session-id`
+from the command template still keyed to `agent:main:main` because
+the session key is derived from agent id, and every retrieval ran
+against the same shared session.
+
+### Added
+
+- **`{spawn_id}` placeholder for subagent backends.** `subagent-cli`
+  and `subagent-http` accept a new `{spawn_id}` token anywhere in
+  their command / URL / body template. The dispatcher mints a
+  cryptographically random `pf_sp_*` token per call and substitutes
+  it in-place, so operators who wire it into their agent runner's
+  session flag (e.g. `openclaw agent run --session-id {spawn_id}`)
+  get one fresh session per `pf_fault` call and no cross-call
+  context bleed. Backwards compatible — the substitution is a
+  silent no-op for command templates that do not reference
+  `{spawn_id}`. The spawn id is also surfaced in the tool response
+  and audit entry so operators can correlate a pagefault call to
+  a downstream session log. See `configs/example.yaml` for the
+  canonical openclaw wiring.
+
+- **In-memory async task manager (`internal/task`).** Every
+  `pf_fault` / `pf_poke` mode:agent call flows through a new task
+  manager that runs the subagent on a **detached goroutine** — the
+  caller's HTTP request can disconnect, the proxy can time out, and
+  the subagent still runs to completion. State lives in a
+  sync-mutex-guarded map keyed on `pf_tk_*` task ids; terminal
+  tasks are reclaimed by a best-effort sweep after `ttl_seconds`
+  (default 600s / 10 minutes). `max_concurrent` (default 16) caps
+  the number of in-flight goroutines; submissions past the cap
+  return `rate_limited` so the HTTP response is a clean 429 instead
+  of an opaque queue. Graceful shutdown cancels every in-flight
+  task's context and waits for the goroutines to exit. Unit tests
+  under `-race` exercise happy-path / failure / timeout / detached
+  context / max-concurrent / sweep / concurrent-submit / close.
+
+- **`server.tasks` config block.** Two fields — `ttl_seconds` and
+  `max_concurrent` — both with sensible defaults. Zero-value
+  config is fine for most deployments; tune `max_concurrent`
+  higher for operators running many concurrent agents.
+
+### Changed
+
+- **`pf_fault` is async by default.** The call now submits the
+  work to the task manager and returns immediately with
+  `{task_id, status: "running", agent, backend, spawn_id}`.
+  Callers **must poll** `pf_ps(task_id=...)` every ~30 seconds
+  (up to 6 times for the default 120s budget — the canonical
+  "30s × 6" pattern) until the status is terminal (`done`,
+  `failed`, `timed_out`). The MCP tool description for `pf_fault`
+  spells out the polling guide so calling agents see it
+  alongside the argument schemas.
+
+  **Backwards-compat escape hatch:** set `wait: true` on the
+  `pf_fault` input to restore the old synchronous behaviour —
+  the handler blocks until the task is terminal and returns the
+  full answer inline. Sync mode is bounded by `timeout_seconds`
+  and is vulnerable to HTTP-level middleware timeouts, so it is
+  recommended only for CLI scripts and tests; MCP agent clients
+  should stick with the async + poll default. The CLI (`pagefault
+  fault`) still defaults to sync for human-friendly blocking
+  behaviour, with a new `--async` flag for testing the poll path.
+
+- **`pf_ps` extended with `task_id` polling mode.** Classic
+  "list agents" behaviour when the request has no `task_id`
+  (unchanged). When `task_id` is set, `pf_ps` returns the task
+  snapshot (`{status, answer?, partial_result?, error?,
+  elapsed_seconds, agent, backend, spawn_id}`) instead of the
+  agent list. Unknown or TTL-expired ids return
+  `resource_not_found` → HTTP 404. The tool description is
+  rewritten to cover both modes. CLI form (`pagefault ps
+  <task_id>`) picks the mode from presence of a positional arg.
+
+- **`pf_poke` mode:agent stays synchronous by default.** Write
+  calls are typically expected to confirm placement before
+  returning, so `handleWriteAgent` passes `Wait: true` to
+  `DelegateWrite`. Behind the scenes the spawn still runs on the
+  task manager's detached goroutine, so a client HTTP disconnect
+  no longer kills the write, but the caller still receives the
+  full result inline. No wire change for `pf_poke` clients.
+
+- **`ToolDispatcher.Close()` now also closes the task manager,**
+  which cancels every in-flight task and waits for the goroutines
+  to return. `buildDispatcher` wraps the close order so shutdown
+  is: cancel tasks → wait on goroutines → flush audit sink.
+
 ## 0.9.1 (2026-04-11)
 
 Follow-up to 0.9.0. A review pass against the DCR commit turned up

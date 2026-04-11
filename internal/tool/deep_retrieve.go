@@ -12,12 +12,24 @@ import (
 
 // DeepRetrieveInput is the request shape for pf_fault.
 //
+// 0.10.0 reshape: pf_fault is async-by-default. The handler submits
+// a task to the dispatcher's task manager and returns immediately
+// with a task_id. Callers poll pf_ps(task_id=...) every 30 seconds
+// (up to ~6 times for a 3-minute budget) until Status is terminal.
+//
+// Set Wait=true to get the old synchronous behaviour: the handler
+// blocks until the task reaches a terminal state and returns the
+// full answer inline. Sync mode is the right choice for short
+// callers (CLI scripts, /api/pf_fault from curl) and for tests —
+// MCP agent clients should prefer the async + poll pattern because
+// the subagent now survives HTTP disconnects.
+//
 // TimeRangeStart / TimeRangeEnd are optional free-form hints
-// restricting the subagent's search to a time window. Either or both
-// may be set; pagefault formats them into a single hint string and
-// passes it through to the subagent via the prompt template's
-// {time_range} placeholder. Values are not parsed — the subagent
-// interprets them — so any human-readable form (ISO 8601,
+// restricting the subagent's search to a time window. Either or
+// both may be set; pagefault formats them into a single hint
+// string and passes it through to the subagent via the prompt
+// template's {time_range} placeholder. Values are not parsed — the
+// subagent interprets them — so any human-readable form (ISO 8601,
 // "last Tuesday", "Q1 2026") works.
 type DeepRetrieveInput struct {
 	Query          string `json:"query"`
@@ -25,18 +37,47 @@ type DeepRetrieveInput struct {
 	TimeoutSeconds int    `json:"timeout_seconds,omitempty"`
 	TimeRangeStart string `json:"time_range_start,omitempty"`
 	TimeRangeEnd   string `json:"time_range_end,omitempty"`
+	// Wait selects the synchronous compatibility path. Default
+	// (false) returns immediately with task_id + status=running
+	// and the caller polls pf_ps; true blocks until the task is
+	// terminal and returns the full result inline.
+	Wait bool `json:"wait,omitempty"`
 }
 
-// DeepRetrieveOutput is the response shape for pf_fault. On timeout
-// TimedOut is true and PartialResult may carry whatever the subagent
-// produced before the deadline.
+// DeepRetrieveOutput is the response shape for pf_fault.
+//
+// In async mode (Wait=false, the default) only TaskID, Status,
+// Agent, Backend, and SpawnID are populated — the caller polls
+// pf_ps(task_id) until Status is terminal, then reads Answer /
+// PartialResult / Error from the poll response.
+//
+// In sync mode (Wait=true) the handler blocks on the task and
+// the full terminal shape is populated.
 type DeepRetrieveOutput struct {
+	// TaskID is the pf_tk_* identifier for the underlying task.
+	// Always set. Feed into pf_ps(task_id=...) to poll.
+	TaskID string `json:"task_id"`
+	// Status is the task lifecycle state: "running", "done",
+	// "failed", or "timed_out". Only "done", "failed", and
+	// "timed_out" are terminal.
+	Status string `json:"status"`
+	// Agent is the resolved subagent id the task is running.
+	Agent string `json:"agent"`
+	// Backend is the subagent backend name.
+	Backend string `json:"backend"`
+	// SpawnID is the pf_sp_* token the dispatcher minted for this
+	// call. Useful for correlating against downstream session
+	// logs when the operator has wired {spawn_id} into their
+	// subagent command (e.g. openclaw's --session-id flag).
+	SpawnID string `json:"spawn_id,omitempty"`
+
+	// Fields below are populated only when Status is terminal.
+
 	Answer         string  `json:"answer,omitempty"`
-	Agent          string  `json:"agent"`
-	Backend        string  `json:"backend"`
-	ElapsedSeconds float64 `json:"elapsed_seconds"`
+	ElapsedSeconds float64 `json:"elapsed_seconds,omitempty"`
 	TimedOut       bool    `json:"timed_out,omitempty"`
 	PartialResult  string  `json:"partial_result,omitempty"`
+	Error          string  `json:"error,omitempty"`
 }
 
 // defaultDeepRetrieveTimeout is used when the caller doesn't specify
@@ -56,17 +97,22 @@ func HandleDeepRetrieve(ctx context.Context, d *dispatcher.ToolDispatcher, in De
 
 	res, err := d.DeepRetrieve(ctx, in.Query, in.Agent, timeout, caller, dispatcher.DeepRetrieveOptions{
 		TimeRange: formatTimeRange(in.TimeRangeStart, in.TimeRangeEnd),
+		Wait:      in.Wait,
 	})
 	if err != nil {
 		return DeepRetrieveOutput{}, err
 	}
 	return DeepRetrieveOutput{
-		Answer:         res.Answer,
+		TaskID:         res.TaskID,
+		Status:         res.Status,
 		Agent:          res.Agent,
 		Backend:        res.Backend,
+		SpawnID:        res.SpawnID,
+		Answer:         res.Answer,
 		ElapsedSeconds: res.ElapsedSeconds,
 		TimedOut:       res.TimedOut,
 		PartialResult:  res.PartialResult,
+		Error:          res.Error,
 	}, nil
 }
 

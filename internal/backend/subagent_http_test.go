@@ -227,6 +227,43 @@ func TestSubagentHTTPBackend_NoopReadSearchList(t *testing.T) {
 // extractResponse live in http_helpers_test.go so both the subagent
 // and generic HTTP backends can share them cleanly.
 
+// TestSubagentHTTPBackend_Spawn_SpawnIDPassthrough — the 0.10.0
+// {spawn_id} placeholder is substituted into BOTH the URL path and
+// the body template, so operators can route a per-call unique
+// session key to the downstream HTTP gateway any way it wants.
+func TestSubagentHTTPBackend_Spawn_SpawnIDPassthrough(t *testing.T) {
+	var gotURL, gotBody string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotURL = r.URL.Path
+		body, _ := io.ReadAll(r.Body)
+		gotBody = string(body)
+		_, _ = io.WriteString(w, `"ok"`)
+	}))
+	defer srv.Close()
+
+	b, err := NewSubagentHTTPBackend(&config.SubagentHTTPBackendConfig{
+		Name: "sa", Type: "subagent-http", BaseURL: srv.URL,
+		Spawn: config.HTTPBackendRequest{
+			Method:       "POST",
+			Path:         "/sessions/{spawn_id}/spawn",
+			BodyTemplate: `{"session_id":"{spawn_id}","task":"{task}"}`,
+		},
+		Agents:                 []config.AgentSpec{{ID: "a"}},
+		RetrievePromptTemplate: passthroughTmpl,
+	})
+	require.NoError(t, err)
+
+	_, err = b.Spawn(context.Background(), SpawnRequest{
+		AgentID: "a",
+		Task:    "q",
+		SpawnID: "pf_sp_fixture",
+		Timeout: 5 * time.Second,
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "/sessions/pf_sp_fixture/spawn", gotURL)
+	assert.Contains(t, gotBody, `"session_id":"pf_sp_fixture"`)
+}
+
 // ensure we send json content type only when a body is present
 func TestSubagentHTTPBackend_Spawn_NoBodyNoContentType(t *testing.T) {
 	var gotCT string

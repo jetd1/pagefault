@@ -225,7 +225,14 @@ func New(cfg *config.Config, d *dispatcher.ToolDispatcher, authP auth.AuthProvid
 				ar.Post("/pf_fault", restHandler(d, tool.HandleDeepRetrieve))
 			}
 			if d.ToolEnabled("pf_ps") {
-				ar.Post("/pf_ps", restHandler(d, tool.HandleListAgents))
+				// pf_ps is polymorphic — empty task_id → list
+				// agents (the classic behaviour), set task_id →
+				// return the task snapshot (0.10.0 async poll
+				// path). The REST adapter cannot use the generic
+				// restHandler because the two modes have
+				// different output types; psHandler routes
+				// explicitly.
+				ar.Post("/pf_ps", s.psHandler())
 			}
 			if d.ToolEnabled("pf_poke") {
 				ar.Post("/pf_poke", restHandler(d, tool.HandleWrite))
@@ -346,6 +353,46 @@ func restHandler[In any, Out any](d *dispatcher.ToolDispatcher, fn handlerFn[In,
 		}
 		caller := auth.CallerFromContext(r.Context())
 		out, err := fn(r.Context(), d, in, caller)
+		if err != nil {
+			writeError(w, errorStatus(err), err)
+			return
+		}
+		writeJSON(w, http.StatusOK, out)
+	}
+}
+
+// psHandler is the polymorphic REST handler for `pf_ps`. It decodes
+// a ListAgentsInput and routes based on the presence of TaskID:
+//
+//   - empty TaskID → HandleListAgents → {"agents": [...]}
+//   - set TaskID   → HandleTaskStatus → DeepRetrieveOutput
+//
+// The two modes return different JSON shapes; the generic restHandler
+// cannot be used because its type parameters would have to resolve
+// to one or the other at compile time. Keeping the routing in the
+// server layer (rather than in the tool layer) means the pure
+// handlers stay single-purpose and the shape-switching stays close
+// to the wire.
+func (s *Server) psHandler() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var in tool.ListAgentsInput
+		if r.Body != nil && r.ContentLength != 0 {
+			if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+				writeError(w, http.StatusBadRequest, fmt.Errorf("invalid json body: %w", err))
+				return
+			}
+		}
+		caller := auth.CallerFromContext(r.Context())
+		if in.TaskID != "" {
+			out, err := tool.HandleTaskStatus(r.Context(), s.dispatcher, in, caller)
+			if err != nil {
+				writeError(w, errorStatus(err), err)
+				return
+			}
+			writeJSON(w, http.StatusOK, out)
+			return
+		}
+		out, err := tool.HandleListAgents(r.Context(), s.dispatcher, in, caller)
 		if err != nil {
 			writeError(w, errorStatus(err), err)
 			return

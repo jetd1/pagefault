@@ -22,6 +22,7 @@ import (
 	"github.com/jet/pagefault/internal/config"
 	"github.com/jet/pagefault/internal/filter"
 	"github.com/jet/pagefault/internal/model"
+	"github.com/jet/pagefault/internal/task"
 )
 
 // ToolDispatcher routes tool calls to backends, applies filters, and audits
@@ -38,6 +39,12 @@ type ToolDispatcher struct {
 	filter   *filter.CompositeFilter
 	auditLog audit.Logger
 	toolsCfg config.ToolsConfig
+	// tasks is the 0.10.0 async task manager. Every DeepRetrieve /
+	// DelegateWrite call flows through it (the subagent goroutine
+	// runs on a detached context so the caller's HTTP request can
+	// disconnect without killing the spawn). Never nil — New()
+	// constructs a default manager when Options.Tasks is not set.
+	tasks *task.Manager
 }
 
 // Options bundles the dependencies required to construct a ToolDispatcher.
@@ -47,6 +54,11 @@ type Options struct {
 	Filter   *filter.CompositeFilter
 	Audit    audit.Logger
 	Tools    config.ToolsConfig
+	// Tasks is the async task manager used by DeepRetrieve /
+	// DelegateWrite. If nil, New() constructs one with default
+	// config so test code and minimal embedders get the async
+	// behaviour without extra wiring.
+	Tasks *task.Manager
 }
 
 // New constructs a ToolDispatcher from Options. It validates that backend
@@ -58,6 +70,9 @@ func New(opts Options) (*ToolDispatcher, error) {
 	if opts.Audit == nil {
 		opts.Audit = audit.NopLogger{}
 	}
+	if opts.Tasks == nil {
+		opts.Tasks = task.NewManager(task.Config{})
+	}
 
 	d := &ToolDispatcher{
 		backends:        make(map[string]backend.Backend, len(opts.Backends)),
@@ -67,6 +82,7 @@ func New(opts Options) (*ToolDispatcher, error) {
 		filter:          opts.Filter,
 		auditLog:        opts.Audit,
 		toolsCfg:        opts.Tools,
+		tasks:           opts.Tasks,
 	}
 
 	for _, b := range opts.Backends {
@@ -563,34 +579,83 @@ func (d *ToolDispatcher) ListAgents(ctx context.Context, caller model.Caller) ([
 // ───────────────────── deep_retrieve (pf_fault) ─────────────────────
 
 // DeepRetrieveResult is the structured response for a pf_fault call.
-// Either Answer (success) or PartialResult (timeout) may be populated.
+//
+// Shape depends on whether the caller requested synchronous wait or
+// async polling:
+//
+//   - Async (default, Wait=false): TaskID / Status / Agent / Backend
+//     are populated; the terminal-only fields (Answer, Elapsed, …)
+//     are zero. The caller polls GetTask (pf_ps with a task_id) until
+//     Status is terminal.
+//   - Sync (Wait=true): the call blocks until the task reaches a
+//     terminal state and the result carries Status plus the
+//     terminal-only fields (Answer on success, PartialResult+TimedOut
+//     on timeout, Error on failure). TaskID is still populated so
+//     clients can correlate with audit logs.
 type DeepRetrieveResult struct {
-	Answer         string  `json:"answer,omitempty"`
-	Agent          string  `json:"agent"`
-	Backend        string  `json:"backend"`
-	ElapsedSeconds float64 `json:"elapsed_seconds"`
-	TimedOut       bool    `json:"timed_out,omitempty"`
-	PartialResult  string  `json:"partial_result,omitempty"`
+	// TaskID is the pf_tk_* identifier for the underlying async
+	// task. Always set — even for synchronous wait calls — so
+	// clients can correlate to audit entries.
+	TaskID string `json:"task_id"`
+	// Status reflects the task lifecycle state at the time the
+	// response was built. Terminal values are "done", "failed",
+	// or "timed_out"; non-terminal is "running".
+	Status string `json:"status"`
+	// Agent is the resolved subagent id the task is running.
+	Agent string `json:"agent"`
+	// Backend is the subagent backend name the task is running on.
+	Backend string `json:"backend"`
+	// SpawnID is the pf_sp_* random token the dispatcher minted for
+	// this call. Included in the response so callers can correlate
+	// with downstream session logs (e.g. an openclaw gateway run).
+	SpawnID string `json:"spawn_id,omitempty"`
+
+	// Fields below are populated only when Status is terminal.
+
+	// Answer is the subagent's final response on success.
+	Answer string `json:"answer,omitempty"`
+	// ElapsedSeconds is the wall-clock duration from task submit
+	// to terminal state.
+	ElapsedSeconds float64 `json:"elapsed_seconds,omitempty"`
+	// TimedOut is true when Status is "timed_out".
+	TimedOut bool `json:"timed_out,omitempty"`
+	// PartialResult carries whatever the subagent produced before
+	// a timeout fired. Empty for clean success/failure.
+	PartialResult string `json:"partial_result,omitempty"`
+	// Error is the stringified failure message when Status is
+	// "failed".
+	Error string `json:"error,omitempty"`
 }
 
 // DeepRetrieveOptions bundles the optional knobs for DeepRetrieve
-// (time range, future caller hints, etc.) so we can grow the call
-// shape without churning every call site.
+// (time range, sync wait, future caller hints) so we can grow the
+// call shape without churning every call site.
 type DeepRetrieveOptions struct {
 	// TimeRange is a free-form hint restricting the subagent's
 	// search to a time window. Passed through to the backend's
 	// prompt template as {time_range}; empty means "no restriction".
 	TimeRange string
+	// Wait toggles the sync compatibility path. When true,
+	// DeepRetrieve blocks until the task reaches a terminal state
+	// (or the caller context cancels) and returns the full result
+	// inline. When false (the 0.10.0 default), the call returns
+	// immediately with {task_id, status=running} and the caller
+	// polls GetTask (pf_ps with a task_id) until it's done.
+	Wait bool
 }
 
-// DeepRetrieve spawns a subagent to answer the query and returns the
-// agent's response. agentID may be empty (use the first subagent
-// backend's default). timeout overrides the backend's configured default
-// when non-zero. opts carries optional hints like TimeRange.
+// DeepRetrieve spawns a subagent to answer the query. In async mode
+// (the default, Wait=false) it submits a task, audits the start, and
+// returns immediately with the task id. In sync mode (Wait=true) it
+// blocks on task completion and returns the full terminal result.
 //
-// On timeout, DeepRetrieve returns a successful result with TimedOut=true
-// and the partial stdout in PartialResult. Other errors (unknown agent,
-// backend failure) propagate via the error return.
+// agentID may be empty (use the first subagent backend's default).
+// timeout overrides the backend's configured default when non-zero.
+// opts carries TimeRange and Wait toggles.
+//
+// On timeout, the result carries TimedOut=true and PartialResult for
+// synchronous callers. Unknown agent / no-subagent errors propagate
+// via the error return *before* a task is submitted.
 func (d *ToolDispatcher) DeepRetrieve(ctx context.Context, query string, agentID string, timeout time.Duration, caller model.Caller, opts DeepRetrieveOptions) (*DeepRetrieveResult, error) {
 	start := time.Now()
 
@@ -601,9 +666,19 @@ func (d *ToolDispatcher) DeepRetrieve(ctx context.Context, query string, agentID
 		if result != nil {
 			size = len(result.Answer) + len(result.PartialResult)
 		}
-		args := map[string]any{"query": query, "agent": agentID, "timeout_s": int(timeout.Seconds())}
+		args := map[string]any{
+			"query":     query,
+			"agent":     agentID,
+			"timeout_s": int(timeout.Seconds()),
+			"wait":      opts.Wait,
+		}
 		if opts.TimeRange != "" {
 			args["time_range"] = opts.TimeRange
+		}
+		if result != nil {
+			args["task_id"] = result.TaskID
+			args["spawn_id"] = result.SpawnID
+			args["status"] = result.Status
 		}
 		d.auditLog.Log(audit.NewEntry(caller, "pf_fault", args, start, size, err))
 	}()
@@ -619,61 +694,158 @@ func (d *ToolDispatcher) DeepRetrieve(ctx context.Context, query string, agentID
 		return nil, err
 	}
 
-	// Spawn runs synchronously; the backend respects our timeout.
-	answer, spawnErr := target.Spawn(ctx, backend.SpawnRequest{
-		AgentID:   agentName,
-		Task:      query,
-		Purpose:   backend.SpawnPurposeRetrieve,
-		TimeRange: opts.TimeRange,
-		Timeout:   timeout,
+	spawnID, err := task.GenerateSpawnID()
+	if err != nil {
+		return nil, fmt.Errorf("dispatcher: generate spawn id: %w", err)
+	}
+
+	// Submit the task to the in-memory manager. Run() wraps
+	// target.Spawn — it runs on the manager's detached context so
+	// HTTP disconnects do not kill the subagent.
+	submitted, submitErr := d.tasks.Submit(task.SubmitRequest{
+		Agent:    agentName,
+		Backend:  target.Name(),
+		CallerID: caller.ID,
+		SpawnID:  spawnID,
+		Query:    query,
+		Timeout:  timeout,
+		Run: func(runCtx context.Context) (string, error) {
+			answer, spawnErr := target.Spawn(runCtx, backend.SpawnRequest{
+				AgentID:   agentName,
+				Task:      query,
+				Purpose:   backend.SpawnPurposeRetrieve,
+				TimeRange: opts.TimeRange,
+				SpawnID:   spawnID,
+				Timeout:   timeout,
+			})
+			if errors.Is(spawnErr, model.ErrSubagentTimeout) {
+				slog.Warn("deep_retrieve: subagent timed out",
+					"agent", agentName, "backend", target.Name(),
+					"caller", caller.ID, "task_id", "", "spawn_id", spawnID)
+				return "", &task.TimeoutError{Partial: answer}
+			}
+			return answer, spawnErr
+		},
 	})
-	elapsed := time.Since(start).Seconds()
-
-	r := &DeepRetrieveResult{
-		Agent:          agentName,
-		Backend:        target.Name(),
-		ElapsedSeconds: elapsed,
-	}
-
-	if errors.Is(spawnErr, model.ErrSubagentTimeout) {
-		r.TimedOut = true
-		r.PartialResult = answer
-		result = r
-		// Not an error from the caller's perspective — the structured
-		// result carries the timeout indicator. Surface the sentinel in
-		// the audit log instead.
-		slog.Warn("deep_retrieve: subagent timed out",
-			"agent", agentName, "backend", target.Name(),
-			"elapsed_s", elapsed, "caller", caller.ID)
-		return r, nil
-	}
-	if spawnErr != nil {
-		err = spawnErr
+	if submitErr != nil {
+		if errors.Is(submitErr, task.ErrBackpressure) {
+			err = fmt.Errorf("%w: task manager at max_concurrent", model.ErrRateLimited)
+			return nil, err
+		}
+		err = submitErr
 		return nil, err
 	}
 
-	r.Answer = answer
-	result = r
-	return r, nil
+	if !opts.Wait {
+		// Async path — return the running snapshot immediately.
+		result = taskToResult(submitted)
+		return result, nil
+	}
+
+	// Sync wait path — block on the task until it reaches a
+	// terminal state, the caller ctx fires, or the task manager
+	// closes. If the caller ctx fires, surface whatever snapshot
+	// is currently available so the client can correlate the
+	// task_id and keep polling.
+	final, waitErr := d.tasks.Wait(ctx, submitted.ID)
+	if waitErr != nil {
+		if errors.Is(waitErr, context.DeadlineExceeded) || errors.Is(waitErr, context.Canceled) {
+			if current, gerr := d.tasks.Get(submitted.ID); gerr == nil {
+				result = taskToResult(current)
+				return result, nil
+			}
+		}
+		err = waitErr
+		return nil, err
+	}
+	result = taskToResult(final)
+	return result, nil
+}
+
+// GetTask returns the current snapshot of a task as a
+// DeepRetrieveResult. Used by the pf_ps poll path — the output
+// shape is identical to DeepRetrieve's async return so clients can
+// pass either one through the same decoder.
+func (d *ToolDispatcher) GetTask(ctx context.Context, taskID string, caller model.Caller) (*DeepRetrieveResult, error) {
+	start := time.Now()
+
+	var result *DeepRetrieveResult
+	var err error
+	defer func() {
+		args := map[string]any{"task_id": taskID}
+		if result != nil {
+			args["status"] = result.Status
+		}
+		d.auditLog.Log(audit.NewEntry(caller, "pf_ps", args, start, 0, err))
+	}()
+
+	t, getErr := d.tasks.Get(taskID)
+	if getErr != nil {
+		if errors.Is(getErr, task.ErrTaskNotFound) {
+			err = fmt.Errorf("%w: task %q", model.ErrResourceNotFound, taskID)
+			return nil, err
+		}
+		err = getErr
+		return nil, err
+	}
+	result = taskToResult(t)
+	return result, nil
+}
+
+// TaskManager exposes the dispatcher's task manager so the server's
+// shutdown path can Close it. Exported for lifecycle integration,
+// not for routine use.
+func (d *ToolDispatcher) TaskManager() *task.Manager { return d.tasks }
+
+// taskToResult translates a task.Task snapshot into the dispatcher's
+// DeepRetrieveResult shape. Shared by DeepRetrieve (async + wait
+// paths), DelegateWrite, and GetTask.
+func taskToResult(t *task.Task) *DeepRetrieveResult {
+	r := &DeepRetrieveResult{
+		TaskID:  t.ID,
+		Status:  string(t.Status),
+		Agent:   t.Agent,
+		Backend: t.Backend,
+		SpawnID: t.SpawnID,
+	}
+	switch t.Status {
+	case task.StatusDone:
+		r.Answer = t.Result
+		r.ElapsedSeconds = t.Elapsed
+	case task.StatusTimedOut:
+		r.TimedOut = true
+		r.PartialResult = t.Result
+		r.ElapsedSeconds = t.Elapsed
+	case task.StatusFailed:
+		r.Error = t.Error
+		r.ElapsedSeconds = t.Elapsed
+	}
+	return r
 }
 
 // DelegateWriteOptions carries the optional knobs for DelegateWrite —
-// notably the free-form Target hint that tells the subagent where to
-// prefer persisting the content.
+// the free-form Target hint that tells the subagent where to prefer
+// persisting the content, plus the Wait toggle that matches
+// DeepRetrieveOptions so pf_poke mode:agent keeps parity with pf_fault.
 type DelegateWriteOptions struct {
 	// Target is a free-form placement hint passed through to the
 	// subagent via the prompt template's {target} placeholder
 	// ("daily", "long-term", "auto", etc.). Empty defaults to
 	// "auto" at the handler layer.
 	Target string
+	// Wait toggles the sync compatibility path. See
+	// DeepRetrieveOptions.Wait for the semantics; pf_poke
+	// mode:agent defaults to Wait=true because write calls are
+	// typically expected to confirm placement before returning.
+	Wait bool
 }
 
 // DelegateWrite spawns a subagent and asks it to persist `content`
 // into the user's memory. It is the dispatcher entry point for
 // pf_poke mode:"agent". Structurally identical to DeepRetrieve —
-// find a subagent, call Spawn, surface timeouts as TimedOut results —
-// but with SpawnPurposeWrite so the backend picks the write-framed
-// prompt template instead of the retrieval-framed one.
+// generate a spawn_id, submit a task, wait or return the async
+// handle — but with SpawnPurposeWrite so the backend picks the
+// write-framed prompt template instead of the retrieval-framed one.
 //
 // The audit entry is emitted under tool: "pf_fault" to match the
 // 0.5.x contract documented in docs/security.md §Audit (agent-mode
@@ -695,9 +867,15 @@ func (d *ToolDispatcher) DelegateWrite(ctx context.Context, content string, agen
 			"agent":         agentID,
 			"timeout_s":     int(timeout.Seconds()),
 			"purpose":       "write",
+			"wait":          opts.Wait,
 		}
 		if opts.Target != "" {
 			args["target"] = opts.Target
+		}
+		if result != nil {
+			args["task_id"] = result.TaskID
+			args["spawn_id"] = result.SpawnID
+			args["status"] = result.Status
 		}
 		d.auditLog.Log(audit.NewEntry(caller, "pf_fault", args, start, size, err))
 	}()
@@ -713,38 +891,63 @@ func (d *ToolDispatcher) DelegateWrite(ctx context.Context, content string, agen
 		return nil, err
 	}
 
-	answer, spawnErr := target.Spawn(ctx, backend.SpawnRequest{
-		AgentID: agentName,
-		Task:    content,
-		Purpose: backend.SpawnPurposeWrite,
-		Target:  opts.Target,
-		Timeout: timeout,
+	spawnID, err := task.GenerateSpawnID()
+	if err != nil {
+		return nil, fmt.Errorf("dispatcher: generate spawn id: %w", err)
+	}
+
+	submitted, submitErr := d.tasks.Submit(task.SubmitRequest{
+		Agent:    agentName,
+		Backend:  target.Name(),
+		CallerID: caller.ID,
+		SpawnID:  spawnID,
+		Query:    content,
+		Timeout:  timeout,
+		Run: func(runCtx context.Context) (string, error) {
+			answer, spawnErr := target.Spawn(runCtx, backend.SpawnRequest{
+				AgentID: agentName,
+				Task:    content,
+				Purpose: backend.SpawnPurposeWrite,
+				Target:  opts.Target,
+				SpawnID: spawnID,
+				Timeout: timeout,
+			})
+			if errors.Is(spawnErr, model.ErrSubagentTimeout) {
+				slog.Warn("delegate_write: subagent timed out",
+					"agent", agentName, "backend", target.Name(),
+					"caller", caller.ID, "spawn_id", spawnID)
+				return "", &task.TimeoutError{Partial: answer}
+			}
+			return answer, spawnErr
+		},
 	})
-	elapsed := time.Since(start).Seconds()
-
-	r := &DeepRetrieveResult{
-		Agent:          agentName,
-		Backend:        target.Name(),
-		ElapsedSeconds: elapsed,
-	}
-
-	if errors.Is(spawnErr, model.ErrSubagentTimeout) {
-		r.TimedOut = true
-		r.PartialResult = answer
-		result = r
-		slog.Warn("delegate_write: subagent timed out",
-			"agent", agentName, "backend", target.Name(),
-			"elapsed_s", elapsed, "caller", caller.ID)
-		return r, nil
-	}
-	if spawnErr != nil {
-		err = spawnErr
+	if submitErr != nil {
+		if errors.Is(submitErr, task.ErrBackpressure) {
+			err = fmt.Errorf("%w: task manager at max_concurrent", model.ErrRateLimited)
+			return nil, err
+		}
+		err = submitErr
 		return nil, err
 	}
 
-	r.Answer = answer
-	result = r
-	return r, nil
+	if !opts.Wait {
+		result = taskToResult(submitted)
+		return result, nil
+	}
+
+	final, waitErr := d.tasks.Wait(ctx, submitted.ID)
+	if waitErr != nil {
+		if errors.Is(waitErr, context.DeadlineExceeded) || errors.Is(waitErr, context.Canceled) {
+			if current, gerr := d.tasks.Get(submitted.ID); gerr == nil {
+				result = taskToResult(current)
+				return result, nil
+			}
+		}
+		err = waitErr
+		return nil, err
+	}
+	result = taskToResult(final)
+	return result, nil
 }
 
 // findSubagent locates a SubagentBackend that exposes the requested
@@ -864,8 +1067,13 @@ func (d *ToolDispatcher) Write(ctx context.Context, uri string, content string, 
 	return result, nil
 }
 
-// Close releases dispatcher-owned resources (primarily the audit logger).
+// Close releases dispatcher-owned resources: the task manager (which
+// cancels every in-flight task and waits for the goroutines to
+// return) and then the audit logger. Close is idempotent.
 func (d *ToolDispatcher) Close() error {
+	if d.tasks != nil {
+		_ = d.tasks.Close()
+	}
 	if d.auditLog != nil {
 		return d.auditLog.Close()
 	}

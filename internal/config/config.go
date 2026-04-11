@@ -37,6 +37,7 @@ type ServerConfig struct {
 	CORS      CORSConfig      `yaml:"cors,omitempty"`
 	RateLimit RateLimitConfig `yaml:"rate_limit,omitempty"`
 	MCP       MCPConfig       `yaml:"mcp,omitempty"`
+	Tasks     TasksConfig     `yaml:"tasks,omitempty"`
 }
 
 // MCPConfig configures the MCP transports and initialize-time
@@ -137,6 +138,47 @@ type RateLimitConfig struct {
 	Enabled bool    `yaml:"enabled,omitempty"`
 	RPS     float64 `yaml:"rps,omitempty"`   // tokens per second; default 10
 	Burst   int     `yaml:"burst,omitempty"` // bucket size; default 20
+}
+
+// TasksConfig configures the 0.10.0 async pf_fault task manager.
+// Every pf_fault / pf_poke mode:agent call flows through the manager:
+// the subagent spawn runs on a detached goroutine so the caller's
+// HTTP request can disconnect without killing the subagent, and the
+// caller polls pf_ps(task_id) for the result.
+//
+// The manager is in-memory only for 0.10.0 — task state is lost on
+// restart, and a client that was mid-poll gets resource_not_found
+// and has to re-issue the pf_fault. Persistence is deferred; see
+// docs/architecture.md → "Task manager" for the rationale.
+type TasksConfig struct {
+	// TTLSeconds is how long a terminal task is kept in memory
+	// before it is reclaimed on the next sweep. Zero means "use
+	// the default of 600 (10 minutes)". Clients should poll
+	// within this window; long-gone tasks are gone.
+	TTLSeconds int `yaml:"ttl_seconds,omitempty"`
+	// MaxConcurrent caps the number of in-flight task goroutines.
+	// Zero means "use the default of 16". Submissions past the
+	// cap return a rate-limited error so the HTTP response is a
+	// 429 instead of a silent queue.
+	MaxConcurrent int `yaml:"max_concurrent,omitempty"`
+}
+
+// TasksTTLOrDefault returns the task TTL in seconds, defaulting to
+// 600 when unset.
+func (t TasksConfig) TasksTTLOrDefault() int {
+	if t.TTLSeconds <= 0 {
+		return 600
+	}
+	return t.TTLSeconds
+}
+
+// TasksMaxConcurrentOrDefault returns the max_concurrent cap,
+// defaulting to 16 when unset.
+func (t TasksConfig) TasksMaxConcurrentOrDefault() int {
+	if t.MaxConcurrent <= 0 {
+		return 16
+	}
+	return t.MaxConcurrent
 }
 
 // AuthConfig configures the authentication layer.

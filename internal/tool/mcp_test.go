@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -255,6 +256,10 @@ func TestRegisterMCP_ListAgents_Populated(t *testing.T) {
 	assert.Equal(t, "cli", out.Agents[0].Backend)
 }
 
+// TestRegisterMCP_DeepRetrieve_Success — sync wait path. The call
+// passes wait=true so the MCP tool returns the populated answer
+// inline. The async-default is covered by
+// TestRegisterMCP_DeepRetrieve_AsyncReturnsTaskID below.
 func TestRegisterMCP_DeepRetrieve_Success(t *testing.T) {
 	sa := &stubSubagent{
 		name:   "sa",
@@ -267,6 +272,7 @@ func TestRegisterMCP_DeepRetrieve_Success(t *testing.T) {
 		"query":           "what?",
 		"agent":           "alpha",
 		"timeout_seconds": float64(5),
+		"wait":            true,
 	})
 	assert.False(t, res.IsError)
 
@@ -275,7 +281,64 @@ func TestRegisterMCP_DeepRetrieve_Success(t *testing.T) {
 	assert.Equal(t, "42", out.Answer)
 	assert.Equal(t, "alpha", out.Agent)
 	assert.Equal(t, "sa", out.Backend)
+	assert.Equal(t, "done", out.Status)
+	assert.NotEmpty(t, out.TaskID)
 	assert.False(t, out.TimedOut)
+}
+
+// TestRegisterMCP_DeepRetrieve_AsyncReturnsTaskID — the 0.10.0
+// default: no wait flag, pf_fault returns {task_id, status:running}
+// and pf_ps(task_id) is used to poll for the terminal snapshot.
+// End-to-end MCP exercise of the async polling pattern.
+func TestRegisterMCP_DeepRetrieve_AsyncReturnsTaskID(t *testing.T) {
+	sa := &stubSubagent{
+		name:   "sa",
+		agents: []backend.AgentInfo{{ID: "alpha"}},
+		answer: "async 42",
+	}
+	srv := newSubagentMCPServer(t, sa)
+
+	res := callTool(t, srv, "pf_fault", map[string]any{
+		"query": "what?",
+	})
+	assert.False(t, res.IsError)
+
+	var out DeepRetrieveOutput
+	require.NoError(t, json.Unmarshal([]byte(textOf(t, res)), &out))
+	assert.Equal(t, "running", out.Status)
+	assert.NotEmpty(t, out.TaskID)
+
+	// Poll via pf_ps(task_id=...) — the Mode B path.
+	// Retry a few times because the Run goroutine may not have
+	// completed by the first poll in loaded CI environments.
+	var polled DeepRetrieveOutput
+	for i := 0; i < 20; i++ {
+		pollRes := callTool(t, srv, "pf_ps", map[string]any{"task_id": out.TaskID})
+		require.False(t, pollRes.IsError)
+		require.NoError(t, json.Unmarshal([]byte(textOf(t, pollRes)), &polled))
+		if polled.Status == "done" {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	assert.Equal(t, "done", polled.Status)
+	assert.Equal(t, "async 42", polled.Answer)
+	assert.Equal(t, out.TaskID, polled.TaskID)
+}
+
+// TestRegisterMCP_ListAgents_UnknownTaskID — the Mode B path when
+// the task id does not exist (never submitted or TTL-expired)
+// returns a resource_not_found error through the MCP envelope.
+func TestRegisterMCP_ListAgents_UnknownTaskID(t *testing.T) {
+	sa := &stubSubagent{
+		name:   "sa",
+		agents: []backend.AgentInfo{{ID: "alpha"}},
+	}
+	srv := newSubagentMCPServer(t, sa)
+
+	res := callTool(t, srv, "pf_ps", map[string]any{"task_id": "pf_tk_ghost"})
+	require.True(t, res.IsError)
+	assert.Contains(t, textOf(t, res), "task")
 }
 
 func TestRegisterMCP_DeepRetrieve_MissingQuery(t *testing.T) {

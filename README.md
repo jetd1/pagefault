@@ -18,19 +18,22 @@ append path or a subagent, and exposes the surface over MCP
 rate limiting, CORS, and a live OpenAPI spec. 0.8.0 added the
 MCP-standard **OAuth 2.1 authorization code + PKCE flow** so Claude
 Desktop (and any other browser-based MCP client) can authenticate
-natively without the `supergateway` bridge, and 0.9.0 layered **RFC
-7591 Dynamic Client Registration** on top so Claude Desktop's
-remote-connector UI can self-register a public client against
-`POST /register` instead of needing a manual
-`pagefault oauth-client create` step. 0.7.0's client_credentials
-grant remains available as a fallback for programmatic clients.
-Seven tools (`pf_maps`, `pf_load`, `pf_scan`, `pf_peek`, `pf_fault`,
-`pf_ps`, `pf_poke`), four auth modes (`none` / `bearer` /
-`trusted_header` / `oauth2`, the last running compound with
-`bearer` for migration), path/tag/redaction filters, and JSONL
-audit logging. Tool names follow a `pf_*` scheme borrowed from
-Unix memory management and kernel debugging — see
-`docs/api-doc.md` for the mapping.
+natively without the `supergateway` bridge; 0.9.0 layered **RFC
+7591 Dynamic Client Registration** on top so the remote-connector
+UI can self-register a public client; 0.10.0 reshapes `pf_fault`
+into an **async task model** — the call returns a `task_id`
+immediately, the subagent runs on a detached goroutine, and the
+caller polls `pf_ps(task_id=...)` (30s × 6, ~3 minutes) for the
+result — so HTTP disconnects and proxy timeouts no longer kill
+long retrieval runs. 0.7.0's client_credentials grant remains
+available as a fallback for programmatic clients. Seven tools
+(`pf_maps`, `pf_load`, `pf_scan`, `pf_peek`, `pf_fault`, `pf_ps`,
+`pf_poke`), four auth modes (`none` / `bearer` / `trusted_header`
+/ `oauth2`, the last running compound with `bearer` for
+migration), path/tag/redaction filters, and JSONL audit logging.
+Tool names follow a `pf_*` scheme borrowed from Unix memory
+management and kernel debugging — see `docs/api-doc.md` for the
+mapping.
 
 ## Quick start
 
@@ -255,6 +258,31 @@ bash scripts/smoke.sh   # end-to-end smoke test
 
 ## Recent Changes
 
+### 0.10.0 — 2026-04-11
+
+- **Async `pf_fault` + `{spawn_id}` session isolation.** Two
+  architectural changes that fix the "every pf_fault pollutes the
+  main session" class of bugs reported against real openclaw
+  deployments. First, subagent backends now accept a new
+  `{spawn_id}` placeholder in their command / URL / body template
+  — pagefault mints a cryptographically random `pf_sp_*` token per
+  call and substitutes it in-place, so wiring e.g. `openclaw agent
+  run --session-id {spawn_id} …` gives one fresh session per
+  `pf_fault` call. Second, `pf_fault` is now **async by default**:
+  it returns `{task_id, status: "running"}` immediately and the
+  subagent runs on a detached goroutine (HTTP disconnects no longer
+  kill the spawn). Callers poll `pf_ps(task_id=...)` every 30
+  seconds (up to 6 times ≈ 3 minutes for the default 120s budget)
+  until the status is terminal. `wait: true` restores the old
+  synchronous behaviour as a compatibility escape hatch; the CLI
+  (`pagefault fault`) still defaults to sync for human-friendly
+  blocking. New `server.tasks.{ttl_seconds, max_concurrent}` config
+  block tunes the task manager (defaults 600s TTL, 16 concurrent).
+  `pf_poke` mode:agent continues to return synchronously (the
+  write path expects placement confirmation before returning),
+  but the spawn still runs on the detached goroutine so proxy
+  timeouts no longer kill it.
+
 ### 0.9.1 — 2026-04-11
 
 - **0.9.0 follow-up: doc drift + two minor code polish items.**
@@ -296,22 +324,6 @@ bash scripts/smoke.sh   # end-to-end smoke test
   origins get no CORS headers (the browser rejects the response
   either way). Plain OPTIONS without `Access-Control-Request-Method`
   is NOT a preflight and still requires auth.
-
-### 0.8.1 — 2026-04-11
-
-- **Security review-pass on the 0.8.0 OAuth2 authorize endpoint.**
-  Fixes an open redirect on `/oauth/authorize` (the `response_type`
-  check fired before `client_id` / `redirect_uri` registration was
-  verified, so an attacker could bounce the browser through an
-  unregistered URI), a consent-form `action` injection bypass (a
-  hidden `<input name="action" value="allow">` echoed from the query
-  string could silently override the user's Deny click — Go's
-  `url.Values.Get` returns the first value), and adds
-  `frame-ancestors 'none'` to the consent-page CSP. The token-endpoint
-  error classification now uses `errors.Is` against the exported
-  sentinels instead of string matching. Regression tests pin every
-  fix. CLI test coverage added for `--public` and `--redirect-uris`
-  (both flags shipped uncovered in 0.8.0). See CHANGELOG.md for details.
 
 See [`CHANGELOG.md`](CHANGELOG.md) for the full history.
 

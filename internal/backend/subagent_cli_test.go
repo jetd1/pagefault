@@ -211,6 +211,60 @@ func TestSubagentCLIBackend_Spawn_NonZeroExit(t *testing.T) {
 	assert.False(t, errors.Is(err, model.ErrSubagentTimeout))
 }
 
+// TestSubagentCLIBackend_Spawn_SpawnIDPassthrough — the 0.10.0
+// {spawn_id} placeholder is substituted into the argv so operators
+// can wire it into `openclaw agent run --session-id {spawn_id}` (or
+// any other command flag that wants a unique per-call token).
+// Operators who do not include {spawn_id} in the command are
+// unaffected; the substitution is silently a no-op for them.
+func TestSubagentCLIBackend_Spawn_SpawnIDPassthrough(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("echo semantics differ on Windows")
+	}
+	b, err := NewSubagentCLIBackend(&config.SubagentCLIBackendConfig{
+		Name: "sa", Type: "subagent-cli",
+		Command:                "echo session={spawn_id}",
+		Agents:                 []config.AgentSpec{{ID: "alpha"}},
+		RetrievePromptTemplate: passthroughTmpl,
+	})
+	require.NoError(t, err)
+
+	out, err := b.Spawn(context.Background(), SpawnRequest{
+		AgentID: "alpha",
+		Task:    "t",
+		SpawnID: "pf_sp_fixture",
+		Timeout: 5 * time.Second,
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "session=pf_sp_fixture", out)
+}
+
+// TestSubagentCLIBackend_Spawn_SpawnIDEmptyWhenUnused — a backend
+// whose command does not reference {spawn_id} works identically
+// regardless of whether the caller supplies SpawnID. Guards the
+// 0.9.x→0.10.0 backwards-compat promise.
+func TestSubagentCLIBackend_Spawn_SpawnIDEmptyWhenUnused(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("echo semantics differ on Windows")
+	}
+	b, err := NewSubagentCLIBackend(&config.SubagentCLIBackendConfig{
+		Name: "sa", Type: "subagent-cli",
+		Command:                "echo {task}",
+		Agents:                 []config.AgentSpec{{ID: "alpha"}},
+		RetrievePromptTemplate: passthroughTmpl,
+	})
+	require.NoError(t, err)
+
+	out, err := b.Spawn(context.Background(), SpawnRequest{
+		AgentID: "alpha",
+		Task:    "hi",
+		SpawnID: "pf_sp_unused",
+		Timeout: 5 * time.Second,
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "hi", out)
+}
+
 func TestSubagentCLIBackend_NoopRead(t *testing.T) {
 	b, err := NewSubagentCLIBackend(&config.SubagentCLIBackendConfig{
 		Name: "sa", Type: "subagent-cli",

@@ -67,6 +67,20 @@ server:
     #   is only this session, the archive covers everything else.
     #   In multi-agent setups call pf_ps first and pick by
     #   description; never set pf_fault.timeout_seconds below 120.
+  #
+  # ── Task manager (0.10.0+) ────────────────────
+  # pf_fault is async by default — the call returns a task_id
+  # immediately and the caller polls pf_ps(task_id) for the
+  # result. The task manager runs the subagent on a detached
+  # goroutine so HTTP disconnects do not kill the spawn.
+  # tasks:
+  #   ttl_seconds: 600        # default; how long a terminal task
+  #                           # is kept in memory before the
+  #                           # sweep reclaims it. Clients should
+  #                           # poll within this window.
+  #   max_concurrent: 16      # default; cap on in-flight task
+  #                           # goroutines. Submissions past the
+  #                           # cap return 429 rate_limited.
 
 auth:
   mode: "none"   # for a live deployment, use "bearer" + a tokens file,
@@ -141,6 +155,19 @@ backends:
   # and pf_fault without installing anything: `pagefault fault hello`
   # will return "alpha:hello". Swap in a real agent runner (openclaw,
   # claude-code, a custom shell script, etc.) for anything useful.
+  #
+  # Placeholders supported in the command template:
+  #   {task}      — the prompt-wrapped user content
+  #   {agent_id}  — which agent id pf_fault picked
+  #   {timeout}   — the per-call timeout in seconds
+  #   {spawn_id}  — NEW in 0.10.0: a pf_sp_* random token minted per
+  #                 call. Wire this into an agent runner's session flag
+  #                 to force a fresh session per pf_fault and prevent
+  #                 cross-call context bleed. Example against openclaw:
+  #                   command: "openclaw agent run \
+  #                     --session-id {spawn_id} \
+  #                     --agent {agent_id} --task {task} \
+  #                     --timeout {timeout}"
   - name: sa
     type: subagent-cli
     command: "echo {agent_id}:{task}"
