@@ -295,6 +295,91 @@ func TestOAuth2Provider_ReloadClients(t *testing.T) {
 	require.NoError(t, err)
 }
 
+// TestOAuth2Provider_ReloadClients_SweepsRevokedTokens asserts that
+// when a client disappears from the reloaded file, every access
+// token still in the in-memory store for that client is purged.
+// This is the hook that makes file-based revocation (rewrite JSONL
+// → ReloadClients) fully cut off an already-authenticated client in
+// a single step, rather than waiting for the access_token TTL.
+func TestOAuth2Provider_ReloadClients_SweepsRevokedTokens(t *testing.T) {
+	dir := t.TempDir()
+	path, _ := seedClients(t, dir, map[string]string{
+		"alice": "a3cret",
+		"bob":   "b3cret",
+	})
+	p := newOAuth2ProviderForTest(t, path, 3600)
+
+	// Issue tokens for both clients.
+	aliceTok, err := p.IssueToken(context.Background(), "alice", "a3cret", nil)
+	require.NoError(t, err)
+	bobTok, err := p.IssueToken(context.Background(), "bob", "b3cret", nil)
+	require.NoError(t, err)
+
+	// Rewrite the file without alice (seedClients truncates).
+	_, _ = seedClients(t, dir, map[string]string{
+		"bob": "b3cret",
+	})
+	require.NoError(t, p.ReloadClients())
+	assert.Equal(t, 1, p.ClientCount())
+
+	// alice's token is swept → Authenticate fails.
+	reqA := httptest.NewRequest(http.MethodPost, "/mcp", nil)
+	reqA.Header.Set("Authorization", "Bearer "+aliceTok.AccessToken)
+	_, err = p.Authenticate(reqA)
+	assert.ErrorIs(t, err, model.ErrUnauthenticated)
+
+	// bob's token survives the reload.
+	reqB := httptest.NewRequest(http.MethodPost, "/mcp", nil)
+	reqB.Header.Set("Authorization", "Bearer "+bobTok.AccessToken)
+	caller, err := p.Authenticate(reqB)
+	require.NoError(t, err)
+	assert.Equal(t, "bob", caller.ID)
+}
+
+// TestOAuth2Provider_RevokeClient asserts the in-memory revoke path
+// removes the client record and every issued access token for that
+// client. This is the method a future admin endpoint (or SIGHUP
+// reload handler) would call to force immediate invalidation.
+func TestOAuth2Provider_RevokeClient(t *testing.T) {
+	dir := t.TempDir()
+	path, _ := seedClients(t, dir, map[string]string{
+		"alice": "a3cret",
+		"bob":   "b3cret",
+	})
+	p := newOAuth2ProviderForTest(t, path, 3600)
+
+	// Two tokens for alice, one for bob.
+	a1, err := p.IssueToken(context.Background(), "alice", "a3cret", nil)
+	require.NoError(t, err)
+	a2, err := p.IssueToken(context.Background(), "alice", "a3cret", nil)
+	require.NoError(t, err)
+	b1, err := p.IssueToken(context.Background(), "bob", "b3cret", nil)
+	require.NoError(t, err)
+
+	n := p.RevokeClient("alice")
+	assert.Equal(t, 2, n)
+
+	// alice's tokens are both gone.
+	for _, tok := range []string{a1.AccessToken, a2.AccessToken} {
+		req := httptest.NewRequest(http.MethodPost, "/mcp", nil)
+		req.Header.Set("Authorization", "Bearer "+tok)
+		_, err := p.Authenticate(req)
+		assert.ErrorIs(t, err, model.ErrUnauthenticated)
+	}
+	// bob's token still works.
+	reqB := httptest.NewRequest(http.MethodPost, "/mcp", nil)
+	reqB.Header.Set("Authorization", "Bearer "+b1.AccessToken)
+	_, err = p.Authenticate(reqB)
+	require.NoError(t, err)
+
+	// alice can no longer get a new token either.
+	_, err = p.IssueToken(context.Background(), "alice", "a3cret", nil)
+	assert.ErrorIs(t, err, ErrInvalidClient)
+
+	// Revoking an unknown client returns 0, no panic, no error.
+	assert.Equal(t, 0, p.RevokeClient("ghost"))
+}
+
 func TestNewOAuth2Provider_RejectsMissingClientsFile(t *testing.T) {
 	cfg := config.AuthConfig{
 		Mode:   "oauth2",

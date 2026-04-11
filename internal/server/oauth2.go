@@ -151,12 +151,12 @@ func (s *Server) handleOAuthToken(w http.ResponseWriter, r *http.Request) {
 		writeOAuthError(w, http.StatusBadRequest, "invalid_request", "failed to parse request body")
 		return
 	}
+	// RFC 6749 §4.4 requires grant_type to be sent in the
+	// application/x-www-form-urlencoded POST body. Reading from
+	// r.PostForm (not r.Form) rejects values passed via the URL
+	// query string so non-compliant clients see a clear
+	// unsupported_grant_type error instead of silently succeeding.
 	grant := r.PostForm.Get("grant_type")
-	if grant == "" {
-		// Some clients pass grant_type in the query string as a
-		// convenience; accept that too rather than rejecting.
-		grant = r.Form.Get("grant_type")
-	}
 	if grant != "client_credentials" {
 		writeOAuthError(w, http.StatusBadRequest, "unsupported_grant_type", "only client_credentials is supported")
 		return

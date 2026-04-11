@@ -225,9 +225,17 @@ func runOAuthClientRevoke(args []string) error {
 	if err := writeOAuthClients(path, out); err != nil {
 		return err
 	}
-	fmt.Printf("revoked oauth2 client %q\n", target)
-	fmt.Printf("Note: any access tokens already issued to this client remain valid until the server restarts\n")
-	fmt.Printf("or they expire (default 1 hour). Restart pagefault to invalidate them immediately.\n")
+	fmt.Printf("revoked oauth2 client %q from %s\n", target, path)
+	fmt.Printf("\nNOTE: access tokens already issued to this client remain valid until either\n")
+	fmt.Printf("  (a) the access_token TTL expires (default 1 hour), or\n")
+	fmt.Printf("  (b) pagefault is restarted.\n")
+	fmt.Printf("The CLI rewrites the clients file out-of-process and cannot reach the running\n")
+	fmt.Printf("server's in-memory token store. Restart pagefault to force immediate invalidation.\n")
+	// TODO(phase 5): wire a SIGHUP reload handler (or an
+	// authenticated admin endpoint) so `oauth-client revoke` can
+	// notify the running server and call
+	// OAuth2Provider.RevokeClient directly, cutting active
+	// sessions without needing a full restart.
 	return nil
 }
 

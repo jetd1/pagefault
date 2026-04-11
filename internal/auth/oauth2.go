@@ -118,8 +118,17 @@ func NewOAuth2Provider(cfg config.AuthConfig) (*OAuth2Provider, error) {
 	return p, nil
 }
 
-// ReloadClients re-reads the clients JSONL file. Safe for concurrent
-// use with Authenticate and IssueToken.
+// ReloadClients re-reads the clients JSONL file and sweeps any
+// issued access tokens whose owning client is no longer in the
+// reloaded set. Safe for concurrent use with Authenticate and
+// IssueToken.
+//
+// The sweep is the mechanism that makes file-based revocation
+// (`pagefault oauth-client revoke` → rewrite JSONL → reload) cut
+// off an already-authenticated client in one shot. The CLI runs
+// out-of-process today, so revocation still needs a restart or a
+// future in-process reload signal to trigger this path; see the
+// Phase 5 TODO in cmd/pagefault/oauth_client.go.
 func (p *OAuth2Provider) ReloadClients() error {
 	data, err := os.ReadFile(p.clientsPath)
 	if err != nil {
@@ -144,8 +153,42 @@ func (p *OAuth2Provider) ReloadClients() error {
 	}
 	p.mu.Lock()
 	p.clients = m
+	// Sweep issued tokens whose owning client has disappeared from
+	// the reloaded file. Tokens for still-present clients are kept
+	// so a reload that adds/edits unrelated records does not
+	// invalidate active sessions.
+	for tok, it := range p.issued {
+		if _, still := m[it.ClientID]; !still {
+			delete(p.issued, tok)
+		}
+	}
 	p.mu.Unlock()
 	return nil
+}
+
+// RevokeClient removes an in-memory client record and revokes every
+// access token currently issued to that client. Returns the number
+// of access tokens purged, which is useful for admin-endpoint
+// responses and audit logs.
+//
+// This does NOT rewrite the clients JSONL file — the caller is
+// responsible for persisting the revocation separately (see
+// `pagefault oauth-client revoke`). The method exists so the
+// running server can be told to forget a client in-process (e.g.
+// via a future SIGHUP reload or admin endpoint) without waiting
+// for the access_token TTL to expire.
+func (p *OAuth2Provider) RevokeClient(clientID string) int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	delete(p.clients, clientID)
+	n := 0
+	for tok, it := range p.issued {
+		if it.ClientID == clientID {
+			delete(p.issued, tok)
+			n++
+		}
+	}
+	return n
 }
 
 // Authenticate validates a bearer token against the OAuth2 issued

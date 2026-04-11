@@ -249,6 +249,31 @@ func TestOAuth2_Token_UnsupportedGrant(t *testing.T) {
 	assert.Equal(t, "unsupported_grant_type", errBody["error"])
 }
 
+// TestOAuth2_Token_GrantTypeInQueryRejected verifies strict RFC 6749
+// §4.4 behaviour: grant_type MUST arrive in the
+// application/x-www-form-urlencoded POST body, not the URL query
+// string. A client that passes ?grant_type=client_credentials gets
+// unsupported_grant_type (even though the body is otherwise valid),
+// so the bug is visible in the client's logs.
+func TestOAuth2_Token_GrantTypeInQueryRejected(t *testing.T) {
+	ts, clientID, clientSecret := newOAuth2TestServer(t, "")
+
+	// grant_type only in the query string, body is empty.
+	req, err := http.NewRequest(http.MethodPost, ts.URL+"/oauth/token?grant_type=client_credentials", strings.NewReader(""))
+	require.NoError(t, err)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.SetBasicAuth(clientID, clientSecret)
+
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+
+	var errBody map[string]any
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&errBody))
+	assert.Equal(t, "unsupported_grant_type", errBody["error"])
+}
+
 func TestOAuth2_Token_MissingCredentials(t *testing.T) {
 	ts, _, _ := newOAuth2TestServer(t, "")
 

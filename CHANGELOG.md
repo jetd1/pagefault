@@ -7,6 +7,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+## 0.7.1 (2026-04-11)
+
+OAuth2 review-pass hardening. External reviewer flagged three
+issues in the 0.7.0 implementation; this release fixes the two
+actionable ones and documents the third.
+
+### Added
+- **`OAuth2Provider.RevokeClient(clientID) int`**
+  (`internal/auth/oauth2.go`). Removes the in-memory client record
+  and purges every access token currently issued to that client,
+  returning the number of tokens purged. Exists so a future
+  in-process hook (SIGHUP reload handler or an authenticated admin
+  endpoint) can force immediate invalidation without waiting for
+  the access_token TTL. The CLI still runs out-of-process today, so
+  the `pagefault oauth-client revoke` command cannot yet call this
+  directly — the CLI revoke message has been rewritten to make
+  that gap obvious, and a Phase-5 TODO is pinned next to the code.
+- **`TestOAuth2Provider_RevokeClient`** and
+  **`TestOAuth2Provider_ReloadClients_SweepsRevokedTokens`**
+  (`internal/auth/oauth2_test.go`) covering the two sweep paths.
+- **`TestOAuth2_Token_GrantTypeInQueryRejected`**
+  (`internal/server/oauth2_test.go`) pinning the strict-body
+  behaviour below.
+
+### Changed
+- **`OAuth2Provider.ReloadClients` now sweeps orphaned tokens.**
+  When a reload removes a client from the in-memory map, every
+  issued access token for that client is deleted as part of the
+  reload. This makes file-based revocation (rewrite JSONL →
+  reload) fully invalidate active sessions in one step, subject
+  to the operator actually triggering the reload. Tokens for
+  still-present clients are untouched, so reloads that add or
+  edit unrelated records do not sign users out.
+- **Token endpoint is now strict about `grant_type` placement.**
+  `POST /oauth/token` reads `grant_type` from `r.PostForm` only,
+  not the URL query string. A client that passes
+  `?grant_type=client_credentials` in the query now gets
+  `unsupported_grant_type`, matching RFC 6749 §4.4's requirement
+  that the field arrive in the application/x-www-form-urlencoded
+  body. The previous lenient fallback was removed so the bug is
+  visible in the client's logs at integration time rather than
+  silently succeeding.
+- **`pagefault oauth-client revoke` output rewritten** to spell
+  out the in-process gap: access tokens issued to the revoked
+  client remain valid until (a) the access_token TTL expires or
+  (b) pagefault is restarted, because the CLI writes the clients
+  file out-of-process and cannot reach the running server's
+  in-memory token store. A Phase-5 TODO is pinned in the code
+  referencing the future SIGHUP reload / admin endpoint.
+
+### Notes on reviewer findings not acted on in 0.7.1
+- **`extractClientCredentials` precedence.** Reviewer confirmed
+  the existing Basic-takes-precedence-over-form-body behaviour
+  matches RFC 6749 §2.3. No change.
+- **`sweepExpiredLocked` cadence.** Still opportunistic (on each
+  new issue). A background ticker adds goroutine lifecycle
+  complexity for a benefit that only matters at high token
+  volumes; deferred.
+- **`resolveIssuer` per-request recomputation.** String concat is
+  truly negligible; not worth a cached field.
+- **`configs/production.yaml` still on bearer mode.** Operational
+  migration question, not a code issue.
+
 ## 0.7.0 (2026-04-11)
 
 OAuth2 client_credentials auth provider. Shipped to unblock
