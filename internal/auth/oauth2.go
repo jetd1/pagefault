@@ -1,5 +1,5 @@
 // This file implements the OAuth2 auth provider (shipped in 0.7.0,
-// extended in 0.8.0). It supports two grant types:
+// extended in 0.8.0, DCR added in 0.9.0). It supports two grant types:
 //
 //   - client_credentials (0.7.0): machine-to-machine auth where the
 //     client authenticates with a pre-registered client_secret.
@@ -7,9 +7,12 @@
 //     based flow that Claude Desktop requires. Public clients (no
 //     secret) use PKCE to protect the code exchange.
 //
-// No dynamic client registration (DCR) endpoint is provided —
-// operators pre-register clients via `pagefault oauth-client create`
-// and paste credentials into the MCP client's configuration UI.
+// Dynamic client registration (DCR, RFC 7591) is opt-in via
+// auth.oauth2.dcr_enabled. When enabled, MCP clients like Claude
+// Desktop can self-register as public OAuth2 clients without running
+// `pagefault oauth-client create` manually. Operators can also
+// pre-register clients via the CLI and paste credentials into the
+// MCP client's configuration UI.
 //
 // The provider runs as a **compound** provider: issued OAuth2 access
 // tokens are validated first, and — when `auth.bearer.tokens_file` is
@@ -33,6 +36,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -53,6 +57,48 @@ var ErrInvalidClient = errors.New("oauth2: invalid client")
 // authorization code is expired, consumed, or otherwise invalid.
 // Callers translate this into the RFC 6749 §5.2 `invalid_grant` error.
 var ErrInvalidGrant = errors.New("oauth2: invalid grant")
+
+// ErrDCRDisabled is returned by RegisterClient when DCR is not
+// enabled on the provider.
+var ErrDCRDisabled = errors.New("oauth2: dynamic client registration is disabled")
+
+// DCRError is an RFC 7591 §3.2.2 error returned when client
+// registration validation fails. Code is one of
+// "invalid_redirect_uri" or "invalid_client_metadata".
+type DCRError struct {
+	Code        string
+	Description string
+}
+
+func (e *DCRError) Error() string { return e.Code + ": " + e.Description }
+
+// DCRRequest represents the parsed body of a POST /register request
+// per RFC 7591. Only the fields pagefault cares about are typed;
+// unknown fields are silently ignored.
+type DCRRequest struct {
+	// RedirectURIs is required for authorization_code clients.
+	RedirectURIs []string `json:"redirect_uris,omitempty"`
+	// GrantTypes defaults to ["authorization_code"] when empty.
+	GrantTypes []string `json:"grant_types,omitempty"`
+	// ResponseTypes defaults to ["code"] when empty.
+	ResponseTypes []string `json:"response_types,omitempty"`
+	// TokenEndpointAuthMethod must be "" or "none" (public client).
+	TokenEndpointAuthMethod string `json:"token_endpoint_auth_method,omitempty"`
+	// ClientName is stored as the client label.
+	ClientName string `json:"client_name,omitempty"`
+	// ClientURI is stored in metadata.
+	ClientURI string `json:"client_uri,omitempty"`
+	// Scope is a space-separated string (RFC 7591 convention).
+	// Provider defaults are applied when empty.
+	Scope string `json:"scope,omitempty"`
+	// LogoURI, TosURI, PolicyURI, SoftwareID, SoftwareVersion
+	// are accepted and stored in metadata.
+	LogoURI         string `json:"logo_uri,omitempty"`
+	TosURI          string `json:"tos_uri,omitempty"`
+	PolicyURI       string `json:"policy_uri,omitempty"`
+	SoftwareID      string `json:"software_id,omitempty"`
+	SoftwareVersion string `json:"software_version,omitempty"`
+}
 
 // ClientRecord is one line of the OAuth2 clients JSONL file. The
 // secret is stored hashed via bcrypt — `pagefault oauth-client create`
@@ -114,6 +160,9 @@ type OAuth2Provider struct {
 	defaultScopes []string
 	autoApprove   bool
 
+	dcrEnabled     bool
+	dcrBearerToken string
+
 	fallback AuthProvider // nil unless bearer.tokens_file is also configured
 }
 
@@ -130,14 +179,16 @@ func NewOAuth2Provider(cfg config.AuthConfig) (*OAuth2Provider, error) {
 		return nil, errors.New("auth: oauth2: clients_file is required")
 	}
 	p := &OAuth2Provider{
-		clientsPath:   cfg.OAuth2.ClientsFile,
-		clients:       map[string]ClientRecord{},
-		issued:        map[string]IssuedToken{},
-		authCodes:     map[string]AuthorizationCode{},
-		ttl:           time.Duration(cfg.OAuth2.AccessTokenTTLOrDefault()) * time.Second,
-		authCodeTTL:   time.Duration(cfg.OAuth2.AuthCodeTTLOrDefault()) * time.Second,
-		defaultScopes: cfg.OAuth2.DefaultScopesOrDefault(),
-		autoApprove:   cfg.OAuth2.AutoApproveOrDefault(),
+		clientsPath:    cfg.OAuth2.ClientsFile,
+		clients:        map[string]ClientRecord{},
+		issued:         map[string]IssuedToken{},
+		authCodes:      map[string]AuthorizationCode{},
+		ttl:            time.Duration(cfg.OAuth2.AccessTokenTTLOrDefault()) * time.Second,
+		authCodeTTL:    time.Duration(cfg.OAuth2.AuthCodeTTLOrDefault()) * time.Second,
+		defaultScopes:  cfg.OAuth2.DefaultScopesOrDefault(),
+		autoApprove:    cfg.OAuth2.AutoApproveOrDefault(),
+		dcrEnabled:     cfg.OAuth2.DCREnabledOrDefault(),
+		dcrBearerToken: cfg.OAuth2.DCRBearerToken,
 	}
 	if err := p.ReloadClients(); err != nil {
 		return nil, err
@@ -393,6 +444,18 @@ func (p *OAuth2Provider) AutoApprove() bool {
 	return p.autoApprove
 }
 
+// DCREnabled returns whether dynamic client registration is enabled
+// on this provider.
+func (p *OAuth2Provider) DCREnabled() bool {
+	return p.dcrEnabled
+}
+
+// DCRBearerToken returns the configured DCR bearer token, or empty
+// string if open registration is allowed.
+func (p *OAuth2Provider) DCRBearerToken() string {
+	return p.dcrBearerToken
+}
+
 // ValidateClientSecret checks if the provided secret matches the
 // stored hash for the given client. Returns true if the client is
 // confidential and the secret matches. Returns false if the client
@@ -425,22 +488,26 @@ func (p *OAuth2Provider) IssueAuthorizationCode(clientID, redirectURI string, sc
 	if !ok {
 		return nil, ErrInvalidClient
 	}
-	// Validate redirect_uri is registered for this client.
-	if len(rec.RedirectURIs) > 0 {
-		found := false
-		for _, ru := range rec.RedirectURIs {
-			if ru == redirectURI {
-				found = true
-				break
-			}
-		}
-		if !found {
-			return nil, fmt.Errorf("%w: redirect_uri not registered for client %q", model.ErrInvalidRequest, clientID)
-		}
-	} else if redirectURI != "" {
-		// Client has no registered redirect_uris — this client was
-		// created for client_credentials flow only.
+	// A client that was registered for client_credentials only (no
+	// redirect_uris) has no business on the authorize endpoint.
+	// Reject up front regardless of whether the caller passed a
+	// redirectURI — the HTTP handler already enforces this, but
+	// IssueAuthorizationCode is exported so library callers must
+	// get the same guarantee.
+	if len(rec.RedirectURIs) == 0 {
 		return nil, fmt.Errorf("%w: client %q has no registered redirect_uris", model.ErrInvalidRequest, clientID)
+	}
+	// Validate redirect_uri exactly matches one of the registered
+	// URIs (RFC 6749 §3.1.2.3 exact-match recommendation).
+	found := false
+	for _, ru := range rec.RedirectURIs {
+		if ru == redirectURI {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return nil, fmt.Errorf("%w: redirect_uri not registered for client %q", model.ErrInvalidRequest, clientID)
 	}
 
 	// Pick effective scopes.
@@ -611,6 +678,168 @@ func verifyCodeChallenge(verifier, expectedChallenge string) bool {
 	h := sha256.Sum256([]byte(verifier))
 	computed := base64.RawURLEncoding.EncodeToString(h[:])
 	return subtle.ConstantTimeCompare([]byte(computed), []byte(expectedChallenge)) == 1
+}
+
+// GenerateClientID returns a cryptographically random client ID with
+// a "pf_dcr_" prefix, suitable for dynamically-registered clients.
+// The prefix distinguishes DCR clients from CLI-created clients in
+// logs and audit entries. 128 bits of randomness is plenty for a
+// client ID — the space is not expected to collide.
+func GenerateClientID() (string, error) {
+	var raw [16]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return "", fmt.Errorf("auth: oauth2: generate client id: %w", err)
+	}
+	return "pf_dcr_" + base64.RawURLEncoding.EncodeToString(raw[:]), nil
+}
+
+// isLocalhostOrHTTPS reports whether a redirect URI is acceptable for
+// MCP clients: localhost (any port), 127.0.0.1, [::1], or HTTPS.
+// This prevents open-redirect attacks through non-local HTTP URIs and
+// matches the MCP specification's security requirements.
+func isLocalhostOrHTTPS(rawURI string) bool {
+	u, err := url.Parse(rawURI)
+	if err != nil {
+		return false
+	}
+	host := u.Hostname()
+	switch {
+	case u.Scheme == "https":
+		return true
+	case host == "localhost", host == "127.0.0.1", host == "::1":
+		return u.Scheme == "http" // localhost must still be http(s)
+	default:
+		return false
+	}
+}
+
+// RegisterClient validates and persists a dynamically-registered
+// OAuth2 client per RFC 7591. It creates a public client (no
+// client_secret, PKCE-only) and appends the record to the clients
+// JSONL file. Returns the new ClientRecord on success.
+//
+// Validation rules:
+//   - redirect_uris is required and must be non-empty
+//   - each redirect_uri must be localhost or HTTPS (MCP security convention)
+//   - grant_types: "authorization_code" is accepted, "refresh_token" is
+//     silently accepted (pagefault does not issue refresh tokens), anything
+//     else is rejected
+//   - token_endpoint_auth_method, if present, must be "none" (public client)
+//   - client_name is stored as the client label
+//   - scope, if non-empty, overrides provider defaults
+func (p *OAuth2Provider) RegisterClient(req DCRRequest) (*ClientRecord, error) {
+	if !p.dcrEnabled {
+		return nil, ErrDCRDisabled
+	}
+
+	// 1. Validate redirect_uris (required, non-empty, localhost or HTTPS).
+	if len(req.RedirectURIs) == 0 {
+		return nil, &DCRError{Code: "invalid_redirect_uri", Description: "redirect_uris is required"}
+	}
+	for _, u := range req.RedirectURIs {
+		if !isLocalhostOrHTTPS(u) {
+			return nil, &DCRError{
+				Code:        "invalid_redirect_uri",
+				Description: fmt.Sprintf("redirect_uri %q must be localhost or HTTPS", u),
+			}
+		}
+	}
+
+	// 2. Validate grant_types. "authorization_code" and "refresh_token"
+	// are accepted; anything else is rejected.
+	for _, gt := range req.GrantTypes {
+		switch gt {
+		case "authorization_code", "refresh_token":
+			// accepted; refresh_token silently ignored
+		default:
+			return nil, &DCRError{
+				Code:        "invalid_client_metadata",
+				Description: fmt.Sprintf("unsupported grant_type %q", gt),
+			}
+		}
+	}
+
+	// 3. Validate token_endpoint_auth_method. Only "none" (public client)
+	// is supported for DCR — we don't issue client_secrets.
+	if req.TokenEndpointAuthMethod != "" && req.TokenEndpointAuthMethod != "none" {
+		return nil, &DCRError{
+			Code:        "invalid_client_metadata",
+			Description: "only 'none' token_endpoint_auth_method is supported for dynamic registration (public client, PKCE-only)",
+		}
+	}
+
+	// 4. Generate client_id.
+	clientID, err := GenerateClientID()
+	if err != nil {
+		return nil, fmt.Errorf("auth: oauth2: dcr: %w", err)
+	}
+
+	// 5. Determine effective scopes.
+	var scopes []string
+	if req.Scope != "" {
+		scopes = strings.Fields(req.Scope)
+	}
+	if len(scopes) == 0 {
+		scopes = p.defaultScopes
+	}
+
+	// 6. Build the ClientRecord (public client, no secret).
+	now := time.Now().UTC()
+	rec := ClientRecord{
+		ID:           clientID,
+		Label:        req.ClientName,
+		SecretHash:   "", // public client
+		Scopes:       scopes,
+		RedirectURIs: req.RedirectURIs,
+		Metadata: map[string]any{
+			"created_at":                 now.Format(time.RFC3339),
+			"dcr":                        true,
+			"grant_types":                req.GrantTypes,
+			"response_types":             req.ResponseTypes,
+			"token_endpoint_auth_method": req.TokenEndpointAuthMethod,
+			"client_uri":                 req.ClientURI,
+			"logo_uri":                   req.LogoURI,
+			"tos_uri":                    req.TosURI,
+			"policy_uri":                 req.PolicyURI,
+			"software_id":                req.SoftwareID,
+			"software_version":           req.SoftwareVersion,
+		},
+	}
+
+	// 7. Persist: append to the JSONL file.
+	if err := p.appendClient(rec); err != nil {
+		return nil, fmt.Errorf("auth: oauth2: dcr: persist: %w", err)
+	}
+
+	// 8. Add to in-memory map.
+	p.mu.Lock()
+	p.clients[clientID] = rec
+	p.mu.Unlock()
+
+	return &rec, nil
+}
+
+// appendClient appends a single ClientRecord as a JSONL line to the
+// clients file. Uses O_APPEND|O_CREATE|O_WRONLY plus fsync for
+// durability, matching the audit log's write pattern. The append-only
+// approach avoids a read-rewrite race with the CLI's writeOAuthClients.
+func (p *OAuth2Provider) appendClient(rec ClientRecord) error {
+	line, err := json.Marshal(rec)
+	if err != nil {
+		return fmt.Errorf("marshal: %w", err)
+	}
+	line = append(line, '\n')
+
+	f, err := os.OpenFile(p.clientsPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		return fmt.Errorf("open: %w", err)
+	}
+	defer f.Close()
+
+	if _, err := f.Write(line); err != nil {
+		return fmt.Errorf("write: %w", err)
+	}
+	return f.Sync()
 }
 
 // ParseClientsJSONL parses an OAuth2 clients JSONL file. Blank lines

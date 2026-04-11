@@ -253,6 +253,8 @@ auth:
 | `oauth2.default_scopes`         | string[] | optional               | Scope list attached to newly issued tokens when the caller requests none. Default `["mcp"]` matches the MCP client ecosystem convention. |
 | `oauth2.auth_code_ttl_seconds`  | int      | optional               | Authorization code lifetime in seconds. Default `60`. Short TTL limits the window for code interception; 60s is generous enough for a browser redirect round-trip. |
 | `oauth2.auto_approve`           | bool     | optional               | When `true` (default), `GET /oauth/authorize` immediately redirects with the authorization code — no consent page is shown. Set `false` to render an HTML consent page before issuing the code. Single-operator servers should leave this at the default; the operator is authorizing themselves. |
+| `oauth2.dcr_enabled`            | bool     | optional               | Mount `POST /register` for RFC 7591 Dynamic Client Registration. Default `false`. When enabled, MCP clients like Claude Desktop can self-register as public OAuth2 clients without manual `oauth-client create`. Opt-in because DCR creates client records without authentication. |
+| `oauth2.dcr_bearer_token`       | string   | optional               | Optional bearer token that must be presented in the `Authorization` header of `POST /register` requests. When empty (default), registration is open. Set this to restrict DCR to clients that know the token. |
 
 ### Token file format (`bearer`)
 
@@ -278,7 +280,7 @@ operator-managed client registry:
    OAuth 2.1 flow. PKCE (S256 only) protects the flow; public
    clients (no client_secret) authenticate via PKCE alone.
 
-When oauth2 mode is active, five public endpoints are mounted on the
+When oauth2 mode is active, four public endpoints are mounted on the
 server **outside** the auth middleware (they have to be reachable
 before a token exists):
 
@@ -286,13 +288,14 @@ before a token exists):
 |---|---|---|
 | `GET /.well-known/oauth-protected-resource` | [RFC 9728](https://datatracker.ietf.org/doc/html/rfc9728) | Points MCP clients at the authorization server for this resource. |
 | `GET /.well-known/oauth-authorization-server` | [RFC 8414](https://datatracker.ietf.org/doc/html/rfc8414) | Advertises the authorization endpoint, token endpoint, supported grants (`client_credentials`, `authorization_code`), response types (`code`), code challenge methods (`S256`), and supported auth methods. |
-| `GET /oauth/authorize` | [RFC 6749 §4.1](https://datatracker.ietf.org/doc/html/rfc6749#section-4.1) | Authorization endpoint for the auth code flow. Validates client_id, redirect_uri, PKCE code_challenge, and state. Auto-approves by default (redirects immediately with code). |
-| `POST /oauth/authorize` | [RFC 6749 §4.1](https://datatracker.ietf.org/doc/html/rfc6749#section-4.1) | Consent form submission (when `auto_approve: false`). |
+| `GET+POST /oauth/authorize` | [RFC 6749 §4.1](https://datatracker.ietf.org/doc/html/rfc6749#section-4.1) | Authorization endpoint for the auth code flow. GET is the browser entry point (validates client_id, redirect_uri, PKCE code_challenge, state; auto-approves by default and 302s back to the client). POST is the consent-form handler when `auto_approve: false`. |
 | `POST /oauth/token` | [RFC 6749](https://datatracker.ietf.org/doc/html/rfc6749) | Exchanges client credentials (client_credentials) or authorization code (authorization_code + PKCE) for an access token. |
+| `POST /register` | [RFC 7591](https://datatracker.ietf.org/doc/html/rfc7591) | Dynamic client registration. Mounted only when `dcr_enabled: true`. Creates a public OAuth2 client (PKCE-only) so MCP clients like Claude Desktop can self-register. |
 
 The discovery endpoints are always public; the token endpoint is
 public but authenticates via client credentials rather than bearer
-tokens. The MCP and `/api/*` routes continue to require
+tokens. The registration endpoint (when enabled) is also public —
+optionally gated by `dcr_bearer_token`. The MCP and `/api/*` routes continue to require
 `Authorization: Bearer <access_token>` and are unchanged.
 
 #### Clients file format
@@ -370,6 +373,8 @@ auth:
     default_scopes: ["mcp"]
     auth_code_ttl_seconds: 60    # auth code lifetime (default 60)
     auto_approve: true           # skip consent page (default true)
+    # dcr_enabled: true          # enable RFC 7591 dynamic client registration
+    # dcr_bearer_token: ""       # optional gate for /register
   bearer:
     # Claude Code keeps using its static bearer token via this
     # fallback path; only Claude Desktop needs the OAuth2 flow.

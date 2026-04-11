@@ -169,6 +169,14 @@ func New(cfg *config.Config, d *dispatcher.ToolDispatcher, authP auth.AuthProvid
 		r.Post("/oauth/token", s.handleOAuthToken)
 		r.Get("/oauth/authorize", s.handleOAuthAuthorize)
 		r.Post("/oauth/authorize", s.handleOAuthAuthorize)
+		// RFC 7591 Dynamic Client Registration. Mounted only when
+		// DCR is enabled — it is opt-in because it creates clients
+		// without authentication. Claude Desktop's remote connector
+		// requires this endpoint to self-register before starting
+		// the authorization_code + PKCE flow.
+		if s.oauth2P.DCREnabled() {
+			r.Post("/register", s.handleOAuthRegister)
+		}
 	}
 
 	// Authenticated endpoints. Rate limiting runs after auth so the
@@ -306,6 +314,9 @@ func (s *Server) handleRoot(w http.ResponseWriter, _ *http.Request) {
 		_, _ = io.WriteString(w, "  POST /oauth/token        — OAuth2 token endpoint\n")
 		_, _ = io.WriteString(w, "  GET  /oauth/authorize    — OAuth2 authorization endpoint\n")
 		_, _ = io.WriteString(w, "  POST /oauth/authorize    — OAuth2 consent form handler\n")
+		if s.oauth2P.DCREnabled() {
+			_, _ = io.WriteString(w, "  POST /register             — RFC 7591 dynamic client registration\n")
+		}
 	}
 	_, _ = io.WriteString(w, "  POST /api/pf_maps        — list memory regions (contexts)\n")
 	_, _ = io.WriteString(w, "  POST /api/pf_load        — load a region by name\n")

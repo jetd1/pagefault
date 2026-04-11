@@ -141,8 +141,9 @@ func handleWriteDirect(ctx context.Context, d *dispatcher.ToolDispatcher, in Wri
 // template (per-agent override → backend default →
 // [backend.DefaultWritePromptTemplate]) applied inside Spawn so it
 // knows its job is placement, not generation. pagefault does not
-// re-validate the agent's writes — per plan.md §5.7, agent mode
-// *delegates trust* to the subagent.
+// re-validate the agent's writes — agent mode *delegates trust* to
+// the subagent. See docs/security.md → "Mode: agent" for the full
+// trust-boundary rationale.
 func handleWriteAgent(ctx context.Context, d *dispatcher.ToolDispatcher, in WriteInput, caller model.Caller) (WriteOutput, error) {
 	target := in.Target
 	if target == "" {

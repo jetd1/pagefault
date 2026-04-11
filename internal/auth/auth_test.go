@@ -189,6 +189,48 @@ func TestMiddleware_RejectsUnauthenticated(t *testing.T) {
 	assert.Contains(t, rec.Body.String(), "unauthenticated")
 }
 
+func TestMiddleware_PreflightBypassesAuth(t *testing.T) {
+	path := writeTokens(t, sampleTokens)
+	b, err := NewBearerTokenAuth(path)
+	require.NoError(t, err)
+
+	called := false
+	h := Middleware(b)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		w.WriteHeader(http.StatusNoContent)
+	}))
+
+	// OPTIONS with Access-Control-Request-Method and NO Authorization header.
+	// Without the preflight bypass this would 401.
+	req := httptest.NewRequest(http.MethodOptions, "/mcp", nil)
+	req.Header.Set("Origin", "https://claude.ai")
+	req.Header.Set("Access-Control-Request-Method", "POST")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	assert.True(t, called, "preflight must pass through to next handler")
+	assert.Equal(t, http.StatusNoContent, rec.Code)
+}
+
+func TestMiddleware_PlainOPTIONSStillRequiresAuth(t *testing.T) {
+	// A plain OPTIONS request (no Access-Control-Request-Method header)
+	// is NOT a CORS preflight and should still go through auth.
+	path := writeTokens(t, sampleTokens)
+	b, err := NewBearerTokenAuth(path)
+	require.NoError(t, err)
+
+	h := Middleware(b)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	req := httptest.NewRequest(http.MethodOptions, "/mcp", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusUnauthorized, rec.Code,
+		"plain OPTIONS without ACRM header must be authenticated")
+}
+
 func TestCallerFromContext_DefaultAnonymous(t *testing.T) {
 	c := CallerFromContext(nil)
 	assert.Equal(t, "anonymous", c.ID)

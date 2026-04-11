@@ -23,8 +23,10 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strings"
@@ -131,9 +133,100 @@ func (s *Server) handleOAuthAuthorizationServer(w http.ResponseWriter, r *http.R
 		"token_endpoint_auth_methods_supported": []string{"client_secret_basic", "client_secret_post", "none"},
 		"scopes_supported":                      s.cfg.Auth.OAuth2.DefaultScopesOrDefault(),
 	}
+	// Advertise the registration endpoint when DCR is enabled.
+	if s.oauth2P.DCREnabled() {
+		body["registration_endpoint"] = issuer + "/register"
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")
 	_ = json.NewEncoder(w).Encode(body)
+}
+
+// handleOAuthRegister implements POST /register for RFC 7591 Dynamic
+// Client Registration. The handler creates a public OAuth2 client (no
+// client_secret, PKCE-only) and returns the client metadata per
+// RFC 7591 §3.2.1.
+//
+// When auth.oauth2.dcr_bearer_token is configured, the request must
+// include an Authorization: Bearer header matching the configured
+// token. When the field is empty, registration is open.
+func (s *Server) handleOAuthRegister(w http.ResponseWriter, r *http.Request) {
+	if s.oauth2P == nil || !s.oauth2P.DCREnabled() {
+		writeOAuthError(w, http.StatusNotFound, "invalid_request", "dynamic client registration is not enabled")
+		return
+	}
+
+	// Optional bearer token gate.
+	if tok := s.oauth2P.DCRBearerToken(); tok != "" {
+		authHeader := r.Header.Get("Authorization")
+		if authHeader == "" {
+			w.Header().Set("WWW-Authenticate", `Bearer realm="pagefault"`)
+			writeOAuthError(w, http.StatusUnauthorized, "invalid_request", "DCR requires authentication")
+			return
+		}
+		parts := strings.SplitN(authHeader, " ", 2)
+		if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") || parts[1] != tok {
+			w.Header().Set("WWW-Authenticate", `Bearer realm="pagefault"`)
+			writeOAuthError(w, http.StatusUnauthorized, "invalid_request", "invalid DCR bearer token")
+			return
+		}
+	}
+
+	// Parse the JSON body.
+	var req auth.DCRRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeOAuthError(w, http.StatusBadRequest, "invalid_client_metadata", "failed to parse request body")
+		return
+	}
+
+	rec, err := s.oauth2P.RegisterClient(req)
+	if err != nil {
+		var dcrErr *auth.DCRError
+		if errors.As(err, &dcrErr) {
+			writeOAuthError(w, http.StatusBadRequest, dcrErr.Code, dcrErr.Description)
+			return
+		}
+		if errors.Is(err, auth.ErrDCRDisabled) {
+			writeOAuthError(w, http.StatusNotFound, "invalid_request", "dynamic client registration is not enabled")
+			return
+		}
+		slog.Error("dcr: register failed", "error", err)
+		writeOAuthError(w, http.StatusInternalServerError, "server_error", "registration failed")
+		return
+	}
+
+	// Build the RFC 7591 §3.2.1 response. No client_secret because
+	// DCR only creates public clients (PKCE-only).
+	grantTypes := req.GrantTypes
+	if len(grantTypes) == 0 {
+		grantTypes = []string{"authorization_code"}
+	}
+	responseTypes := req.ResponseTypes
+	if len(responseTypes) == 0 {
+		responseTypes = []string{"code"}
+	}
+	resp := map[string]any{
+		"client_id":                  rec.ID,
+		"client_id_issued_at":        time.Now().Unix(),
+		"redirect_uris":              rec.RedirectURIs,
+		"grant_types":                grantTypes,
+		"response_types":             responseTypes,
+		"token_endpoint_auth_method": "none",
+	}
+	if rec.Label != "" {
+		resp["client_name"] = rec.Label
+	}
+	if len(rec.Scopes) > 0 {
+		resp["scope"] = strings.Join(rec.Scopes, " ")
+	}
+	if req.ClientURI != "" {
+		resp["client_uri"] = req.ClientURI
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusCreated)
+	_ = json.NewEncoder(w).Encode(resp)
 }
 
 // handleOAuthToken implements the RFC 6749 token endpoint for both
@@ -263,11 +356,15 @@ func (s *Server) handleAuthorizationCodeGrant(w http.ResponseWriter, r *http.Req
 
 	issued, err := s.oauth2P.ExchangeAuthorizationCode(code, redirectURI, clientID, codeVerifier)
 	if err != nil {
+		// Use errors.Is against the exported sentinels so the
+		// classification survives future wrapping or message tweaks.
+		// Per RFC 6749 §5.2 we return a static description rather
+		// than err.Error() so no internal detail leaks to the caller.
 		switch {
-		case isErrInvalidGrant(err):
-			writeOAuthError(w, http.StatusBadRequest, "invalid_grant", err.Error())
-		case isErrInvalidClient(err):
-			writeOAuthError(w, http.StatusBadRequest, "invalid_client", err.Error())
+		case errors.Is(err, auth.ErrInvalidClient):
+			writeOAuthError(w, http.StatusBadRequest, "invalid_client", "unknown client")
+		case errors.Is(err, auth.ErrInvalidGrant):
+			writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "authorization code is invalid, expired, consumed, or bound to a different client")
 		default:
 			writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "authorization code exchange failed")
 		}
@@ -282,7 +379,7 @@ func (s *Server) writeTokenResponse(w http.ResponseWriter, issued *auth.IssuedTo
 	resp := map[string]any{
 		"access_token": issued.AccessToken,
 		"token_type":   "Bearer",
-		"expires_in":   int(time.Until(issued.ExpiresAt).Seconds()),
+		"expires_in":   computeExpiresIn(issued.ExpiresAt, time.Now()),
 	}
 	if len(issued.Scopes) > 0 {
 		resp["scope"] = strings.Join(issued.Scopes, " ")
@@ -334,11 +431,13 @@ func (s *Server) handleOAuthAuthorize(w http.ResponseWriter, r *http.Request) {
 		codeChallengeMethod = r.URL.Query().Get("code_challenge_method")
 	}
 
-	// Validate required parameters.
-	if responseType != "code" {
-		s.authorizeError(w, r, redirectURI, state, "unsupported_response_type", "only 'code' response_type is supported")
-		return
-	}
+	// RFC 6749 §4.1.2.1: client_id and redirect_uri MUST be validated
+	// against the registered list BEFORE any error can trigger a
+	// redirect. Validating response_type / state / code_challenge
+	// first would let an attacker bounce the browser through an
+	// unregistered URL via authorizeError — an open redirect. Order
+	// is therefore: client_id → client lookup → redirect_uri presence
+	// → redirect_uri registration → everything else.
 	if clientID == "" {
 		writeOAuthError(w, http.StatusBadRequest, "invalid_request", "missing client_id")
 		return
@@ -352,24 +451,37 @@ func (s *Server) handleOAuthAuthorize(w http.ResponseWriter, r *http.Request) {
 		writeOAuthError(w, http.StatusBadRequest, "invalid_request", "missing redirect_uri")
 		return
 	}
-	// Validate redirect_uri is registered.
-	if len(rec.RedirectURIs) > 0 {
-		found := false
-		for _, ru := range rec.RedirectURIs {
-			if ru == redirectURI {
-				found = true
-				break
-			}
-		}
-		if !found {
-			// Don't redirect with the error — the redirect_uri is
-			// not registered, so redirecting would be unsafe.
-			writeOAuthError(w, http.StatusBadRequest, "invalid_request", "redirect_uri not registered for this client")
-			return
+	// Validate redirect_uri is registered. A client with no registered
+	// URIs at all cannot use the authorization_code flow — this
+	// typically means it was created for client_credentials only.
+	if len(rec.RedirectURIs) == 0 {
+		writeOAuthError(w, http.StatusBadRequest, "invalid_request", "client has no registered redirect_uris")
+		return
+	}
+	registered := false
+	for _, ru := range rec.RedirectURIs {
+		if ru == redirectURI {
+			registered = true
+			break
 		}
 	}
+	if !registered {
+		// Don't redirect with the error — the redirect_uri is not
+		// registered, so redirecting would be unsafe (open redirect).
+		writeOAuthError(w, http.StatusBadRequest, "invalid_request", "redirect_uri not registered for this client")
+		return
+	}
+
+	// From here on the redirect_uri is safe, so errors may fall back
+	// to authorizeError (redirect with error=... & state=...). Per RFC
+	// 6749 §4.1.2.1 the state must also be present for the redirect
+	// form to be useful — a missing state still gets a 400.
 	if state == "" {
-		s.authorizeError(w, r, redirectURI, state, "invalid_request", "missing state parameter")
+		writeOAuthError(w, http.StatusBadRequest, "invalid_request", "missing state parameter")
+		return
+	}
+	if responseType != "code" {
+		s.authorizeError(w, r, redirectURI, state, "unsupported_response_type", "only 'code' response_type is supported")
 		return
 	}
 	if codeChallenge == "" {
@@ -381,15 +493,34 @@ func (s *Server) handleOAuthAuthorize(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// If auto_approve is false and this is a GET, render the consent
-	// page. POST with action=allow proceeds; POST with action=deny
-	// redirects with access_denied.
+	// If auto_approve is false, either render the consent page (GET)
+	// or gate the issue on an explicit action=allow (POST). Any other
+	// action value — including missing or repeated values from query-
+	// injected hidden fields — is treated as deny.
 	if !s.oauth2P.AutoApprove() {
 		if r.Method == http.MethodGet {
-			s.renderConsentPage(w, rec, r.URL.Query())
+			s.renderConsentPage(w, rec, consentParams{
+				responseType:        responseType,
+				clientID:            clientID,
+				redirectURI:         redirectURI,
+				scope:               scope,
+				state:               state,
+				codeChallenge:       codeChallenge,
+				codeChallengeMethod: codeChallengeMethod,
+			})
 			return
 		}
-		if r.Method == http.MethodPost && r.PostForm.Get("action") == "deny" {
+		// POST path. Take the last value of `action` so that an
+		// attacker-seeded hidden field cannot outrank the clicked
+		// button (which the browser appends at the end of form
+		// submission). Default-deny: anything other than a literal
+		// "allow" redirects with access_denied.
+		actions := r.PostForm["action"]
+		var action string
+		if len(actions) > 0 {
+			action = actions[len(actions)-1]
+		}
+		if action != "allow" {
 			s.authorizeError(w, r, redirectURI, state, "access_denied", "resource owner denied the request")
 			return
 		}
@@ -448,27 +579,62 @@ func buildRedirectURI(base, code, state string) string {
 	return u.String()
 }
 
-// renderConsentPage writes a minimal HTML consent page. This is only
-// reached when auto_approve is false.
-func (s *Server) renderConsentPage(w http.ResponseWriter, rec auth.ClientRecord, params url.Values) {
+// consentParams is the whitelist of values preserved across the
+// consent form render → submit round-trip. Only the OAuth 2.1
+// authorization-endpoint parameters are allowed through — anything
+// else in the original query string is dropped so an attacker cannot
+// inject an `action=allow` hidden field that would silently bypass
+// the user's "Deny" click (Go's url.Values.Get returns the first
+// value, so a pre-existing hidden `action` would outrank the button).
+type consentParams struct {
+	responseType        string
+	clientID            string
+	redirectURI         string
+	scope               string
+	state               string
+	codeChallenge       string
+	codeChallengeMethod string
+}
+
+// renderConsentPage writes a minimal HTML consent page. Only reached
+// when auto_approve is false. The hidden fields are restricted to the
+// OAuth spec parameters so a query-injected `action` cannot ride
+// through the form submission.
+func (s *Server) renderConsentPage(w http.ResponseWriter, rec auth.ClientRecord, p consentParams) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
-	w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'")
+	// frame-ancestors 'none' blocks clickjacking; form-action 'self'
+	// keeps the submit pinned to the same origin; default-src 'none'
+	// denies scripts/images/fonts so the page has no network side
+	// effects beyond the form post.
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'")
 
 	clientName := html.EscapeString(rec.Label)
 	if clientName == "" {
 		clientName = html.EscapeString(rec.ID)
 	}
 
-	// Build hidden form fields preserving all original query params.
+	// Build hidden form fields from the whitelisted OAuth params
+	// only. Empty fields are omitted — they are either optional
+	// (scope) or will be re-validated on POST anyway.
+	fields := []struct{ name, value string }{
+		{"response_type", p.responseType},
+		{"client_id", p.clientID},
+		{"redirect_uri", p.redirectURI},
+		{"scope", p.scope},
+		{"state", p.state},
+		{"code_challenge", p.codeChallenge},
+		{"code_challenge_method", p.codeChallengeMethod},
+	}
 	var hiddenFields strings.Builder
-	for key, values := range params {
-		for _, v := range values {
-			hiddenFields.WriteString(fmt.Sprintf(
-				`<input type="hidden" name="%s" value="%s">`,
-				html.EscapeString(key), html.EscapeString(v),
-			))
+	for _, f := range fields {
+		if f.value == "" {
+			continue
 		}
+		hiddenFields.WriteString(fmt.Sprintf(
+			`<input type="hidden" name="%s" value="%s">`,
+			html.EscapeString(f.name), html.EscapeString(f.value),
+		))
 	}
 
 	fmt.Fprintf(w, `<!DOCTYPE html>
@@ -533,21 +699,31 @@ func extractClientCredentials(r *http.Request) (id, secret, authMethod string, o
 	return "", "", "", false
 }
 
-// isErrInvalidGrant checks if the error is an invalid_grant error.
-func isErrInvalidGrant(err error) bool {
-	return err.Error() == "oauth2: invalid grant" ||
-		strings.Contains(err.Error(), "invalid grant")
-}
-
-// isErrInvalidClient checks if the error is an invalid_client error.
-func isErrInvalidClient(err error) bool {
-	return err.Error() == "oauth2: invalid client" ||
-		strings.Contains(err.Error(), "invalid client")
-}
-
 // computePKCEChallenge computes BASE64URL(SHA256(verifier)), the S256
 // code_challenge method per RFC 7636. Exported for tests.
 func computePKCEChallenge(verifier string) string {
 	h := sha256.Sum256([]byte(verifier))
 	return base64.RawURLEncoding.EncodeToString(h[:])
+}
+
+// computeExpiresIn returns the OAuth2 `expires_in` value for a token
+// whose absolute expiry is `expiresAt`, relative to `now`. The
+// remaining lifetime is rounded up to the next whole second and
+// clamped to at least 1. RFC 6749 §5.1 requires `expires_in` to be
+// a positive integer when present, and OAuth2 clients that key off
+// the value as "seconds before refresh" break on zero or negative
+// values — either of which is possible when the configured TTL is
+// very short or when there is a tiny latency spike between issuance
+// and response. Passing `now` explicitly keeps the helper
+// unit-testable without a clock abstraction.
+func computeExpiresIn(expiresAt, now time.Time) int {
+	remaining := expiresAt.Sub(now)
+	if remaining <= 0 {
+		return 1
+	}
+	secs := int((remaining + time.Second - 1) / time.Second)
+	if secs < 1 {
+		return 1
+	}
+	return secs
 }

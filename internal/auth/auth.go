@@ -66,9 +66,23 @@ func WithCaller(ctx context.Context, c *model.Caller) context.Context {
 // the given provider. On success the caller is stored on the request context
 // and the next handler is invoked. On failure a 401 (bearer) or 403
 // (trusted_header) is written.
+//
+// CORS preflight (OPTIONS with Access-Control-Request-Method) is passed
+// through without authentication so the upstream CORS middleware can
+// handle it. Browsers never attach credentials to preflight requests,
+// so authenticating them always fails and blocks the subsequent real
+// request.
 func Middleware(p AuthProvider) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Let CORS preflight through — the CORS middleware upstream
+			// decides whether to set Allow-Origin headers; we just need
+			// to avoid rejecting the OPTIONS before it gets there.
+			if r.Method == http.MethodOptions && r.Header.Get("Access-Control-Request-Method") != "" {
+				next.ServeHTTP(w, r)
+				return
+			}
+
 			caller, err := p.Authenticate(r)
 			if err != nil {
 				writeAuthError(w, err)

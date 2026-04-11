@@ -561,9 +561,16 @@ func TestOAuth2Provider_IssueAuthorizationCode_NoRegisteredURIs(t *testing.T) {
 	p := newOAuth2ProviderForTest(t, path, 3600)
 
 	// Confidential client has no redirect_uris — auth code flow not
-	// allowed for this client.
+	// allowed for this client. Exercise both the non-empty and the
+	// empty redirectURI arg to pin the 0.8.1 library-level guard
+	// (pre-fix, an empty redirectURI would fall through the
+	// validation without error).
 	_, err := p.IssueAuthorizationCode("confidential", "http://localhost:3000/callback", nil, "state", "challenge", "S256")
 	assert.ErrorIs(t, err, model.ErrInvalidRequest)
+
+	_, err = p.IssueAuthorizationCode("confidential", "", nil, "state", "challenge", "S256")
+	assert.ErrorIs(t, err, model.ErrInvalidRequest,
+		"library callers must also be rejected when both the client has no registered URIs AND the supplied redirect_uri is empty")
 }
 
 func TestOAuth2Provider_ExchangeAuthorizationCode_HappyPath(t *testing.T) {
@@ -752,4 +759,294 @@ func TestGenerateAuthCode_Unique(t *testing.T) {
 	require.NoError(t, err)
 	assert.NotEqual(t, a, b)
 	assert.True(t, strings.HasPrefix(a, "pf_ac_"))
+}
+
+// ─────────────────── DCR helpers ───────────────────
+
+// newOAuth2ProviderWithDCR builds an OAuth2Provider with DCR enabled.
+func newOAuth2ProviderWithDCR(t *testing.T, path string, dcrBearerToken string) *OAuth2Provider {
+	t.Helper()
+	dcrEnabled := true
+	cfg := config.AuthConfig{
+		Mode: "oauth2",
+		OAuth2: config.OAuth2Config{
+			ClientsFile:           path,
+			AccessTokenTTLSeconds: 3600,
+			DefaultScopes:         []string{"mcp"},
+			DCREnabled:            &dcrEnabled,
+			DCRBearerToken:        dcrBearerToken,
+		},
+	}
+	p, err := NewOAuth2Provider(cfg)
+	require.NoError(t, err)
+	return p
+}
+
+// seedEmptyClientsFile creates an empty clients JSONL file and returns
+// its path. Used by DCR tests that start with no pre-registered clients.
+func seedEmptyClientsFile(t *testing.T, dir string) string {
+	t.Helper()
+	path := filepath.Join(dir, "clients.jsonl")
+	// Write an empty file — pagefault accepts empty JSONL.
+	require.NoError(t, os.WriteFile(path, []byte{}, 0o600))
+	return path
+}
+
+// ─────────────────── DCR tests ───────────────────
+
+func TestGenerateClientID_Unique(t *testing.T) {
+	a, err := GenerateClientID()
+	require.NoError(t, err)
+	b, err := GenerateClientID()
+	require.NoError(t, err)
+	assert.NotEqual(t, a, b)
+	assert.True(t, strings.HasPrefix(a, "pf_dcr_"))
+}
+
+func TestIsLocalhostOrHTTPS(t *testing.T) {
+	tests := []struct {
+		uri string
+		ok  bool
+	}{
+		{"http://localhost:3000/callback", true},
+		{"http://127.0.0.1:8080/cb", true},
+		{"http://[::1]:3000/callback", true},
+		{"https://example.com/callback", true},
+		{"https://pagefault.jetd.one/oauth/callback", true},
+		{"http://evil.com/callback", false},
+		{"http://192.168.1.1/callback", false},
+		{"ftp://localhost/callback", false},
+		{"", false},
+		{"not-a-url", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.uri, func(t *testing.T) {
+			assert.Equal(t, tt.ok, isLocalhostOrHTTPS(tt.uri))
+		})
+	}
+}
+
+func TestRegisterClient_HappyPath(t *testing.T) {
+	dir := t.TempDir()
+	path := seedEmptyClientsFile(t, dir)
+	p := newOAuth2ProviderWithDCR(t, path, "")
+
+	rec, err := p.RegisterClient(DCRRequest{
+		RedirectURIs:  []string{"http://localhost:3000/callback"},
+		GrantTypes:    []string{"authorization_code"},
+		ResponseTypes: []string{"code"},
+		ClientName:    "Claude Desktop",
+	})
+	require.NoError(t, err)
+	assert.True(t, strings.HasPrefix(rec.ID, "pf_dcr_"))
+	assert.Equal(t, "Claude Desktop", rec.Label)
+	assert.Empty(t, rec.SecretHash, "DCR creates public clients only")
+	assert.Equal(t, []string{"http://localhost:3000/callback"}, rec.RedirectURIs)
+	assert.Equal(t, []string{"mcp"}, rec.Scopes)
+
+	// Verify in-memory presence.
+	got, ok := p.LookupClient(rec.ID)
+	assert.True(t, ok)
+	assert.Equal(t, rec.ID, got.ID)
+
+	// Verify JSONL file has the record.
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+	assert.Contains(t, string(data), rec.ID)
+
+	// Verify dcr flag in metadata.
+	dcrFlag, ok := rec.Metadata["dcr"].(bool)
+	assert.True(t, ok && dcrFlag, "metadata should have dcr=true")
+}
+
+func TestRegisterClient_MissingRedirectURIs(t *testing.T) {
+	dir := t.TempDir()
+	path := seedEmptyClientsFile(t, dir)
+	p := newOAuth2ProviderWithDCR(t, path, "")
+
+	_, err := p.RegisterClient(DCRRequest{
+		GrantTypes: []string{"authorization_code"},
+	})
+	require.Error(t, err)
+	var dcrErr *DCRError
+	assert.ErrorAs(t, err, &dcrErr)
+	assert.Equal(t, "invalid_redirect_uri", dcrErr.Code)
+}
+
+func TestRegisterClient_NonLocalhostHTTPRedirectURI(t *testing.T) {
+	dir := t.TempDir()
+	path := seedEmptyClientsFile(t, dir)
+	p := newOAuth2ProviderWithDCR(t, path, "")
+
+	_, err := p.RegisterClient(DCRRequest{
+		RedirectURIs: []string{"http://evil.com/callback"},
+	})
+	require.Error(t, err)
+	var dcrErr *DCRError
+	assert.ErrorAs(t, err, &dcrErr)
+	assert.Equal(t, "invalid_redirect_uri", dcrErr.Code)
+}
+
+func TestRegisterClient_HTTPSRedirectURI(t *testing.T) {
+	dir := t.TempDir()
+	path := seedEmptyClientsFile(t, dir)
+	p := newOAuth2ProviderWithDCR(t, path, "")
+
+	rec, err := p.RegisterClient(DCRRequest{
+		RedirectURIs: []string{"https://example.com/callback"},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"https://example.com/callback"}, rec.RedirectURIs)
+}
+
+func TestRegisterClient_UnsupportedGrantType(t *testing.T) {
+	dir := t.TempDir()
+	path := seedEmptyClientsFile(t, dir)
+	p := newOAuth2ProviderWithDCR(t, path, "")
+
+	_, err := p.RegisterClient(DCRRequest{
+		RedirectURIs: []string{"http://localhost:3000/callback"},
+		GrantTypes:   []string{"implicit"},
+	})
+	require.Error(t, err)
+	var dcrErr *DCRError
+	assert.ErrorAs(t, err, &dcrErr)
+	assert.Equal(t, "invalid_client_metadata", dcrErr.Code)
+}
+
+func TestRegisterClient_RefreshTokenSilentlyAccepted(t *testing.T) {
+	dir := t.TempDir()
+	path := seedEmptyClientsFile(t, dir)
+	p := newOAuth2ProviderWithDCR(t, path, "")
+
+	rec, err := p.RegisterClient(DCRRequest{
+		RedirectURIs: []string{"http://localhost:3000/callback"},
+		GrantTypes:   []string{"authorization_code", "refresh_token"},
+	})
+	require.NoError(t, err)
+	assert.True(t, strings.HasPrefix(rec.ID, "pf_dcr_"))
+}
+
+func TestRegisterClient_InvalidAuthMethod(t *testing.T) {
+	dir := t.TempDir()
+	path := seedEmptyClientsFile(t, dir)
+	p := newOAuth2ProviderWithDCR(t, path, "")
+
+	_, err := p.RegisterClient(DCRRequest{
+		RedirectURIs:            []string{"http://localhost:3000/callback"},
+		TokenEndpointAuthMethod: "client_secret_basic",
+	})
+	require.Error(t, err)
+	var dcrErr *DCRError
+	assert.ErrorAs(t, err, &dcrErr)
+	assert.Equal(t, "invalid_client_metadata", dcrErr.Code)
+}
+
+func TestRegisterClient_AuthMethodNone(t *testing.T) {
+	dir := t.TempDir()
+	path := seedEmptyClientsFile(t, dir)
+	p := newOAuth2ProviderWithDCR(t, path, "")
+
+	rec, err := p.RegisterClient(DCRRequest{
+		RedirectURIs:            []string{"http://localhost:3000/callback"},
+		TokenEndpointAuthMethod: "none",
+	})
+	require.NoError(t, err)
+	assert.Empty(t, rec.SecretHash)
+}
+
+func TestRegisterClient_ScopeDefaults(t *testing.T) {
+	dir := t.TempDir()
+	path := seedEmptyClientsFile(t, dir)
+	p := newOAuth2ProviderWithDCR(t, path, "")
+
+	rec, err := p.RegisterClient(DCRRequest{
+		RedirectURIs: []string{"http://localhost:3000/callback"},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"mcp"}, rec.Scopes, "empty scope should fall back to provider default")
+}
+
+func TestRegisterClient_CustomScope(t *testing.T) {
+	dir := t.TempDir()
+	path := seedEmptyClientsFile(t, dir)
+	p := newOAuth2ProviderWithDCR(t, path, "")
+
+	rec, err := p.RegisterClient(DCRRequest{
+		RedirectURIs: []string{"http://localhost:3000/callback"},
+		Scope:        "mcp admin",
+	})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"mcp", "admin"}, rec.Scopes)
+}
+
+func TestRegisterClient_DCRDisabled(t *testing.T) {
+	dir := t.TempDir()
+	path := seedEmptyClientsFile(t, dir)
+	p := newOAuth2ProviderForTest(t, path, 3600) // no DCR
+
+	_, err := p.RegisterClient(DCRRequest{
+		RedirectURIs: []string{"http://localhost:3000/callback"},
+	})
+	assert.ErrorIs(t, err, ErrDCRDisabled)
+}
+
+func TestRegisterClient_PersistSurvivesReload(t *testing.T) {
+	dir := t.TempDir()
+	path := seedEmptyClientsFile(t, dir)
+	p := newOAuth2ProviderWithDCR(t, path, "")
+
+	rec, err := p.RegisterClient(DCRRequest{
+		RedirectURIs: []string{"http://localhost:3000/callback"},
+		ClientName:   "Test Client",
+	})
+	require.NoError(t, err)
+
+	// Reload from the JSONL file.
+	require.NoError(t, p.ReloadClients())
+
+	got, ok := p.LookupClient(rec.ID)
+	assert.True(t, ok, "DCR-registered client must survive reload")
+	assert.Equal(t, "Test Client", got.Label)
+}
+
+func TestRegisterClient_Concurrent(t *testing.T) {
+	dir := t.TempDir()
+	path := seedEmptyClientsFile(t, dir)
+	p := newOAuth2ProviderWithDCR(t, path, "")
+
+	errCh := make(chan error, 2)
+	var rec1, rec2 *ClientRecord
+
+	go func() {
+		r, err := p.RegisterClient(DCRRequest{
+			RedirectURIs: []string{"http://localhost:3001/callback"},
+			ClientName:   "Client 1",
+		})
+		rec1 = r
+		errCh <- err
+	}()
+	go func() {
+		r, err := p.RegisterClient(DCRRequest{
+			RedirectURIs: []string{"http://localhost:3002/callback"},
+			ClientName:   "Client 2",
+		})
+		rec2 = r
+		errCh <- err
+	}()
+
+	require.NoError(t, <-errCh)
+	require.NoError(t, <-errCh)
+	assert.NotEqual(t, rec1.ID, rec2.ID, "concurrent registrations must get unique IDs")
+
+	// Both should be in the JSONL file.
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+	assert.Contains(t, string(data), rec1.ID)
+	assert.Contains(t, string(data), rec2.ID)
+}
+
+func TestDCRError_Error(t *testing.T) {
+	err := &DCRError{Code: "invalid_redirect_uri", Description: "bad uri"}
+	assert.Equal(t, "invalid_redirect_uri: bad uri", err.Error())
 }

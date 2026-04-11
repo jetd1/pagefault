@@ -207,7 +207,7 @@ func runOAuthClientList(args []string) error {
 	}
 
 	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "ID\tLABEL\tTYPE\tSCOPES\tREDIRECT_URIS\tCREATED")
+	fmt.Fprintln(tw, "ID\tLABEL\tTYPE\tSCOPES\tREDIRECT_URIS\tSOURCE\tCREATED")
 	for _, r := range records {
 		created := ""
 		if r.Metadata != nil {
@@ -227,7 +227,13 @@ func runOAuthClientList(args []string) error {
 		if redirectURIs == "" {
 			redirectURIs = "-"
 		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n", r.ID, r.Label, clientType, scopes, redirectURIs, created)
+		source := "cli"
+		if r.Metadata != nil {
+			if d, ok := r.Metadata["dcr"].(bool); ok && d {
+				source = "dcr"
+			}
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", r.ID, r.Label, clientType, scopes, redirectURIs, source, created)
 	}
 	return tw.Flush()
 }

@@ -65,15 +65,17 @@ func corsMiddleware(cfg config.CORSConfig) func(http.Handler) http.Handler {
 				}
 			}
 
-			// Short-circuit preflight requests, but only when the origin
-			// is in the allowlist — a disallowed preflight falls through
-			// to the downstream chain so chi returns its normal 405 (for
-			// POST-only routes). Returning 204 + no headers to a
-			// disallowed origin was ambiguous: browsers would reject it,
-			// but the downstream auth / route matching was silently
-			// skipped, which made OPTIONS an unintentional path-probing
-			// channel.
-			if originOK && r.Method == http.MethodOptions && r.Header.Get("Access-Control-Request-Method") != "" {
+			// Short-circuit ALL preflight requests with 204. When the
+			// origin is in the allowlist the ACAO header was already set
+			// above and the browser will accept the response. When the
+			// origin is NOT allowlisted no ACAO header is present and
+			// the browser rejects the preflight — so we're not widening
+			// anything the browser will actually honor. Returning 204
+			// unconditionally prevents the request from falling through
+			// to downstream handlers (auth middleware, chi route matching)
+			// which would produce confusing 401/405 responses that mask
+			// the real CORS rejection.
+			if r.Method == http.MethodOptions && r.Header.Get("Access-Control-Request-Method") != "" {
 				w.WriteHeader(http.StatusNoContent)
 				return
 			}

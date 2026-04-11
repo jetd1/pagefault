@@ -193,3 +193,112 @@ func TestRunOAuthClientList_WithRecords(t *testing.T) {
 	assert.Contains(t, out, "phone")
 	assert.Contains(t, out, "mcp.read")
 }
+
+// TestOAuthClientCreate_Public covers the 0.8.0 --public flag: the
+// resulting ClientRecord must have an empty SecretHash, the supplied
+// RedirectURIs populated, and the CLI output must NOT print a secret
+// line (because there is none).
+func TestOAuthClientCreate_Public(t *testing.T) {
+	dir := t.TempDir()
+	clientsFile := filepath.Join(dir, "oauth-clients.jsonl")
+
+	out := captureStdout(t, func() {
+		require.NoError(t, runOAuthClientCreate([]string{
+			"--label", "Claude Desktop",
+			"--public",
+			"--redirect-uris", "http://localhost:3000/callback,http://127.0.0.1:3000/callback",
+			"--clients-file", clientsFile,
+		}))
+	})
+
+	// No client secret is printed for public clients.
+	assert.NotContains(t, out, "secret:")
+	assert.Contains(t, out, "public (PKCE-only")
+
+	records, err := readOAuthClients(clientsFile)
+	require.NoError(t, err)
+	require.Len(t, records, 1)
+	rec := records[0]
+	assert.Equal(t, "claude-desktop", rec.ID)
+	assert.Empty(t, rec.SecretHash, "public clients must not have a secret_hash")
+	assert.Equal(t, []string{
+		"http://localhost:3000/callback",
+		"http://127.0.0.1:3000/callback",
+	}, rec.RedirectURIs)
+
+	// The on-disk JSONL must not contain any bcrypt hash prefix.
+	data, err := os.ReadFile(clientsFile)
+	require.NoError(t, err)
+	assert.NotContains(t, string(data), "$2", "public clients must not serialize a bcrypt hash")
+}
+
+// TestOAuthClientCreate_PublicRequiresRedirectURIs verifies the CLI
+// refuses to create a public client without redirect URIs — PKCE
+// alone is useless without a callback.
+func TestOAuthClientCreate_PublicRequiresRedirectURIs(t *testing.T) {
+	dir := t.TempDir()
+	clientsFile := filepath.Join(dir, "oauth-clients.jsonl")
+
+	err := runOAuthClientCreate([]string{
+		"--label", "Claude Desktop",
+		"--public",
+		"--clients-file", clientsFile,
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "--redirect-uris")
+}
+
+// TestOAuthClientCreate_ConfidentialWithRedirectURIs verifies a
+// confidential client can also register redirect URIs (so it can use
+// both grant types).
+func TestOAuthClientCreate_ConfidentialWithRedirectURIs(t *testing.T) {
+	dir := t.TempDir()
+	clientsFile := filepath.Join(dir, "oauth-clients.jsonl")
+
+	out := captureStdout(t, func() {
+		require.NoError(t, runOAuthClientCreate([]string{
+			"--label", "Mixed",
+			"--redirect-uris", "http://localhost:3000/callback",
+			"--clients-file", clientsFile,
+		}))
+	})
+	// Confidential clients still get a printed secret.
+	assert.Contains(t, out, "secret:")
+	assert.Contains(t, out, "redirect_uris")
+
+	records, err := readOAuthClients(clientsFile)
+	require.NoError(t, err)
+	require.Len(t, records, 1)
+	rec := records[0]
+	assert.NotEmpty(t, rec.SecretHash, "confidential clients must have a secret_hash")
+	assert.Equal(t, []string{"http://localhost:3000/callback"}, rec.RedirectURIs)
+}
+
+// TestRunOAuthClientList_ShowsTypeAndRedirectURIs verifies the list
+// command includes the 0.8.0 TYPE and REDIRECT_URIS columns and
+// classifies each record correctly.
+func TestRunOAuthClientList_ShowsTypeAndRedirectURIs(t *testing.T) {
+	dir := t.TempDir()
+	clientsFile := filepath.Join(dir, "oauth-clients.jsonl")
+
+	require.NoError(t, runOAuthClientCreate([]string{
+		"--label", "Desktop",
+		"--public",
+		"--redirect-uris", "http://localhost:3000/callback",
+		"--clients-file", clientsFile,
+	}))
+	require.NoError(t, runOAuthClientCreate([]string{
+		"--label", "Machine",
+		"--clients-file", clientsFile,
+	}))
+
+	out := captureStdout(t, func() {
+		require.NoError(t, runOAuthClientList([]string{"--clients-file", clientsFile}))
+	})
+
+	assert.Contains(t, out, "TYPE")
+	assert.Contains(t, out, "REDIRECT_URIS")
+	assert.Contains(t, out, "public")
+	assert.Contains(t, out, "confidential")
+	assert.Contains(t, out, "http://localhost:3000/callback")
+}

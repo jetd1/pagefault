@@ -27,8 +27,10 @@ bash scripts/smoke.sh  # End-to-end smoke test (builds, runs, curls every endpoi
 ./bin/pagefault token create --label "my-device" --tokens-file /tmp/tokens.jsonl
 ./bin/pagefault token ls --tokens-file /tmp/tokens.jsonl
 ./bin/pagefault token revoke <id> --tokens-file /tmp/tokens.jsonl
-# OAuth2 client_credentials (auth.mode: oauth2) — 0.7.0+
-./bin/pagefault oauth-client create --label "Claude Desktop" --clients-file /tmp/oauth-clients.jsonl
+# OAuth2 (auth.mode: oauth2) — client_credentials 0.7.0+, authorization_code + PKCE 0.8.0+
+./bin/pagefault oauth-client create --label "CI" --clients-file /tmp/oauth-clients.jsonl
+./bin/pagefault oauth-client create --label "Claude Desktop" --public \
+    --redirect-uris "http://localhost:3000/callback" --clients-file /tmp/oauth-clients.jsonl
 ./bin/pagefault oauth-client ls --clients-file /tmp/oauth-clients.jsonl
 ./bin/pagefault oauth-client revoke <id> --clients-file /tmp/oauth-clients.jsonl
 ./bin/pagefault --version
@@ -43,7 +45,6 @@ pagefault/
 ├── VERSION                               # Current version (single line, read by the Makefile and -ldflags)
 ├── README.md                             # Quick-start guide
 ├── Makefile                              # build/test/lint/run/clean/smoke targets
-├── plan.md                               # Full spec, source of truth
 ├── go.mod                                # Go module: github.com/jet/pagefault
 ├── go.sum                                # Module checksums
 ├── .gitignore                            # Go-standard ignores
@@ -55,8 +56,8 @@ pagefault/
 │       ├── serve_test.go                 # buildDispatcher tests (minimal, unsupported, full Phase-2 stack)
 │       ├── token.go                      # `token create/ls/revoke` subcommands
 │       ├── token_test.go                 # Token CLI: lifecycle, slugify, maskToken, list/resolve
-│       ├── oauth_client.go               # `oauth-client create/ls/revoke` subcommands (0.7.0): manage OAuth2 client_credentials registry, bcrypt secret hashing, prints secret once
-│       ├── oauth_client_test.go          # OAuth-client CLI tests: full lifecycle, duplicate-id, empty list, stored-hash-verifies-printed-secret, resolveClientsFile precedence
+│       ├── oauth_client.go               # `oauth-client create/ls/revoke` subcommands (0.7.0+, 0.8.0 added --public + --redirect-uris, 0.9.0 added SOURCE column): manage OAuth2 client registry (confidential + public clients for client_credentials and authorization_code grants), bcrypt secret hashing, prints secret once
+│       ├── oauth_client_test.go          # OAuth-client CLI tests: full lifecycle, duplicate-id, empty list, stored-hash-verifies-printed-secret, resolveClientsFile precedence, public client + redirect_uris path, TYPE/REDIRECT_URIS/SOURCE columns
 │       ├── tools.go                      # `maps`/`load`/`scan`/`peek`/`fault`/`ps`/`poke` — CLI form of the pf_* tools
 │       └── tools_test.go                 # Tool CLI tests: text/JSON/env/cwd fallback/no-filter/audit redirect/fault/ps/poke
 │
@@ -96,8 +97,8 @@ pagefault/
 │   ├── auth/
 │   │   ├── auth.go                       # AuthProvider, Bearer/None/TrustedHeader, middleware
 │   │   ├── auth_test.go                  # Auth provider + middleware + token gen tests
-│   │   ├── oauth2.go                     # OAuth2 client_credentials provider (0.7.0): ClientRecord, IssuedToken store, IssueToken/Authenticate, compound-mode fallback
-│   │   └── oauth2_test.go                # OAuth2 provider unit tests (happy/invalid/expired/compound/scope intersection/reload)
+│   │   ├── oauth2.go                     # OAuth2 provider (0.7.0+, 0.9.0 added DCR): ClientRecord, IssuedToken + AuthorizationCode stores, IssueToken / IssueAuthorizationCode / ExchangeAuthorizationCode / Authenticate / RegisterClient, S256 PKCE verification (crypto/subtle), compound-mode fallback to BearerTokenAuth, file-based reload + RevokeClient sweep, RFC 7591 Dynamic Client Registration (public-only, pf_dcr_ prefix, JSONL persistence)
+│   │   └── oauth2_test.go                # OAuth2 provider unit tests: client_credentials (happy/invalid/expired/compound/scope intersection/reload), authorization_code + PKCE (happy/unknown-client/unregistered-URI/expired/consumed/wrong-redirect/wrong-client/RFC 7636 Appendix B test vector), public-client lifecycle, DCR (happy/validation/persistence/concurrent/bearer-token-gate)
 │   │
 │   ├── filter/
 │   │   ├── filter.go                     # CompositeFilter, PathFilter (read + Phase-4 write globs), TagFilter, RedactionFilter
@@ -137,8 +138,8 @@ pagefault/
 │   └── server/
 │       ├── server.go                     # chi router, MCP streamable-http + SSE mounts, REST adapter, /health, structured error envelope, oauth2 route mounts when enabled
 │       ├── server_test.go                # Integration tests via httptest (incl. MCP smoke, SSE handshake + roundtrip, instructions, OpenAPI, health probe)
-│       ├── oauth2.go                     # OAuth2 discovery + token endpoints (0.7.0): /.well-known/oauth-protected-resource (RFC 9728), /.well-known/oauth-authorization-server (RFC 8414), POST /oauth/token (client_credentials, Basic + form body)
-│       ├── oauth2_test.go                # OAuth2 HTTP integration: discovery shape, Basic/form/invalid/unsupported/missing-creds paths, end-to-end token → /api/pf_maps, compound mode, unmounted-when-disabled, URL-encoded Basic credential decoding
+│       ├── oauth2.go                     # OAuth2 HTTP surface (0.7.0+, 0.8.0 added authorize + auth code flow, 0.8.1 hardened validation order + consent, 0.9.0 added DCR): /.well-known/oauth-protected-resource (RFC 9728), /.well-known/oauth-authorization-server (RFC 8414, includes registration_endpoint when DCR enabled), POST /oauth/token (client_credentials + authorization_code, Basic + form body), GET+POST /oauth/authorize (consent page + auto-approve + PKCE), POST /register (RFC 7591 DCR, public-only, opt-in), consentParams whitelist, errors.Is classification
+│       ├── oauth2_test.go                # OAuth2 HTTP integration: discovery shape, Basic/form/invalid/unsupported/missing-creds paths, end-to-end token → /api/pf_maps, compound mode, unmounted-when-disabled, URL-encoded Basic credential decoding, authorize happy paths (auto-approve + public/confidential auth code flow), DCR (happy/validation/disabled/bearer-gate/discovery/end-to-end), negative regressions (open redirect on bad response_type or missing client_id, consent-form action-injection bypass, consent default-deny, frame-ancestors CSP)
 │       ├── openapi.go                    # /api/openapi.json spec builder (OpenAPI 3.1.0, live from dispatcher + config)
 │       ├── cors.go                       # CORS middleware (opt-in, per server.cors config)
 │       ├── cors_test.go                  # Preflight + allowed/denied origin tests
@@ -150,10 +151,10 @@ pagefault/
 │   └── example.yaml                      # Tour of every backend type with inline docs
 │
 ├── docs/
-│   ├── api-doc.md                        # Tool reference (Phase 1–4)
-│   ├── config-doc.md                     # Full YAML config reference (incl. Phase-4 write fields)
-│   ├── architecture.md                   # Architecture deep dive
-│   └── security.md                       # Threat model, auth, filters, audit, rate limit, CORS, write safety
+│   ├── api-doc.md                        # Tool reference (HTTP + CLI) for all seven `pf_*` tools
+│   ├── config-doc.md                     # Full YAML config reference (incl. filesystem write fields + OAuth2)
+│   ├── architecture.md                   # Architecture deep dive (request flow, backend model, prompt templates, transports, OAuth2 wiring)
+│   └── security.md                       # Threat model, auth (bearer / trusted_header / oauth2 / none), filters, audit, rate limit, CORS, write safety
 │
 ├── demo-data/
 │   ├── README.md                         # Sample content for minimal.yaml
@@ -185,7 +186,7 @@ Client → chi router → auth middleware → tool handler → dispatcher
 - **SpawnRequest / prompt templates** — `internal/backend/prompt.go` defines the `SpawnRequest` struct (agent id, task, purpose, time range, target, timeout), the `SpawnPurpose` enum (`retrieve` / `write`), the two default templates, and `ResolvePromptTemplate` + `WrapTask`. Every subagent backend wraps the raw caller content with a resolved template **before** substituting into its command / body template, so fresh subagents are framed as memory retrievers/placers rather than generic Q&A. Three-layer override precedence: per-agent → per-backend → built-in default.
 - **Context** — named, pre-composed bundle of backend resources (YAML-defined).
 - **Filter** — optional path/tag/redaction filter. Can be fully disabled. Phase-4 added `AllowWriteURI` for the write path.
-- **Auth** — bearer token, trusted header, OAuth2 client_credentials (0.7.0+, `internal/auth/oauth2.go`), or none. OAuth2 mode mounts three public endpoints (`/.well-known/oauth-protected-resource`, `/.well-known/oauth-authorization-server`, `POST /oauth/token`) and runs as a compound provider: it validates issued access tokens first, then falls back to `BearerTokenAuth` when `bearer.tokens_file` is also configured. Clients are registered via `pagefault oauth-client create` and stored with bcrypt secret hashes.
+- **Auth** — bearer token, trusted header, OAuth2 (0.7.0+, `internal/auth/oauth2.go`), or none. OAuth2 supports two grants: **client_credentials** (0.7.0) for programmatic clients with a bcrypt-hashed secret, and **authorization_code + PKCE (S256-only)** (0.8.0) for browser-based clients like Claude Desktop. OAuth2 mode mounts four public endpoints (`/.well-known/oauth-protected-resource`, `/.well-known/oauth-authorization-server`, `POST /oauth/token`, `GET+POST /oauth/authorize`) plus an optional fifth — `POST /register` (RFC 7591 Dynamic Client Registration, 0.9.0, opt-in via `dcr_enabled`) — and runs as a compound provider: it validates issued access tokens first, then falls back to `BearerTokenAuth` when `bearer.tokens_file` is also configured. Clients are registered via `pagefault oauth-client create` (confidential by default, `--public --redirect-uris` for PKCE-only public clients) or dynamically via DCR (public-only, `pf_dcr_` prefix).
 - **Dispatcher** — central tool router. Holds backends + contexts + filters + audit logger. Exposes `ListContexts`, `GetContext`, `Search`, `Read`, `DeepRetrieve`, `ListAgents`, `Write`, and `DelegateWrite` (Phase-4 write-side twin of `DeepRetrieve` that spawns a subagent with `Purpose=write` so the write-framed prompt template is picked).
 - **Writer** — `internal/write.FilesystemWriter` is the flock-serialised atomic-append primitive behind `pf_poke` mode:direct.
 - **Tools** — pure `HandleX` functions (`internal/tool/*.go`); the server package wraps them for REST and `tool.RegisterMCP` wraps them for mcp-go.
@@ -306,9 +307,9 @@ the `pf_` prefix.
 
 ## See Also
 
-- `plan.md` — full spec, source of truth for Phase 1–5
-- `docs/architecture.md` — architecture deep dive
-- `docs/api-doc.md` — tool reference
-- `docs/config-doc.md` — config reference
-- `docs/security.md` — threat model, auth, filters, audit
+- `docs/architecture.md` — architecture deep dive (request flow, backend + subagent model, prompt templates, transports)
+- `docs/api-doc.md` — tool reference (HTTP + CLI for all seven `pf_*` tools)
+- `docs/config-doc.md` — YAML config reference
+- `docs/security.md` — threat model, auth, filters, audit, write safety
+- `CHANGELOG.md` — authoritative version history
 - `README.md` — user-facing quick start

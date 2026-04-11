@@ -130,14 +130,11 @@ func TestCORS_EmptyAllowedOriginsDisables(t *testing.T) {
 	assert.Empty(t, resp.Header.Get("Access-Control-Allow-Origin"))
 }
 
-// TestCORS_DisallowedOriginPreflightFallsThrough is a regression test
-// for a bug where a preflight OPTIONS request from a disallowed origin
-// was short-circuited with 204 + no CORS headers, bypassing downstream
-// middleware. The fix: only short-circuit when the origin is in the
-// allowlist; a disallowed preflight falls through and the downstream
-// handler gets a chance to respond (chi returns its normal 405 / the
-// inner handler runs).
-func TestCORS_DisallowedOriginPreflightFallsThrough(t *testing.T) {
+// TestCORS_DisallowedOriginPreflightReturns204 verifies that a preflight
+// from a disallowed origin is still short-circuited with 204, but without
+// any CORS headers. The browser will reject the response (no ACAO) while
+// the server avoids leaking 401/405 responses from downstream handlers.
+func TestCORS_DisallowedOriginPreflightReturns204(t *testing.T) {
 	reached := false
 	inner := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		reached = true
@@ -158,10 +155,10 @@ func TestCORS_DisallowedOriginPreflightFallsThrough(t *testing.T) {
 	require.NoError(t, err)
 	defer resp.Body.Close()
 
-	// Downstream handler must have been invoked — the preflight from a
-	// disallowed origin is not the CORS middleware's call to handle.
-	assert.True(t, reached, "downstream handler should run for disallowed preflight")
-	assert.Equal(t, http.StatusTeapot, resp.StatusCode)
+	// Preflight is short-circuited with 204 — downstream handler is NOT
+	// reached. The browser rejects the response because ACAO is missing.
+	assert.False(t, reached, "downstream handler must not run for preflight")
+	assert.Equal(t, http.StatusNoContent, resp.StatusCode)
 	assert.Empty(t, resp.Header.Get("Access-Control-Allow-Origin"),
 		"no CORS header for a disallowed origin")
 }

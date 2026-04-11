@@ -10,19 +10,23 @@ backing store and resumes execution. pagefault does the same for AI agents:
 when they need context they don't have, they fault to this server, which
 loads the right information from configured backends.
 
-Phases 1–4 ship a Go binary that serves markdown files from a directory,
-answers search via subprocess or HTTP backends, spawns real subagents
-for deep retrieval, writes back through a sandboxed append path or a
-subagent, and exposes the surface over MCP, REST, and the CLI with
-opt-in rate limiting, CORS, and a live OpenAPI spec. 0.7.0 adds an
-OAuth2 client_credentials auth provider so Claude Desktop's native
-SSE configuration (Client ID + Client Secret only) works without the
-`supergateway` bridge. Seven tools (`pf_maps`, `pf_load`, `pf_scan`,
-`pf_peek`, `pf_fault`, `pf_ps`, `pf_poke`), bearer-token or OAuth2
-auth (compound mode supported), path/tag/redaction filters, and
-JSONL audit logging. Tool names follow a `pf_*` scheme borrowed from
-Unix memory management and kernel debugging — see `docs/api-doc.md`
-for the mapping.
+pagefault ships a Go binary that serves markdown files from a
+directory, answers search via subprocess or HTTP backends, spawns
+real subagents for deep retrieval, writes back through a sandboxed
+append path or a subagent, and exposes the surface over MCP
+(streamable-http **and** legacy SSE), REST, and the CLI with opt-in
+rate limiting, CORS, and a live OpenAPI spec. The 0.8.0 release adds
+the MCP-standard **OAuth 2.1 authorization code + PKCE flow** so
+Claude Desktop (and any other browser-based MCP client) can
+authenticate natively — no `supergateway` bridge required — and
+0.7.0's client_credentials grant remains available as a fallback for
+programmatic clients. Seven tools (`pf_maps`, `pf_load`, `pf_scan`,
+`pf_peek`, `pf_fault`, `pf_ps`, `pf_poke`), four auth modes
+(`none` / `bearer` / `trusted_header` / `oauth2`, the last running
+compound with `bearer` for migration), path/tag/redaction filters,
+and JSONL audit logging. Tool names follow a `pf_*` scheme borrowed
+from Unix memory management and kernel debugging — see
+`docs/api-doc.md` for the mapping.
 
 ## Quick start
 
@@ -238,14 +242,30 @@ bash scripts/smoke.sh   # end-to-end smoke test
 
 ## Documentation
 
-- **`plan.md`** — full product spec and roadmap (source of truth)
-- **`docs/api-doc.md`** — tool reference (Phase 1–4, all seven `pf_*` tools)
+- **`docs/api-doc.md`** — tool reference for all seven `pf_*` tools (HTTP + CLI)
 - **`docs/config-doc.md`** — full YAML configuration reference
 - **`docs/architecture.md`** — architecture deep dive
 - **`docs/security.md`** — threat model, auth, filters, audit, write safety
 - **`CLAUDE.md`** — developer guide for AI agents working on this repo
+- **`CHANGELOG.md`** — authoritative history of shipped features
 
 ## Recent Changes
+
+### 0.8.1 — 2026-04-11
+
+- **Security review-pass on the 0.8.0 OAuth2 authorize endpoint.**
+  Fixes an open redirect on `/oauth/authorize` (the `response_type`
+  check fired before `client_id` / `redirect_uri` registration was
+  verified, so an attacker could bounce the browser through an
+  unregistered URI), a consent-form `action` injection bypass (a
+  hidden `<input name="action" value="allow">` echoed from the query
+  string could silently override the user's Deny click — Go's
+  `url.Values.Get` returns the first value), and adds
+  `frame-ancestors 'none'` to the consent-page CSP. The token-endpoint
+  error classification now uses `errors.Is` against the exported
+  sentinels instead of string matching. Regression tests pin every
+  fix. CLI test coverage added for `--public` and `--redirect-uris`
+  (both flags shipped uncovered in 0.8.0). See CHANGELOG.md for details.
 
 ### 0.8.0 — 2026-04-11
 
@@ -267,10 +287,6 @@ bash scripts/smoke.sh   # end-to-end smoke test
 ### 0.7.1 — 2026-04-11
 
 - **OAuth2 review-pass hardening.** See CHANGELOG.md for details.
-
-### 0.7.0 — 2026-04-11
-
-- **OAuth2 client_credentials auth provider.** See CHANGELOG.md for details.
 
 See [`CHANGELOG.md`](CHANGELOG.md) for the full history.
 

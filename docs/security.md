@@ -2,9 +2,29 @@
 
 This document describes pagefault's threat model, trust boundaries, and the
 mechanisms the server uses to keep personal data from leaking to untrusted
-clients. It tracks `plan.md` §12 and the code in `internal/auth`,
-`internal/filter`, `internal/backend`, and `internal/audit`. If this doc
-drifts from any of those, update it.
+clients. It tracks the code in `internal/auth`, `internal/filter`,
+`internal/backend`, and `internal/audit`. If this doc drifts from any of
+those, update it.
+
+## Design intent: thin auth, reverse proxy expected
+
+pagefault's auth layer is intentionally **thin**. The binary ships
+with a small set of first-party providers (none / bearer /
+trusted_header / oauth2) but is **designed to run behind a reverse
+proxy** — Caddy, nginx, Hermes, Cloudflare — that terminates TLS,
+routes public traffic, and optionally enforces its own auth. Two
+consequences:
+
+- **No TLS in the binary.** pagefault speaks plaintext HTTP. The
+  proxy is expected to handle certificates. "Running pagefault
+  directly on a reachable address" is a development shortcut, not a
+  production deployment shape.
+- **`trusted_header` is first-class.** When the proxy handles auth
+  (SSO, WebAuthn, IP allowlisting, etc.), pagefault can read the
+  resulting identity from an operator-chosen header and enforce an
+  IP allowlist on the upstream peer. The built-in bearer / OAuth2
+  providers are the fallback for deployments that don't already
+  have a proxy auth layer.
 
 ## Trust model
 
@@ -125,23 +145,67 @@ Security-relevant properties of the implementation:
   it used form body. The error code is always `invalid_client`;
   we do not leak whether the failure was "unknown id" vs "wrong
   secret" to avoid enabling client-id enumeration.
+- **Error classification on the token endpoint is sentinel-based.**
+  The `authorization_code` grant branch uses
+  `errors.Is(err, auth.ErrInvalidClient)` /
+  `errors.Is(err, auth.ErrInvalidGrant)` against the exported
+  sentinels (0.8.1), then emits a **static sanitized**
+  `error_description` (not `err.Error()`), so no internal detail
+  leaks into client-visible error bodies.
 - **`GET/POST /oauth/authorize` is outside the bearer middleware.**
-  It validates the client_id, redirect_uri (must match a
-  registered URI), PKCE code_challenge, and state parameter. By
-  default, `auto_approve: true` means the server immediately
-  redirects with the authorization code — no consent page is
-  shown. The rationale: pagefault is a single-operator server;
-  the operator authorizes themselves. Set `auto_approve: false`
-  to render an HTML consent page (future use for multi-operator
-  deployments). On validation errors where redirect_uri + state
-  are both valid, the server redirects with an `error` parameter
-  per RFC 6749 §4.1.2.1; otherwise it returns a JSON error to
-  prevent open redirects.
-- **Redirect URI validation is strict.** The `redirect_uri`
-  parameter in the authorize request must exactly match one of the
-  URIs registered on the client record. This prevents open-redirect
-  attacks that could leak authorization codes to an attacker's
-  endpoint.
+  By default, `auto_approve: true` means the server immediately
+  redirects with the authorization code after validation — no
+  consent page is shown. The rationale: pagefault is a
+  single-operator server; the operator authorizes themselves.
+  Set `auto_approve: false` to render an HTML consent page
+  (intended for future multi-operator deployments).
+- **Redirect URI validation is strict and happens first.** The
+  `redirect_uri` parameter in an authorize request must exactly
+  match one of the URIs registered on the client record. RFC 6749
+  §4.1.2.1 mandates that `client_id` and `redirect_uri` are
+  validated **before** any other error can trigger a redirect, and
+  pagefault follows that order explicitly (0.8.1 fix). The
+  validation pipeline is:
+
+  1. `client_id` present?
+  2. Client exists in the registry?
+  3. `redirect_uri` present?
+  4. Client has at least one registered `redirect_uri`?
+  5. Supplied `redirect_uri` exactly matches one of the registered?
+  6. `state` present?
+  7. `response_type == "code"`?
+  8. `code_challenge` present and `code_challenge_method == "S256"`?
+
+  Steps 1–5 all return `400 invalid_request` / `invalid_client` as
+  a plain JSON body — **no 302 redirect is emitted** until the
+  `redirect_uri` is confirmed registered. This blocks open-redirect
+  attacks that would otherwise let an attacker bounce the browser
+  through an attacker-controlled URL via `authorizeError`. Steps
+  6–8 may redirect the error back to the now-trusted URI with an
+  `error` parameter per §4.1.2.1.
+- **Consent form is a whitelist + default-deny.** When
+  `auto_approve: false`, the consent page is rendered from a
+  typed `consentParams` struct containing only the seven OAuth
+  2.1 authorization-endpoint fields (`response_type`, `client_id`,
+  `redirect_uri`, `scope`, `state`, `code_challenge`,
+  `code_challenge_method`). Arbitrary query parameters — including
+  an attacker-seeded `action=allow` — are dropped before the HTML
+  is emitted (0.8.1). The POST handler then takes the **last**
+  `action` value from the form body and requires it to be literally
+  `"allow"` (default-deny); any other value, including missing or
+  a hidden-field `allow` that slipped through, is treated as a
+  deny. Both halves are defences in depth: the whitelist stops
+  the injection from ever reaching the form, and the take-last +
+  default-deny stops it even if somehow a POST arrives with
+  multiple `action` values.
+- **Consent page CSP blocks script, clickjacking, and
+  cross-origin submit.** The consent HTML is served with
+  `Content-Security-Policy: default-src 'none'; style-src
+  'unsafe-inline'; form-action 'self'; frame-ancestors 'none'`
+  plus `X-Content-Type-Options: nosniff`. `default-src 'none'`
+  denies scripts/images/fonts; `frame-ancestors 'none'` blocks
+  clickjacking (0.8.1); `form-action 'self'` pins form submits
+  back to the same origin.
 - **Compound mode** (`oauth2` + populated `bearer.tokens_file`)
   runs the OAuth2 store first and falls back to the bearer store
   on no match. The fallback re-uses the existing `BearerTokenAuth`
@@ -161,14 +225,45 @@ Security-relevant properties of the implementation:
   remain valid until their TTL expires or the server restarts**.
   The CLI prints this explicitly after every revoke. For
   immediate invalidation, restart pagefault.
-- **No refresh tokens, no dynamic client registration (DCR).**
-  Claude Desktop re-exchanges its credentials for a new access
-  token automatically when its cached one expires (either via
-  client_credentials or by re-running the authorization code
-  flow), so refresh tokens are unnecessary for the target
-  workload. DCR would open a zero-auth endpoint that creates
-  privileged records on a single-operator server — operators
-  register clients via the CLI instead.
+- **No refresh tokens.** Claude Desktop re-exchanges its
+  credentials for a new access token automatically when its cached
+  one expires (either via client_credentials or by re-running the
+  authorization code flow), so refresh tokens are unnecessary for
+  the target workload.
+- **Dynamic client registration (DCR) is opt-in.** RFC 7591
+  endpoint `POST /register` is mounted only when
+  `auth.oauth2.dcr_enabled: true`. DCR creates public clients (no
+  client_secret, PKCE-only) with `redirect_uris` restricted to
+  localhost or HTTPS. Open registration is the default when enabled
+  (matching the MCP SDK's expectation); operators who want to gate
+  registration can set `auth.oauth2.dcr_bearer_token` to require a
+  bearer token on the registration request. DCR appends to the
+  clients JSONL file using atomic append+sync, so
+  dynamically-registered clients survive restarts. The `pf_dcr_`
+  prefix on client IDs distinguishes them from CLI-created clients
+  in audit logs. Operators should consider the blast radius: any
+  client that can reach `/register` can create an OAuth2 client and
+  then go through the authorization flow to obtain an access token.
+  In a single-operator deployment behind a reverse proxy, the
+  proxy's access controls are the primary defence. Do not enable DCR
+  on an internet-exposed pagefault instance without the bearer token
+  gate or a proxy-level access list.
+- **Public OAuth2 endpoints are outside the in-process rate
+  limiter.** `server.rate_limit` keys on the authenticated
+  `caller.id`, and the discovery / token / authorize paths run
+  *before* auth, so the in-process bucket does not apply to them.
+  Of the four, `/oauth/authorize` is the only one with a
+  memory cost per request: each successful call allocates one
+  `AuthorizationCode` (~300 bytes) kept in memory until it is
+  exchanged, swept, or `auth_code_ttl_seconds` (default 60) passes.
+  At an attacker-sustained 1000 req/s this caps at roughly 18 MB,
+  which `sweepExpiredLocked` reclaims on the next `IssueToken` /
+  `IssueAuthorizationCode` call — unpleasant but bounded.
+  Rate-limiting the OAuth public endpoints is the reverse proxy's
+  responsibility; Caddy's `rate_limit` handler, nginx
+  `limit_req_zone`, or Hermes's upstream limiter should each apply
+  a tighter bound on `/.well-known/oauth-*`, `/oauth/authorize`,
+  and `/oauth/token` than on the authenticated MCP paths.
 
 Auth middleware is applied to every authenticated route, including both
 MCP transports: streamable-http at `/mcp` and `/mcp/*`, and legacy SSE
@@ -438,12 +533,24 @@ Concretely, this means:
   want to know what was written must parse `result`, or wait for
   Phase 5's structured subagent envelope.
 
-**Design rationale.** The plan.md §5.7 rationale is that direct mode
-handles the 80% case (fixed format, known location) and agent mode
-handles the 20% case (needs judgment about where to write, how to
-format, whether to merge with existing content). The trust model
-follows: direct mode is mechanical and sandboxed; agent mode is
-smart and trusted.
+**Design rationale.** Direct mode handles the 80% case (fixed
+format, known location) and agent mode handles the 20% case (needs
+judgment about where to write, how to format, whether to merge with
+existing content). The trust model follows: direct mode is
+mechanical and sandboxed; agent mode is smart and trusted.
+
+**Why agent writes bypass `write_paths` on purpose.** The subagent
+is already a workspace-level actor with its own filesystem
+credentials and its own sandbox. Duplicating pagefault's
+`write_paths` / `filters.path.write_*` checks against the
+*subagent's* writes would be either (a) ineffective — pagefault
+never sees the individual mkdir / open / write syscalls the agent
+issues — or (b) misleading — callers would believe pagefault is
+gating writes that it fundamentally cannot observe. The explicit
+design choice is that `pf_poke` mode:agent delegates trust fully
+to the subagent, and operators treat `pf_fault` / `pf_poke`
+mode:agent callers as users of that subagent with whatever
+privileges it already holds.
 
 Do not enable agent mode writes in environments where you would not
 also enable direct subagent invocation via `pf_fault`. The threat
@@ -569,7 +676,12 @@ bearer gate.
 - **Rate limiting is in-process only.** A single pagefault instance
   honours `server.rate_limit`, but if you run several behind a load
   balancer each one keeps its own buckets. Put a shared limiter at the
-  proxy if you need global throttling.
+  proxy if you need global throttling. The OAuth2 public endpoints
+  (`/oauth/token`, `/oauth/authorize`, the two `/.well-known/*`
+  metadata paths) additionally bypass the in-process limiter because
+  they run *before* auth — see the "Public OAuth2 endpoints are
+  outside the in-process rate limiter" bullet in the Auth section
+  for the details and the recommended proxy configuration.
 - **No per-tool auth.** Any authenticated caller can invoke any enabled
   tool. Per-token tool ACLs are a future addition.
 - **No TLS.** Terminate TLS at a reverse proxy (Caddy, nginx,

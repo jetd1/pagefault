@@ -79,7 +79,8 @@ management / kernel debugging. The shipped tools:
 | `pf_ps`    | List configured subagents                        | `ps(1)`                    | 2     |
 | `pf_poke`  | Poke content back into memory (append / agent)   | Debugger `POKEDATA`        | 4     |
 
-See `plan.md` §10 for the full roadmap.
+All seven tools are shipped. See `CHANGELOG.md` for the per-version
+history of when each tool / flag / endpoint landed.
 
 ## CLI
 
@@ -178,18 +179,22 @@ Authorization: Bearer pf_xxx...
 
 `/health`, `/`, and `/api/openapi.json` are public (no auth required).
 
-### OAuth2 client_credentials (0.7.0+)
+### OAuth2 (0.7.0+, authorization code + PKCE in 0.8.0)
 
-When `auth.mode: oauth2` is configured, three additional public
+When `auth.mode: oauth2` is configured, up to five additional public
 endpoints are mounted on the root so MCP clients can bootstrap:
 
 | Endpoint | Method | Purpose |
 |---|---|---|
 | `/.well-known/oauth-protected-resource` | GET | [RFC 9728](https://datatracker.ietf.org/doc/html/rfc9728) protected-resource metadata; points at the authorization server. |
-| `/.well-known/oauth-authorization-server` | GET | [RFC 8414](https://datatracker.ietf.org/doc/html/rfc8414) metadata; advertises `token_endpoint`, supported grants, supported auth methods. |
-| `/oauth/token` | POST | [RFC 6749 §4.4](https://datatracker.ietf.org/doc/html/rfc6749#section-4.4) client_credentials grant. |
+| `/.well-known/oauth-authorization-server` | GET | [RFC 8414](https://datatracker.ietf.org/doc/html/rfc8414) metadata; advertises `token_endpoint`, `authorization_endpoint`, `registration_endpoint` (when DCR enabled), supported grants (`client_credentials`, `authorization_code`), supported auth methods, `code_challenge_methods_supported: ["S256"]`. |
+| `/oauth/token` | POST | [RFC 6749 §4.4](https://datatracker.ietf.org/doc/html/rfc6749#section-4.4) client_credentials grant **and** [§4.1](https://datatracker.ietf.org/doc/html/rfc6749#section-4.1) authorization_code grant. |
+| `/oauth/authorize` | GET / POST | Authorization endpoint for the authorization_code + PKCE flow. GET is the browser entry point; POST is the consent-form handler when `auto_approve: false`. |
+| `/register` | POST | [RFC 7591](https://datatracker.ietf.org/doc/html/rfc7591) Dynamic Client Registration. Mounted only when `dcr_enabled: true`. Creates a public client (PKCE-only) so MCP clients like Claude Desktop can self-register without manual `oauth-client create`. |
 
-A typical `POST /oauth/token` exchange looks like:
+#### client_credentials grant (machine-to-machine)
+
+A typical `POST /oauth/token` exchange with Basic credentials:
 
 ```
 POST /oauth/token
@@ -205,10 +210,57 @@ Or with form-body credentials:
 POST /oauth/token
 Content-Type: application/x-www-form-urlencoded
 
-grant_type=client_credentials&client_id=claude-desktop&client_secret=pf_cs_...
+grant_type=client_credentials&client_id=ci&client_secret=pf_cs_...
 ```
 
-Success (HTTP 200):
+#### authorization_code + PKCE grant (browser-based)
+
+Claude Desktop and any other MCP client that implements the
+OAuth 2.1 browser flow use this grant. pagefault requires the
+`S256` `code_challenge_method`; the plaintext method is rejected.
+
+Step 1 — client redirects the user to the authorize endpoint:
+
+```
+GET /oauth/authorize?
+    response_type=code
+    &client_id=claude-desktop
+    &redirect_uri=http://localhost:3000/callback
+    &code_challenge=<BASE64URL(SHA256(code_verifier))>
+    &code_challenge_method=S256
+    &state=<opaque CSRF nonce>
+    &scope=mcp
+```
+
+With `auto_approve: true` (the default), pagefault immediately
+302s back to the registered `redirect_uri` with `code=pf_ac_...`
+and the original `state`. With `auto_approve: false`, pagefault
+renders a minimal consent form; the user clicks Allow or Deny
+and the form POSTs back to the same endpoint.
+
+Step 2 — the client exchanges the authorization code for an
+access token, proving possession of the `code_verifier`:
+
+```
+POST /oauth/token
+Content-Type: application/x-www-form-urlencoded
+
+grant_type=authorization_code
+&code=pf_ac_...
+&redirect_uri=http://localhost:3000/callback
+&client_id=claude-desktop
+&code_verifier=<the verifier whose SHA256 matched the challenge>
+```
+
+Confidential clients must also authenticate via Basic or form-body
+`client_secret`. **Public clients** (registered with `--public`
+and no `client_secret`) authenticate via PKCE alone — the
+verifier proves the exchanger is the same party that initiated
+the authorize request.
+
+#### Token response
+
+Both grants return the same envelope on success (HTTP 200):
 
 ```json
 {
@@ -221,11 +273,70 @@ Success (HTTP 200):
 
 The access token is then attached to every subsequent request as
 `Authorization: Bearer <access_token>`. On credential failure the
-endpoint emits an RFC 6749 §5.2 envelope (`{"error":"invalid_client"}`)
+endpoint emits an RFC 6749 §5.2 envelope
+(`{"error":"invalid_client"}` or `{"error":"invalid_grant"}`)
 rather than the pagefault-standard `error.code` shape, because
 OAuth2 clients key on the top-level `error` field. See
-`docs/security.md → Auth → OAuth2 client_credentials` for the
-full cryptographic and revocation model.
+`docs/security.md → Auth → OAuth2` for the full cryptographic,
+consent, and revocation model.
+
+#### Dynamic client registration (RFC 7591, Claude Desktop remote connector)
+
+When `dcr_enabled: true`, pagefault mounts `POST /register` and
+advertises `registration_endpoint` in the RFC 8414 metadata. Claude
+Desktop's remote connector discovers this endpoint and self-registers
+as a public client before starting the authorization code flow — no
+manual `pagefault oauth-client create` step is needed.
+
+```
+POST /register
+Content-Type: application/json
+
+{
+  "redirect_uris": ["http://localhost:3000/callback"],
+  "grant_types": ["authorization_code", "refresh_token"],
+  "response_types": ["code"],
+  "client_name": "Claude Desktop",
+  "token_endpoint_auth_method": "none"
+}
+```
+
+Success (HTTP 201):
+
+```json
+{
+  "client_id": "pf_dcr_abc123...",
+  "client_id_issued_at": 1712812345,
+  "redirect_uris": ["http://localhost:3000/callback"],
+  "grant_types": ["authorization_code", "refresh_token"],
+  "response_types": ["code"],
+  "token_endpoint_auth_method": "none",
+  "client_name": "Claude Desktop",
+  "scope": "mcp"
+}
+```
+
+No `client_secret` is returned — DCR only creates public clients.
+`grant_types` may include `"refresh_token"` (silently accepted; pagefault
+does not issue refresh tokens). `redirect_uris` must be localhost or
+HTTPS per MCP security conventions.
+
+On validation error (HTTP 400):
+
+```json
+{"error": "invalid_redirect_uri", "error_description": "redirect_uri ... must be localhost or HTTPS"}
+```
+
+Enable with:
+
+```yaml
+auth:
+  mode: "oauth2"
+  oauth2:
+    clients_file: "/etc/pagefault/oauth-clients.jsonl"
+    dcr_enabled: true
+    # dcr_bearer_token: "optional-gate-token"
+```
 
 ## Common response shapes
 
@@ -549,13 +660,17 @@ on status codes; orchestrators should read the envelope's top-level
 ```json
 {
   "status": "ok",
-  "version": "0.6.0",
+  "version": "0.8.1",
   "backends": {
     "fs":       {"status": "ok"},
     "openclaw": {"status": "ok"}
   }
 }
 ```
+
+The `version` field mirrors the single-line `VERSION` file at the
+repo root — the example above will drift as new releases land; the
+shape is stable.
 
 Per-backend `status` is one of:
 
@@ -662,12 +777,13 @@ Timeouts on mode:agent are flattened into a success envelope with
 the deadline surfaced as `result` — same pattern as `pf_fault`.
 
 The OpenAPI schema also advertises a `targets_written` field
-(array of URIs the subagent reports writing). As of 0.6.0 pagefault
-has no structured way to extract this from the subagent's reply, so
-the field is **reserved but always absent**. Clients that need to
-know which files were touched must parse the free-form `result`
-text. Populating `targets_written` waits for a structured subagent
-response envelope in Phase 5.
+(array of URIs the subagent reports writing). pagefault still has
+no structured way to extract this from the subagent's reply, so
+the field is **reserved but always absent** as of the current
+release. Clients that need to know which files were touched must
+parse the free-form `result` text. Populating `targets_written`
+waits for a structured subagent response envelope in a future
+release.
 
 **Errors:**
 
@@ -701,8 +817,12 @@ response envelope in Phase 5.
 
 ---
 
-## Planned (future phases)
+## Planned (future work)
 
-Phases 1–4 are shipped. Phase 5 items on the roadmap (OAuth2,
-caching, streaming, metrics) are tracked in `plan.md` §10. No
-additional tool surface is planned for Phase 5.
+All seven tools are shipped. OAuth2 (both `client_credentials` and
+`authorization_code + PKCE`) shipped in 0.7.0 / 0.8.0. The
+remaining tracked items — caching, streaming tool results,
+Prometheus metrics, a structured subagent response envelope that
+would let `pf_poke` mode:agent populate `targets_written` — do
+not add new tool surface and are not currently scheduled. See
+`CHANGELOG.md` for the shipped history.

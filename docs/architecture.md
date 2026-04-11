@@ -1,8 +1,9 @@
 # pagefault — Architecture
 
-This document describes the runtime architecture of pagefault. It is a
-condensed version of `plan.md` §3–5 and should match the code in
-`internal/`. If it drifts, update this doc.
+This document describes the runtime architecture of pagefault. It
+should match the code in `internal/` and `cmd/pagefault/`. If it
+drifts, update this doc first — the shipped release notes live in
+`CHANGELOG.md`.
 
 ## The one-line description
 
@@ -23,7 +24,8 @@ MCP (streamable-http *and* legacy SSE) and a REST / OpenAPI transport.
 ┌──────────────────────────────────────────────────┐
 │  chi router + middleware (Recoverer, Logger)      │
 │  ┌──────────┐                                    │
-│  │ auth     │  bearer / trusted_header / none    │
+│  │ auth     │  bearer / trusted_header /         │
+│  │          │  oauth2 / none                     │
 │  └────┬─────┘                                    │
 │       │                                          │
 │       ▼                                          │
@@ -62,7 +64,7 @@ MCP (streamable-http *and* legacy SSE) and a REST / OpenAPI transport.
 | `internal/config`       | YAML schema structs, loader, env substitution, validation |
 | `internal/model`        | Shared types (`Caller`) and sentinel errors |
 | `internal/backend`      | `Backend` / `SubagentBackend` / `WritableBackend` interfaces and five built-in types: `filesystem` (P1, P4 write support), `subprocess`, `http`, `subagent-cli`, `subagent-http` (P2) |
-| `internal/auth`         | `AuthProvider` interface, Bearer/None/TrustedHeader, middleware |
+| `internal/auth`         | `AuthProvider` interface, Bearer/None/TrustedHeader, OAuth2 (client_credentials + authorization_code + PKCE + DCR, compound fallback), middleware |
 | `internal/filter`       | `Filter` interface, `CompositeFilter`, PathFilter (read + write allowlists), TagFilter, RedactionFilter (P3) |
 | `internal/write`        | `Writer` interface + `FilesystemWriter` (flock + atomic append), entry-format templating — Phase 4 |
 | `internal/audit`        | `Logger` interface, JSONL/stdout/nop sinks, arg sanitization |
@@ -263,7 +265,7 @@ through `DeepRetrieve` which would use the retrieve template.
 
 ## Auth layer
 
-Three providers, all implementing `AuthProvider.Authenticate(r) (*Caller, error)`:
+Four providers, all implementing `AuthProvider.Authenticate(r) (*Caller, error)`:
 
 - **NoneAuth** — always returns `AnonymousCaller`. Local dev only.
 - **BearerTokenAuth** — loads a JSONL tokens file at startup, matches
@@ -272,6 +274,67 @@ Three providers, all implementing `AuthProvider.Authenticate(r) (*Caller, error)
 - **TrustedHeaderAuth** — reads identity from a configurable header, with
   optional trusted-proxy IP allowlist. Intended for deployments behind a
   reverse proxy that handles auth externally.
+- **OAuth2Provider** (0.7.0+) — validates `pf_at_…` access tokens
+  issued by pagefault's own token endpoint against an in-memory
+  store. Supports two grant types and dynamic client registration:
+  - **`client_credentials`** (0.7.0) — programmatic clients present
+    `client_id` + `client_secret` (bcrypt-hashed in the registry) to
+    `POST /oauth/token` via HTTP Basic or form body, and receive a
+    scoped access token.
+  - **`authorization_code + PKCE`** (0.8.0) — browser-based clients
+    (Claude Desktop is the driving use case) hit `GET /oauth/authorize`
+    with a PKCE challenge, get 302'd back to their registered
+    `redirect_uri` with a one-time `pf_ac_…` authorization code, and
+    exchange the code at `POST /oauth/token` by proving possession of
+    the verifier. `S256` is the only supported challenge method;
+    verification uses `crypto/subtle.ConstantTimeCompare`. Public
+    clients (no secret) are supported via `--public` at registration
+    time — PKCE provides the code-exchange protection.
+  - **Dynamic Client Registration** (0.9.0, RFC 7591) — opt-in via
+    `auth.oauth2.dcr_enabled`. Public clients only (no
+    `client_secret`, PKCE-only). `POST /register` creates a client
+    with `pf_dcr_`-prefixed ID, validates `redirect_uris` (localhost
+    or HTTPS), accepts `refresh_token` in `grant_types` silently, and
+    persists to the same JSONL file via `O_APPEND|O_CREATE|O_WRONLY`.
+    Optional `dcr_bearer_token` gates registration behind a bearer
+    token. The `registration_endpoint` appears in RFC 8414 metadata
+    only when DCR is enabled.
+
+### OAuth2 wiring
+
+`NewOAuth2Provider` is constructed via `auth.NewProvider` when
+`auth.mode: "oauth2"`. Server wiring, in `internal/server/server.go`:
+
+1. `*auth.OAuth2Provider` is stashed on `Server.oauth2P` so the
+   OAuth handlers can call its methods without a type assertion.
+2. Four **public** (un-authed) routes are always mounted on the root
+   when `oauth2P != nil`:
+   - `GET /.well-known/oauth-protected-resource` (RFC 9728)
+   - `GET /.well-known/oauth-authorization-server` (RFC 8414)
+   - `POST /oauth/token` (client_credentials **and**
+     authorization_code grants)
+   - `GET+POST /oauth/authorize` (authorization endpoint + consent
+     form handler)
+3. A fifth public route is mounted when `oauth2P.DCREnabled()`:
+   - `POST /register` (RFC 7591 Dynamic Client Registration) — creates
+     public-only clients (`pf_dcr_` prefix, no `client_secret`, PKCE-only).
+     The `/.well-known/oauth-authorization-server` response includes
+     `registration_endpoint` only when DCR is enabled. An optional
+     `dcr_bearer_token` gates registration behind a bearer token.
+3. The authenticated routes (`/api/pf_*`, `/mcp`, `/sse`, `/message`)
+   run the OAuth2Provider as the bearer-token validator.
+
+### Compound mode (bearer + oauth2)
+
+When `auth.mode: "oauth2"` **and** `auth.bearer.tokens_file` are
+both set, `NewOAuth2Provider` constructs a `BearerTokenAuth` and
+stashes it as `p.fallback`. `Authenticate` tries the OAuth2 store
+first, then falls back to the bearer store on miss. This is the
+migration-friendly path that lets an operator flip Claude Desktop
+onto OAuth2 while long-lived bearer tokens for Claude Code clients
+continue to work — both populate the same `model.Caller`, so audit
+entries and filter pipelines are identical regardless of which
+validator matched.
 
 `auth.Middleware` wraps any `AuthProvider` as an HTTP middleware that stores
 the resolved `Caller` on the request context. Tool handlers retrieve it with
@@ -366,11 +429,37 @@ The entire binary is a runtime for a single YAML file. There are **no**
 hardcoded paths, URLs, or identifiers in the code. All specificity lives in
 the config — see `docs/config-doc.md`.
 
-## Future phases
+## Shipped milestones
 
-See `plan.md` §10 for the full roadmap. Short version:
+`CHANGELOG.md` is the authoritative history. Short version of what's
+already in the tree:
 
-- **Phase 2 (shipped in 0.3.0):** subagent / subprocess / http backends, `pf_fault` (deep retrieval), `pf_ps` (list agents), plus matching CLI subcommands.
-- **Phase 3 (shipped in 0.4.0):** `RedactionFilter`, JSON / markdown-with-metadata context formats, `/api/openapi.json`, opt-in CORS, per-caller rate limiting, `HealthChecker` interface + richer `/health`, structured REST error envelope.
-- **Phase 4 (shipped in 0.5.0):** write support via `pf_poke` — filesystem `WritableBackend` with `write_paths`/`write_mode`/`max_entry_size`/`flock`, direct append via `internal/write`, entry-template formatting, and `mode:"agent"` writeback that delegates to a subagent.
-- **Phase 5:** OAuth2, caching, streaming, metrics
+- **Phase 1 (0.1.x–0.2.x):** filesystem backend, read-side tools
+  (`pf_maps` / `pf_load` / `pf_scan` / `pf_peek`), bearer-token auth.
+- **Phase 2 (0.3.0):** subagent / subprocess / http backends,
+  `pf_fault` (deep retrieval), `pf_ps` (list agents), plus matching
+  CLI subcommands.
+- **Phase 3 (0.4.0):** `RedactionFilter`, JSON /
+  markdown-with-metadata context formats, `/api/openapi.json`, opt-in
+  CORS, per-caller rate limiting, `HealthChecker` interface + richer
+  `/health`, structured REST error envelope.
+- **Phase 4 (0.5.x):** write support via `pf_poke` — filesystem
+  `WritableBackend` with `write_paths` / `write_mode` /
+  `max_entry_size` / `flock`, direct append via `internal/write`,
+  entry-template formatting, and `mode:"agent"` writeback that
+  delegates to a subagent.
+- **Phase 4.5 (0.6.x):** native MCP SSE transport, server-level
+  `instructions`, subagent prompt templates with three-layer
+  precedence, SSE keepalive pings for proxy idle timeouts.
+- **OAuth2 (0.7.0–0.9.0):** `client_credentials` grant (0.7.0),
+  authorization_code + PKCE with public clients (0.8.0), security
+  hardening on the authorize endpoint (0.8.1), RFC 7591 Dynamic
+  Client Registration (0.9.0).
+
+## Not yet shipped
+
+Items that are tracked but have no scheduled release: response
+caching, streaming tool results, Prometheus metrics, and a
+structured subagent response envelope that would let `pf_poke`
+mode:agent populate `targets_written` instead of leaving it
+reserved. None of these change the tool surface.

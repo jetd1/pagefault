@@ -7,6 +7,202 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+## 0.9.0 (2026-04-11)
+
+### Added
+
+- **RFC 7591 Dynamic Client Registration (`POST /register`).**
+  When `auth.oauth2.dcr_enabled: true` is set, pagefault mounts a public
+  `/register` endpoint that allows MCP clients like Claude Desktop to
+  self-register as public OAuth2 clients (PKCE-only, no client_secret)
+  without manual `pagefault oauth-client create`. The endpoint is
+  advertised in the RFC 8414 authorization server metadata as
+  `registration_endpoint`. DCR is opt-in because it creates client
+  records without authentication; operators who want to gate registration
+  can set `auth.oauth2.dcr_bearer_token` to require a bearer token on
+  the registration request. Redirect URIs are restricted to localhost or
+  HTTPS per MCP security conventions. Dynamically-registered clients
+  get a `pf_dcr_` prefix on their client ID and persist across restarts
+  via append-only JSONL writes. The `oauth-client ls` output now shows
+  a SOURCE column (`cli` vs `dcr`) to distinguish registration method.
+  `grant_types: ["refresh_token"]` is silently accepted (pagefault does
+  not issue refresh tokens) to avoid breaking Claude Desktop's DCR
+  request.
+
+### Changed
+
+- **CORS middleware always short-circuits preflights with 204.**
+  Previously, preflight requests from disallowed origins fell through
+  to downstream handlers, producing confusing 401/405 responses.
+  Now all preflights return 204 — allowed origins get CORS headers,
+  disallowed origins get no CORS headers (the browser rejects either
+  way). This prevents the auth middleware from rejecting CORS preflight
+  OPTIONS requests before the CORS middleware can handle them.
+
+- **Auth middleware passes CORS preflights through.** The auth
+  middleware now skips authentication for OPTIONS requests with an
+  `Access-Control-Request-Method` header, letting the CORS middleware
+  handle them. Browsers never attach credentials to preflight requests,
+  so authenticating them always fails and blocks the subsequent real
+  request.
+
+## 0.8.1 (2026-04-11)
+
+### Security
+
+- **Open redirect on `/oauth/authorize` (pre-registration error path).**
+  `handleOAuthAuthorize` validated `response_type` before it validated
+  `client_id` and the registered `redirect_uri`. An attacker could
+  send `response_type=bogus&redirect_uri=https://evil.example.com/&state=…`
+  and the handler would 302 to the unregistered URI with the error
+  envelope — a textbook open redirect on a publicly advertised
+  discovery endpoint. RFC 6749 §4.1.2.1 explicitly forbids this.
+  Validation is now strictly ordered: `client_id` → client lookup →
+  `redirect_uri` presence → registered-URI match, and only after the
+  redirect target is confirmed safe may any subsequent error trigger
+  an `authorizeError` redirect. A client with zero registered URIs is
+  now rejected up front (it was created for `client_credentials` and
+  has no business on `/oauth/authorize`).
+
+- **Consent form `action` injection bypass.** When `auto_approve: false`,
+  `renderConsentPage` echoed every query parameter back as a hidden
+  form field. An attacker URL carrying `&action=allow` landed a
+  hidden `<input name="action" value="allow">` ahead of the submit
+  buttons; Go's `url.Values.Get("action")` returns the first value,
+  so the user's "Deny" click was silently overridden by the injected
+  value. Two-layer fix: (a) the hidden-field renderer is now a strict
+  whitelist of OAuth spec parameters (`response_type`, `client_id`,
+  `redirect_uri`, `scope`, `state`, `code_challenge`,
+  `code_challenge_method`); (b) the POST handler takes the **last**
+  `action` value and requires it to be literally `"allow"` — anything
+  else (missing, empty, unknown, attacker-seeded) is treated as deny.
+
+- **Clickjacking defence on the consent page.** The CSP on the
+  consent form now includes `frame-ancestors 'none'` alongside
+  `default-src 'none'`, `style-src 'unsafe-inline'`, and
+  `form-action 'self'`. Low blast radius (auto_approve is on by
+  default, and pagefault has no user session to hijack), but a
+  one-line defence-in-depth change.
+
+### Changed
+
+- **`invalid_grant` / `invalid_client` classification uses
+  `errors.Is`.** The token endpoint's authorization-code error
+  branch was classifying errors by `err.Error() == "oauth2: invalid
+  grant"` / `strings.Contains`. It now calls
+  `errors.Is(err, auth.ErrInvalidGrant)` against the exported
+  sentinels, so the classification survives message tweaks and
+  future error wrapping. The client-facing `error_description` is
+  now a static sanitized string instead of `err.Error()`, so no
+  internal detail leaks on the error path.
+
+- **`IssueAuthorizationCode` library-level guard.** The provider
+  method used to fall through silently when the client had zero
+  registered `redirect_uris` **and** the caller passed an empty
+  `redirectURI` argument. The HTTP handler already blocks that
+  combination, but `IssueAuthorizationCode` is exported and could
+  be called by library consumers. Now rejects `len(rec.RedirectURIs)
+  == 0` up front with `ErrInvalidRequest` regardless of the
+  supplied `redirectURI`, so the defensive guarantee matches
+  whether the caller comes through HTTP or Go code. A second
+  assertion in `TestOAuth2Provider_IssueAuthorizationCode_NoRegisteredURIs`
+  pins the empty-arg case.
+
+- **`expires_in` clamped to ≥ 1.** `writeTokenResponse` used to
+  compute `int(time.Until(ExpiresAt).Seconds())`, which could
+  return 0 for sub-second TTLs or negative under clock skew.
+  RFC 6749 §5.1 requires a positive integer, and clients that key
+  off the value as "seconds until refresh" misbehave on zero or
+  negative. The clamp logic is now in `computeExpiresIn(expiresAt,
+  now)` — a package-private helper that rounds up to the next
+  whole second and clamps to 1 — with table-driven unit tests
+  covering typical-TTL / sub-second / exactly-expired / already-
+  expired / latency-spike / fractional-second cases.
+
+### Testing
+
+- **Regression tests for all three security fixes.**
+  `TestOAuth2_Authorize_NoOpenRedirect_UnregisteredURI` and
+  `…_MissingClientID` pin the RFC 6749 §4.1.2.1 ordering.
+  `TestOAuth2_Authorize_ConsentPage_ParamInjectionBypass` drives the
+  attacker POST body with two `action` values and asserts the last
+  one (the user's click) decides the outcome.
+  `TestOAuth2_Authorize_ConsentPage_WhitelistDropsInjectedAction`
+  checks the rendered HTML and the `frame-ancestors` CSP in one go.
+  `TestOAuth2_Authorize_ConsentPage_DefaultDeny` /
+  `…_Allow` pin the POST state machine.
+
+- **CLI coverage for `--public` and `--redirect-uris`.** The 0.8.0
+  CLI flags previously had zero direct tests.
+  `TestOAuthClientCreate_Public`,
+  `…_PublicRequiresRedirectURIs`,
+  `…_ConfidentialWithRedirectURIs`, and
+  `TestRunOAuthClientList_ShowsTypeAndRedirectURIs` now cover the
+  happy paths, the guard rail, the mixed-mode case, and the `ls`
+  output format.
+
+### Docs
+
+- **`plan.md` removed.** The file was a 1033-line mix of
+  architectural spec, phase roadmap, deployment-specific
+  (OpenClaw/Hermes) context, and open questions. Most of its
+  content had either shipped and been superseded by `CHANGELOG.md`,
+  or drifted out of date (OAuth2 was still listed as "Phase 5 /
+  future" despite shipping in 0.7.0 and 0.8.0). Load-bearing
+  architectural content migrated into the existing docs:
+  - `docs/architecture.md` — added full **OAuth2 wiring** section
+    (provider construction, public endpoint mounts, compound mode
+    fallback), expanded the auth-layer list from three to four
+    providers, added OAuth2 to the component diagram, added a
+    Shipped-milestones / Not-yet-shipped split to replace the
+    plan.md §10 phase roadmap.
+  - `docs/security.md` — added **Design intent: thin auth, reverse
+    proxy expected** section at the top (pagefault does not ship
+    TLS; `trusted_header` is first-class). Expanded the OAuth2
+    authorize-endpoint section to document the 0.8.1 validation
+    order explicitly (eight-step pipeline), the `consentParams`
+    whitelist, the take-last-action / default-deny semantics on the
+    consent POST, the `frame-ancestors 'none'` CSP, and the
+    `errors.Is` classification. Added **"Public OAuth2 endpoints
+    are outside the in-process rate limiter"** bullet covering the
+    ~18 MB authorization-code memory bound under abuse and the
+    recommended proxy-level rate-limit configuration, with a
+    cross-reference from the "Rate limiting is in-process only"
+    known-limitation note. Added the **"why agent writes bypass
+    `write_paths` on purpose"** rationale to the mode:agent
+    trust-boundary discussion.
+  - `docs/config-doc.md` — collapsed the split `GET /oauth/authorize`
+    / `POST /oauth/authorize` rows into a single `GET+POST
+    /oauth/authorize` entry so the stated endpoint count matches
+    `docs/api-doc.md` and `docs/architecture.md` ("four public
+    endpoints").
+  - `docs/api-doc.md` — expanded the OAuth2 section to cover both
+    grant types and all four public endpoints
+    (client_credentials + authorization_code + PKCE walkthrough).
+    Bumped the health-endpoint example version to 0.8.1 and noted
+    that the `version` field drifts with the VERSION file. Dropped
+    the "OAuth2 is Phase 5 future work" framing from the Planned
+    section.
+  - `README.md` — rewrote the intro paragraph to feature 0.8.0's
+    authorization_code + PKCE flow as the primary OAuth2
+    experience (0.7.0 client_credentials is now framed as the
+    programmatic fallback). Dropped the plan.md documentation
+    bullet and added a CHANGELOG.md pointer in its place.
+  - `CLAUDE.md` — updated the directory tree to drop the plan.md
+    entry, refreshed the `oauth_client.go` /
+    `auth/oauth2.go` / `server/oauth2.go` / `server/oauth2_test.go`
+    descriptions to cover the 0.8.0 and 0.8.1 additions, updated
+    the "Running Locally" OAuth2 examples to show both
+    confidential and `--public --redirect-uris` client creation,
+    expanded the Auth abstraction bullet from three to four
+    public endpoints, removed the plan.md entry from the See Also
+    section.
+
+  Historical CHANGELOG references to plan.md (in the 0.4 / 0.5 /
+  0.6 / 0.7 entries) are intentionally preserved — they describe
+  what was true at the time each version shipped and rewriting
+  them would be revisionist.
+
 ## 0.8.0 (2026-04-11)
 
 ### Added

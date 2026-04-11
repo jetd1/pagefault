@@ -184,12 +184,13 @@ type TrustedHeaderConfig struct {
 //   - GET  /.well-known/oauth-authorization-server (RFC 8414 metadata)
 //   - POST /oauth/token                            (both grant types)
 //   - GET  /oauth/authorize                        (authorization_code)
+//   - POST /register                               (RFC 7591 DCR, when dcr_enabled)
 //
-// Clients are registered out-of-band via `pagefault oauth-client
-// create`, which appends a bcrypt-hashed secret to ClientsFile.
-// No dynamic client registration (DCR) endpoint is provided —
-// operators pre-register clients and paste credentials into the
-// MCP client's configuration UI.
+// Clients are registered either out-of-band via `pagefault
+// oauth-client create` or dynamically via RFC 7591 POST /register
+// (when dcr_enabled is true). DCR creates public clients (no
+// client_secret, PKCE-only) and is opt-in because it opens a
+// zero-auth endpoint that creates client records.
 type OAuth2Config struct {
 	// ClientsFile is a JSONL file where each line is an OAuth2 client
 	// record (id, label, bcrypt secret_hash, scopes, redirect_uris,
@@ -227,6 +228,18 @@ type OAuth2Config struct {
 	// operator is authorizing themselves, so clicking a consent
 	// button adds no security value.
 	AutoApprove *bool `yaml:"auto_approve,omitempty"`
+	// DCREnabled controls whether the RFC 7591 dynamic client
+	// registration endpoint (POST /register) is mounted. Disabled by
+	// default because DCR creates clients without authentication,
+	// which is inappropriate for most single-operator deployments.
+	// When enabled, MCP clients like Claude Desktop can self-register
+	// as public OAuth2 clients without manual `oauth-client create`.
+	DCREnabled *bool `yaml:"dcr_enabled,omitempty"`
+	// DCRBearerToken is an optional bearer token that must be
+	// presented in the Authorization header of POST /register
+	// requests. When empty, registration is open (no auth required).
+	// Set this to restrict DCR to clients that know the token.
+	DCRBearerToken string `yaml:"dcr_bearer_token,omitempty"`
 }
 
 // AccessTokenTTLOrDefault returns the access token TTL as a Go
@@ -245,6 +258,16 @@ func (o OAuth2Config) DefaultScopesOrDefault() []string {
 		return []string{"mcp"}
 	}
 	return o.DefaultScopes
+}
+
+// DCREnabledOrDefault returns whether DCR is enabled, defaulting to
+// false when nil. DCR is opt-in because it opens a zero-auth endpoint
+// that creates client records on the server.
+func (o OAuth2Config) DCREnabledOrDefault() bool {
+	if o.DCREnabled == nil {
+		return false
+	}
+	return *o.DCREnabled
 }
 
 // AuthCodeTTLOrDefault returns the authorization code TTL in seconds,
