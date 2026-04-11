@@ -7,6 +7,116 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+## 0.7.0 (2026-04-11)
+
+OAuth2 client_credentials auth provider. Shipped to unblock
+Claude Desktop's built-in SSE MCP configuration, which as of 2026-04
+only accepts **Client ID / Client Secret** credentials in its UI —
+there is no field for attaching a plain `Authorization: Bearer pf_...`
+header to the SSE GET. Before this release, a bearer-auth
+pagefault deployment could only serve Claude Desktop via the
+`npx supergateway` bridge; with 0.7.0, operators can register a
+Claude Desktop client with `pagefault oauth-client create` and
+point Claude Desktop directly at the pagefault URL.
+
+### Added
+- **`auth.mode: "oauth2"` provider** (`internal/auth/oauth2.go`).
+  Implements RFC 6749 §4.4 client_credentials grant against an
+  operator-managed client registry. Opaque access tokens with
+  configurable TTL (default 3600s) are held in an in-memory store;
+  expired entries are swept lazily on lookup and opportunistically
+  on issue. Tokens are scoped by intersection of the client's
+  allowed scopes and the caller-requested scopes; the default scope
+  set is `["mcp"]` to match the MCP client-ecosystem convention.
+- **Compound mode.** When `auth.mode: "oauth2"` is configured
+  alongside a populated `auth.bearer.tokens_file`, long-lived bearer
+  tokens from the JSONL store continue to authenticate as a
+  fallback. This lets operators migrate Claude Desktop to OAuth2
+  without breaking existing Claude Code deployments that still rely
+  on static bearer tokens. The fallback is constructed lazily in
+  `NewOAuth2Provider` and reuses the existing `BearerTokenAuth`
+  implementation, so audit entries and caller metadata are identical
+  regardless of which validator matched.
+- **Three public HTTP endpoints** (`internal/server/oauth2.go`),
+  mounted outside the auth middleware because they must work before
+  any token exists:
+  - `GET /.well-known/oauth-protected-resource` (RFC 9728 metadata,
+    points `authorization_servers` at the pagefault issuer)
+  - `GET /.well-known/oauth-authorization-server` (RFC 8414 metadata
+    advertising `grant_types_supported: ["client_credentials"]` and
+    `token_endpoint_auth_methods_supported: ["client_secret_basic",
+    "client_secret_post"]`)
+  - `POST /oauth/token` (the client_credentials grant endpoint,
+    accepts both HTTP Basic and form-body credentials; returns a
+    standard RFC 6749 token response with `Cache-Control: no-store`)
+- **`pagefault oauth-client` CLI subcommand** mirroring
+  `pagefault token` — `create` / `ls` / `revoke` against an
+  operator-managed JSONL clients file. `create` prints the Client ID
+  and Client Secret exactly once; the secret is stored as a bcrypt
+  hash and is never recoverable from the file afterwards. Supports
+  `--scopes "mcp mcp.read"` to narrow a client's allowed scope set,
+  `--id` for a custom id, and the standard
+  `--config`/`--clients-file` resolution pair.
+- **`auth.oauth2` config block** (`internal/config/config.go`):
+  `clients_file` (required), `issuer` (optional override for the
+  discovery documents), `access_token_ttl_seconds` (default 3600),
+  `default_scopes` (default `["mcp"]`). `AccessTokenTTLOrDefault` /
+  `DefaultScopesOrDefault` helpers return the resolved values for
+  consumers that need the effective settings.
+- **Issuer resolution.** The discovery endpoint handlers prefer the
+  explicit `auth.oauth2.issuer` override, then fall back to
+  `server.public_url`, and finally infer from the incoming request's
+  scheme + host (honouring `X-Forwarded-Proto` / `X-Forwarded-Host`
+  when present). Deployments behind a reverse proxy that rewrites
+  Host without forwarding the original should pin one of the first
+  two.
+- **New CHANGELOG entries in the README** (the three most recent)
+  and a new `docs/config-doc.md` section covering the full
+  `auth.mode: oauth2` wiring with a worked Claude Desktop example.
+
+### Changed
+- `internal/auth/auth.go` — `NewProvider` gained an `oauth2` case
+  that calls through to `NewOAuth2Provider`. The existing `none` /
+  `bearer` / `trusted_header` branches are unchanged; operators
+  flipping `auth.mode` to `oauth2` and adding a `clients_file`
+  entry is the full upgrade path.
+- `internal/config/config.go` — `AuthConfig.Mode` oneof validator
+  now accepts `oauth2`. The new `OAuth2Config` struct is embedded
+  on `AuthConfig`; empty is fine except when mode is oauth2.
+
+### Fixed
+- **`docs/security.md` drift from 0.6.0 wave G.** An earlier edit
+  claimed "Claude Desktop sends the Authorization header on both
+  the initial SSE GET and subsequent message POSTs, so bearer auth
+  works end-to-end on the SSE transport without any special
+  accommodation." This is incorrect — Claude Desktop's SSE config
+  does not attach bearer headers at all. Rewritten to call out the
+  OAuth2-only credential field and point at the new 0.7.0 path.
+
+### Dependencies
+- `golang.org/x/crypto/bcrypt` added for client secret hashing.
+  Pulled in at module level via `go get`, pinning
+  `golang.org/x/crypto v0.50.0` (up from `v0.49.0`).
+
+### Tests
+- `internal/auth/oauth2_test.go` — 13 tests covering
+  IssueToken happy/invalid/unknown/empty, Authenticate with
+  issued/expired/unknown/missing-header, compound-mode fallback,
+  scope intersection, ReloadClients mid-run, missing-clients-file
+  rejection, duplicate-id rejection, JSONL parser (comments +
+  blanks), access token + client secret generator entropy.
+- `internal/server/oauth2_test.go` — 11 integration tests via
+  httptest covering discovery endpoint shapes, token endpoint
+  Basic/post/invalid/unsupported-grant/missing-creds paths,
+  end-to-end token → /api/pf_maps, compound-mode legacy bearer,
+  unmounted-when-disabled, and RFC 6749 §2.3.1 URL-encoded Basic
+  credential decoding.
+- `cmd/pagefault/oauth_client_test.go` — full CLI lifecycle
+  (create/ls/revoke, duplicate-id error, empty list, with-records
+  list, stored hash verifies the printed secret, required-label
+  error, unknown/missing subcommand errors, resolveClientsFile
+  config-vs-flag precedence).
+
 ## 0.6.1 (2026-04-11)
 
 Hotfix for a long-running `pf_fault` failure mode reported in a real

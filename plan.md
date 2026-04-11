@@ -811,16 +811,116 @@ See `CHANGELOG.md` §0.6.0 for the full breakdown. `docs/config-doc.md`
 has a worked `server.mcp.instructions` override example showing
 how to layer installation-specific framing on top of the default.
 
+### Phase 4.6 — Keepalive hotfix + OAuth2 ✅ (shipped in 0.6.1 + 0.7.0)
+
+Two tightly-linked releases driven by one Claude Desktop deployment
+goal: make the native SSE MCP config reach pagefault directly, with
+no `supergateway` bridge and no premature idle-timeout deaths on
+long `pf_fault` calls. The fix split along the two layers the
+problem lived on.
+
+**0.6.1 — SSE keepalive pings.** The persistent `GET /sse` stream
+no longer sits silent for the duration of a long subagent wait;
+mcp-go's built-in keepalive is enabled with a 15-second interval
+(tunable via `server.mcp.sse_keepalive` / `sse_keepalive_interval_seconds`),
+so intermediate proxies see a `ping` event on a ticker and do not
+close the connection. Resolves the "几十秒就挂" failure mode
+reported against the live deployment. Note: operators on the
+`supergateway → /mcp` bridge are not covered because mcp-go's
+streamable-http transport has no per-request keepalive — bump the
+reverse proxy's `proxy_read_timeout` / equivalent to 300s+ as a
+workaround on that path.
+
+**0.7.0 — OAuth2 client_credentials auth provider.** Claude
+Desktop's built-in SSE credential UI only exposes Client ID and
+Client Secret fields, so even with the keepalive fix a
+bearer-authenticated pagefault deployment could not be reached
+natively. 0.7.0 adds `auth.mode: "oauth2"` with the full minimum
+viable client_credentials surface:
+
+- **`internal/auth/oauth2.go`** — `OAuth2Provider` implementing
+  `AuthProvider`, backed by a JSONL clients registry with
+  bcrypt-hashed secrets and an in-memory access token store with
+  configurable TTL (default 3600s). `IssueToken` verifies
+  credentials via `bcrypt.CompareHashAndPassword`, issues a
+  32-byte opaque token (prefix `pf_at_`), and intersects the
+  caller-requested scopes with the client's allowed set.
+  `Authenticate` checks issued tokens first and falls back to
+  the legacy `BearerTokenAuth` when `bearer.tokens_file` is also
+  configured — the **compound-mode** path that lets operators
+  migrate Claude Desktop without breaking Claude Code.
+- **`internal/server/oauth2.go`** — three new public HTTP
+  endpoints: `GET /.well-known/oauth-protected-resource`
+  (RFC 9728), `GET /.well-known/oauth-authorization-server`
+  (RFC 8414), and `POST /oauth/token` (RFC 6749 §4.4). The
+  discovery endpoints advertise only what pagefault supports:
+  `grant_types_supported: ["client_credentials"]`,
+  `token_endpoint_auth_methods_supported: ["client_secret_basic",
+  "client_secret_post"]`, empty `response_types_supported`. The
+  token endpoint parses credentials from either HTTP Basic
+  (§2.3.1) or form body (§2.3.2), with the RFC 6749 §5.2 error
+  envelope on failure (401 + WWW-Authenticate on Basic failures,
+  400 on form-body failures). Mounted outside the auth middleware
+  so clients can bootstrap before they have a token.
+- **`cmd/pagefault/oauth_client.go`** — new CLI subcommand
+  mirroring `pagefault token`. `create` generates a Client ID
+  (slugified from `--label` or given via `--id`) and a 32-byte
+  random Client Secret (prefix `pf_cs_`), hashes the secret with
+  bcrypt, and prints both exactly once. `ls` lists ID + label +
+  scopes + created timestamp (never the hash or the secret).
+  `revoke` removes future issuance for that client but warns
+  that already-issued access tokens remain valid until TTL or
+  server restart.
+- **`internal/config/config.go`** — `AuthConfig.Mode` oneof
+  validator extended with `"oauth2"`; new `OAuth2Config` struct
+  with `clients_file`, `issuer`, `access_token_ttl_seconds`,
+  `default_scopes` plus `AccessTokenTTLOrDefault` /
+  `DefaultScopesOrDefault` helpers.
+- **Issuer resolution** in the discovery handlers: explicit
+  `auth.oauth2.issuer` → `server.public_url` → inferred from
+  incoming request's scheme + host (honouring `X-Forwarded-Proto`
+  and `X-Forwarded-Host`).
+
+Tests: `internal/auth/oauth2_test.go` (13 unit tests covering
+issue, authenticate, expire + sweep, compound fallback, scope
+intersection, reload, parser edge cases, entropy),
+`internal/server/oauth2_test.go` (11 integration tests via
+httptest: discovery shape, Basic + form-body + invalid +
+unsupported-grant + missing-creds paths, end-to-end token →
+`/api/pf_maps`, compound-mode legacy bearer, unmounted when
+disabled, URL-encoded Basic credential decoding),
+`cmd/pagefault/oauth_client_test.go` (full CLI lifecycle plus
+stored-hash-verifies-printed-secret round-trip).
+
+Docs: `docs/config-doc.md` §auth → "mode: oauth2 — client_credentials
+grant (shipped in 0.7.0)" with a complete worked example for
+Claude Desktop; `docs/security.md` §Auth → "OAuth2 client_credentials
+(0.7.0+)" covering bcrypt/`crypto/rand`/TTL/compound-mode/revocation
+semantics; `docs/api-doc.md` §Authentication → "OAuth2
+client_credentials (0.7.0+)" with the POST /oauth/token wire
+format; `configs/example.yaml` gains a commented-out oauth2 +
+compound block; `README.md` Claude Desktop section rewritten to
+lead with the native OAuth2 path and keep `supergateway` as a
+fallback.
+
+Deliberately out of scope for 0.7.0: authorization_code flow,
+PKCE, refresh tokens, dynamic client registration, per-scope
+tool ACLs, and persistent token storage. The target workload
+(Claude Desktop's static client_id/client_secret UI) does not
+need any of them.
+
+See `CHANGELOG.md` §0.6.1 and §0.7.0 for the full per-release
+breakdown.
+
 ### Phase 5 — Hardening
 
-1. OAuth2 auth provider
-2. Caching layer (LRU in-process, or Redis)
-3. Streaming for long subagent responses
-4. Metrics endpoint (Prometheus)
-5. Docker image
-6. systemd unit file example
-7. Update all docs
-8. Version bump + CHANGELOG
+1. Caching layer (LRU in-process, or Redis)
+2. Streaming for long subagent responses
+3. Metrics endpoint (Prometheus)
+4. Docker image
+5. systemd unit file example
+6. Update all docs
+7. Version bump + CHANGELOG
 
 ## 11. OpenAPI Endpoint Mapping (for ChatGPT Actions)
 

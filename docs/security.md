@@ -32,12 +32,13 @@ when you started using Claude/ChatGPT.
 
 ## Auth
 
-Configured under `auth:` in the YAML config. Three modes are supported:
+Configured under `auth:` in the YAML config. Four modes are supported:
 
 | Mode              | When to use                               | How it checks callers |
 |-------------------|-------------------------------------------|-----------------------|
 | `bearer`          | Normal remote access                      | `Authorization: Bearer <tok>` matched against `tokens.jsonl` |
 | `trusted_header`  | Behind a reverse proxy that authenticates | Reads a header (e.g. `X-Pagefault-User`) and enforces `trusted_proxies` |
+| `oauth2`          | Claude Desktop native SSE (0.7.0+)        | RFC 6749 §4.4 client_credentials grant against `oauth-clients.jsonl`; can run compound with `bearer` as a fallback |
 | `none`            | Local dev / loopback only                 | Every request is treated as `anonymous` |
 
 Tokens are managed by the `pagefault token` subcommand — `create`, `ls`,
@@ -50,6 +51,80 @@ Tokens are managed by the `pagefault token` subcommand — `create`, `ls`,
 - The tokens file is written atomically (temp file + rename) and should be
   mode `0600`.
 
+### OAuth2 client_credentials (0.7.0+)
+
+`mode: "oauth2"` runs an RFC 6749 §4.4 client_credentials grant
+against an operator-managed client registry (`oauth-clients.jsonl`,
+managed by `pagefault oauth-client create / ls / revoke`). The
+provider exists primarily to make pagefault reachable from Claude
+Desktop's native SSE MCP configuration, which only exposes Client
+ID / Client Secret credential fields.
+
+Security-relevant properties of the implementation:
+
+- **Client secrets are bcrypt-hashed** (`golang.org/x/crypto/bcrypt`
+  at `DefaultCost`). The plaintext secret is printed exactly once
+  at `oauth-client create` time and stored only as the hash. A
+  dumped `oauth-clients.jsonl` therefore reveals client IDs +
+  labels + scopes but not the secrets themselves.
+- **Access tokens are 32 bytes of `crypto/rand`**, base64-URL
+  encoded, prefixed `pf_at_` (distinct from the long-lived `pf_`
+  prefix used by bearer tokens). Tokens live in an in-memory map
+  only — they do not persist across server restarts, so a restart
+  is an authoritative way to invalidate every outstanding token.
+- **Token TTL is enforced on lookup.** `Authenticate` compares the
+  stored `ExpiresAt` against `time.Now()` and both rejects the
+  request *and* evicts the entry when expired. A follow-up write
+  lock re-checks before deleting to handle the rare race where
+  another request refreshed the same key. Opportunistic sweeps
+  also run on every `IssueToken` call, bounding memory even if
+  no expired lookups happen.
+- **The two discovery endpoints are intentionally public.** RFC
+  9728 and RFC 8414 require them to be reachable without
+  credentials because clients bootstrap through them *before*
+  they have a token. They advertise only the issuer, token
+  endpoint, supported grants, and supported auth methods — no
+  scope-sensitive or client-sensitive information.
+- **`POST /oauth/token` is outside the bearer middleware.** It
+  authenticates via the client credentials carried in either the
+  Authorization Basic header (RFC 6749 §2.3.1) or the form body
+  (§2.3.2). Credential failure returns RFC 6749 §5.2 error
+  envelopes: 401 + `WWW-Authenticate: Basic` when the client used
+  Basic, 400 when it used form body. The error code is always
+  `invalid_client`; we do not leak whether the failure was
+  "unknown id" vs "wrong secret" to avoid enabling client-id
+  enumeration.
+- **Compound mode** (`oauth2` + populated `bearer.tokens_file`)
+  runs the OAuth2 store first and falls back to the bearer store
+  on no match. The fallback re-uses the existing `BearerTokenAuth`
+  implementation, so audit entries and caller metadata are
+  identical regardless of which store matched. Operators can
+  audit by checking `caller.metadata.auth` — it is `"oauth2"`
+  for OAuth2-issued tokens and absent for legacy bearer tokens.
+- **Scope enforcement is coarse in 0.7.0.** Scopes are attached
+  to issued tokens (as the intersection of the client's allowed
+  set and the caller-requested set) but no tool currently
+  branches on them — any authenticated caller can invoke any
+  enabled tool. Per-scope tool ACLs are a future addition;
+  until then, scope narrowing is primarily a forward-compatibility
+  knob plus an audit trail hint.
+- **Revocation semantics.** `pagefault oauth-client revoke <id>`
+  removes the client record so no new tokens can be issued for
+  that client, but **access tokens that have already been issued
+  remain valid until their TTL expires or the server restarts**.
+  The CLI prints this explicitly after every revoke. For
+  immediate invalidation, restart pagefault.
+- **No refresh tokens, no PKCE, no dynamic client registration**
+  in the 0.7.0 implementation. Claude Desktop re-exchanges
+  client_id/client_secret for a new access token automatically
+  when its cached one expires, so refresh tokens are unnecessary
+  for the target workload. PKCE protects against authorization
+  code interception in the authorization_code flow, which we do
+  not implement. Dynamic client registration would open a
+  zero-auth endpoint that creates privileged records on a
+  single-operator server — operators can register clients via
+  the CLI instead.
+
 Auth middleware is applied to every authenticated route, including both
 MCP transports: streamable-http at `/mcp` and `/mcp/*`, and legacy SSE
 at `GET /sse` + `POST /message?sessionId=...`. Callers that fail auth
@@ -61,13 +136,23 @@ returns `403` if the source IP is not in `trusted_proxies`.
 > middleware re-runs on every HTTP request — the initial `GET /sse` open,
 > every `POST /message?sessionId=…`, every `POST /mcp` tool call — so
 > bearer tokens are validated on every hop and the session ID alone is
-> not a substitute for auth. Claude Desktop sends the `Authorization`
-> header on both the initial SSE GET and subsequent message POSTs, so
-> bearer auth works end-to-end on the SSE transport without any special
-> accommodation. If you find a client that opens a session once and
-> never re-sends its `Authorization` header, that is a client bug and
-> you should report it. Audit log entries will show the caller as
+> not a substitute for auth. A well-behaved MCP client re-sends its
+> `Authorization` header on every request; if you find one that opens
+> a session once and never re-sends it, that is a client bug and you
+> should report it. Audit log entries will show the caller as
 > `anonymous` if the token is missing, which is a useful signal.
+
+> **Claude Desktop caveat (as of 2026-04).** Claude Desktop's built-in
+> SSE configuration UI only exposes **OAuth2 Client ID / Client
+> Secret** fields for extra credentials — it does not expose a way to
+> attach a plain `Authorization: Bearer pf_...` header to the SSE GET.
+> For a bearer-auth deployment of pagefault, the practical paths are
+> (a) use the `npx supergateway --streamableHttp` bridge to inject the
+> bearer header via a local stdio adapter (the supergateway config in
+> `README.md`), or (b) switch to `auth.mode: oauth2` (shipped in 0.7.0)
+> and register a Claude Desktop OAuth2 client via
+> `pagefault oauth-client create`. See the `Auth → OAuth2` section
+> below for the full flow.
 
 ## Sandbox & path traversal
 

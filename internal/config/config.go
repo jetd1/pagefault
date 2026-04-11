@@ -141,11 +141,18 @@ type RateLimitConfig struct {
 
 // AuthConfig configures the authentication layer.
 //
-// Mode selects the provider: "none", "bearer", or "trusted_header".
+// Mode selects the provider: "none", "bearer", "trusted_header", or "oauth2".
+// The "oauth2" mode is a **compound** provider: OAuth2 client_credentials
+// issued access tokens are accepted first, and — if `bearer.tokens_file` is
+// also configured — long-lived bearer tokens from the JSONL store are
+// accepted as a fallback. This lets operators migrate Claude Desktop to
+// OAuth2 without breaking existing Claude Code deployments that rely on
+// static bearer tokens.
 type AuthConfig struct {
-	Mode          string              `yaml:"mode" validate:"required,oneof=none bearer trusted_header"`
+	Mode          string              `yaml:"mode" validate:"required,oneof=none bearer trusted_header oauth2"`
 	Bearer        BearerAuthConfig    `yaml:"bearer,omitempty"`
 	TrustedHeader TrustedHeaderConfig `yaml:"trusted_header,omitempty"`
+	OAuth2        OAuth2Config        `yaml:"oauth2,omitempty"`
 }
 
 // BearerAuthConfig configures bearer-token authentication.
@@ -160,6 +167,63 @@ type BearerAuthConfig struct {
 type TrustedHeaderConfig struct {
 	Header         string   `yaml:"header,omitempty"`
 	TrustedProxies []string `yaml:"trusted_proxies,omitempty"`
+}
+
+// OAuth2Config configures the OAuth2 client_credentials grant provider
+// (shipped in 0.7.0). The minimum viable implementation targets Claude
+// Desktop's native SSE configuration UI, which as of 2026-04 only
+// exposes Client ID / Client Secret fields — no redirect URI, no
+// browser popup, no refresh flow. The provider mounts three public
+// endpoints at the server root:
+//
+//   - GET  /.well-known/oauth-protected-resource   (RFC 9728 pointer)
+//   - GET  /.well-known/oauth-authorization-server (RFC 8414 metadata)
+//   - POST /oauth/token                            (client_credentials)
+//
+// Clients are registered out-of-band via `pagefault oauth-client
+// create`, which appends a bcrypt-hashed secret to ClientsFile.
+type OAuth2Config struct {
+	// ClientsFile is a JSONL file where each line is an OAuth2 client
+	// record (id, label, bcrypt secret_hash, scopes, metadata).
+	// Required when Mode is "oauth2".
+	ClientsFile string `yaml:"clients_file,omitempty"`
+	// Issuer overrides the `iss` value advertised in the RFC 8414
+	// metadata document and the `resource` value in RFC 9728. Empty
+	// falls back to server.public_url, and if that is also empty the
+	// handlers infer the issuer from the incoming request's scheme +
+	// host — works for direct access, may misreport behind a reverse
+	// proxy that rewrites hosts.
+	Issuer string `yaml:"issuer,omitempty"`
+	// AccessTokenTTLSeconds controls how long an issued access token
+	// is valid. Zero means "use the default of 3600 (1 hour)". Claude
+	// Desktop will re-exchange client_id/client_secret for a new
+	// token automatically when its cached one expires, so a short
+	// TTL is safe and limits the blast radius of a leaked token.
+	AccessTokenTTLSeconds int `yaml:"access_token_ttl_seconds,omitempty"`
+	// DefaultScopes is the scope list attached to every newly issued
+	// token when the client does not request any. Empty means
+	// ["mcp"] — a single broad scope that matches the MCP client
+	// ecosystem convention. Fine-grained per-tool scopes are not
+	// supported in 0.7.0.
+	DefaultScopes []string `yaml:"default_scopes,omitempty"`
+}
+
+// AccessTokenTTLOrDefault returns the access token TTL as a Go
+// time.Duration-compatible seconds value, defaulting to 3600.
+func (o OAuth2Config) AccessTokenTTLOrDefault() int {
+	if o.AccessTokenTTLSeconds <= 0 {
+		return 3600
+	}
+	return o.AccessTokenTTLSeconds
+}
+
+// DefaultScopesOrDefault returns the default scope list, falling back
+// to ["mcp"] when none are configured.
+func (o OAuth2Config) DefaultScopesOrDefault() []string {
+	if len(o.DefaultScopes) == 0 {
+		return []string{"mcp"}
+	}
+	return o.DefaultScopes
 }
 
 // BackendConfig is a generic backend configuration. Type-specific fields are

@@ -27,6 +27,10 @@ bash scripts/smoke.sh  # End-to-end smoke test (builds, runs, curls every endpoi
 ./bin/pagefault token create --label "my-device" --tokens-file /tmp/tokens.jsonl
 ./bin/pagefault token ls --tokens-file /tmp/tokens.jsonl
 ./bin/pagefault token revoke <id> --tokens-file /tmp/tokens.jsonl
+# OAuth2 client_credentials (auth.mode: oauth2) — 0.7.0+
+./bin/pagefault oauth-client create --label "Claude Desktop" --clients-file /tmp/oauth-clients.jsonl
+./bin/pagefault oauth-client ls --clients-file /tmp/oauth-clients.jsonl
+./bin/pagefault oauth-client revoke <id> --clients-file /tmp/oauth-clients.jsonl
 ./bin/pagefault --version
 ```
 
@@ -51,6 +55,8 @@ pagefault/
 │       ├── serve_test.go                 # buildDispatcher tests (minimal, unsupported, full Phase-2 stack)
 │       ├── token.go                      # `token create/ls/revoke` subcommands
 │       ├── token_test.go                 # Token CLI: lifecycle, slugify, maskToken, list/resolve
+│       ├── oauth_client.go               # `oauth-client create/ls/revoke` subcommands (0.7.0): manage OAuth2 client_credentials registry, bcrypt secret hashing, prints secret once
+│       ├── oauth_client_test.go          # OAuth-client CLI tests: full lifecycle, duplicate-id, empty list, stored-hash-verifies-printed-secret, resolveClientsFile precedence
 │       ├── tools.go                      # `maps`/`load`/`scan`/`peek`/`fault`/`ps`/`poke` — CLI form of the pf_* tools
 │       └── tools_test.go                 # Tool CLI tests: text/JSON/env/cwd fallback/no-filter/audit redirect/fault/ps/poke
 │
@@ -89,7 +95,9 @@ pagefault/
 │   │
 │   ├── auth/
 │   │   ├── auth.go                       # AuthProvider, Bearer/None/TrustedHeader, middleware
-│   │   └── auth_test.go                  # Auth provider + middleware + token gen tests
+│   │   ├── auth_test.go                  # Auth provider + middleware + token gen tests
+│   │   ├── oauth2.go                     # OAuth2 client_credentials provider (0.7.0): ClientRecord, IssuedToken store, IssueToken/Authenticate, compound-mode fallback
+│   │   └── oauth2_test.go                # OAuth2 provider unit tests (happy/invalid/expired/compound/scope intersection/reload)
 │   │
 │   ├── filter/
 │   │   ├── filter.go                     # CompositeFilter, PathFilter (read + Phase-4 write globs), TagFilter, RedactionFilter
@@ -127,8 +135,10 @@ pagefault/
 │   │   └── mcp_test.go                   # MCP registration + toolResult helper tests (incl. pf_poke)
 │   │
 │   └── server/
-│       ├── server.go                     # chi router, MCP streamable-http + SSE mounts, REST adapter, /health, structured error envelope
+│       ├── server.go                     # chi router, MCP streamable-http + SSE mounts, REST adapter, /health, structured error envelope, oauth2 route mounts when enabled
 │       ├── server_test.go                # Integration tests via httptest (incl. MCP smoke, SSE handshake + roundtrip, instructions, OpenAPI, health probe)
+│       ├── oauth2.go                     # OAuth2 discovery + token endpoints (0.7.0): /.well-known/oauth-protected-resource (RFC 9728), /.well-known/oauth-authorization-server (RFC 8414), POST /oauth/token (client_credentials, Basic + form body)
+│       ├── oauth2_test.go                # OAuth2 HTTP integration: discovery shape, Basic/form/invalid/unsupported/missing-creds paths, end-to-end token → /api/pf_maps, compound mode, unmounted-when-disabled, URL-encoded Basic credential decoding
 │       ├── openapi.go                    # /api/openapi.json spec builder (OpenAPI 3.1.0, live from dispatcher + config)
 │       ├── cors.go                       # CORS middleware (opt-in, per server.cors config)
 │       ├── cors_test.go                  # Preflight + allowed/denied origin tests
@@ -175,7 +185,7 @@ Client → chi router → auth middleware → tool handler → dispatcher
 - **SpawnRequest / prompt templates** — `internal/backend/prompt.go` defines the `SpawnRequest` struct (agent id, task, purpose, time range, target, timeout), the `SpawnPurpose` enum (`retrieve` / `write`), the two default templates, and `ResolvePromptTemplate` + `WrapTask`. Every subagent backend wraps the raw caller content with a resolved template **before** substituting into its command / body template, so fresh subagents are framed as memory retrievers/placers rather than generic Q&A. Three-layer override precedence: per-agent → per-backend → built-in default.
 - **Context** — named, pre-composed bundle of backend resources (YAML-defined).
 - **Filter** — optional path/tag/redaction filter. Can be fully disabled. Phase-4 added `AllowWriteURI` for the write path.
-- **Auth** — bearer token, trusted header, or none.
+- **Auth** — bearer token, trusted header, OAuth2 client_credentials (0.7.0+, `internal/auth/oauth2.go`), or none. OAuth2 mode mounts three public endpoints (`/.well-known/oauth-protected-resource`, `/.well-known/oauth-authorization-server`, `POST /oauth/token`) and runs as a compound provider: it validates issued access tokens first, then falls back to `BearerTokenAuth` when `bearer.tokens_file` is also configured. Clients are registered via `pagefault oauth-client create` and stored with bcrypt secret hashes.
 - **Dispatcher** — central tool router. Holds backends + contexts + filters + audit logger. Exposes `ListContexts`, `GetContext`, `Search`, `Read`, `DeepRetrieve`, `ListAgents`, `Write`, and `DelegateWrite` (Phase-4 write-side twin of `DeepRetrieve` that spawns a subagent with `Purpose=write` so the write-framed prompt template is picked).
 - **Writer** — `internal/write.FilesystemWriter` is the flock-serialised atomic-append primitive behind `pf_poke` mode:direct.
 - **Tools** — pure `HandleX` functions (`internal/tool/*.go`); the server package wraps them for REST and `tool.RegisterMCP` wraps them for mcp-go.

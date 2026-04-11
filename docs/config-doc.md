@@ -226,20 +226,29 @@ case out of the "I don't remember" trap.
 
 ```yaml
 auth:
-  mode: "bearer"                        # "none" | "bearer" | "trusted_header"
+  mode: "bearer"                        # "none" | "bearer" | "trusted_header" | "oauth2"
   bearer:
     tokens_file: "/etc/pagefault/tokens.jsonl"
   trusted_header:
     header: "X-Forwarded-User"
     trusted_proxies: ["127.0.0.1"]
+  oauth2:
+    clients_file: "/etc/pagefault/oauth-clients.jsonl"
+    # issuer: "https://pagefault.example.com"  # optional override
+    # access_token_ttl_seconds: 3600
+    # default_scopes: ["mcp"]
 ```
 
-| Field                   | Type        | Required when        | Notes |
-|-------------------------|-------------|----------------------|-------|
-| `mode`                  | enum        | always               | `none`, `bearer`, or `trusted_header`. |
-| `bearer.tokens_file`    | path        | `mode: bearer`       | JSONL file, one record per line. |
-| `trusted_header.header` | string      | `mode: trusted_header` | Header name carrying the identity. |
-| `trusted_header.trusted_proxies` | string[] | optional         | If set, the remote IP must be in this list. |
+| Field                           | Type     | Required when          | Notes |
+|---------------------------------|----------|------------------------|-------|
+| `mode`                          | enum     | always                 | `none`, `bearer`, `trusted_header`, or `oauth2`. |
+| `bearer.tokens_file`            | path     | `mode: bearer` or compound `oauth2` | JSONL file, one record per line. |
+| `trusted_header.header`         | string   | `mode: trusted_header` | Header name carrying the identity. |
+| `trusted_header.trusted_proxies` | string[] | optional              | If set, the remote IP must be in this list. |
+| `oauth2.clients_file`           | path     | `mode: oauth2`         | JSONL of registered OAuth2 clients. Managed via `pagefault oauth-client create / ls / revoke`. |
+| `oauth2.issuer`                 | URL      | optional               | Override for the `iss` / `authorization_servers` value in the RFC 9728 + RFC 8414 discovery documents. Empty falls back to `server.public_url`, then to the incoming request's scheme + host (honouring `X-Forwarded-Proto` / `X-Forwarded-Host` when present). |
+| `oauth2.access_token_ttl_seconds` | int    | optional               | Access token lifetime in seconds. Default `3600` (1 hour). Claude Desktop re-exchanges its credentials automatically when its cached token expires, so a short TTL is safe and limits the blast radius of a leaked token. |
+| `oauth2.default_scopes`         | string[] | optional               | Scope list attached to newly issued tokens when the caller requests none. Default `["mcp"]` matches the MCP client ecosystem convention. |
 
 ### Token file format (`bearer`)
 
@@ -252,6 +261,132 @@ One JSON object per line, blank lines and `#`-prefixed comment lines allowed:
 ```
 
 Tokens are managed with `pagefault token create / ls / revoke`.
+
+### `mode: oauth2` — client_credentials grant (shipped in 0.7.0)
+
+`mode: "oauth2"` runs an RFC 6749 §4.4 client_credentials provider
+against an operator-managed client registry. It exists to make
+pagefault reachable from Claude Desktop's built-in SSE MCP
+configuration, whose credential UI only exposes **Client ID** and
+**Client Secret** fields — there is no way to attach a plain
+`Authorization: Bearer` header to the SSE GET. Other SSE-capable MCP
+clients benefit from the same endpoints.
+
+When oauth2 mode is active, three new endpoints are mounted on the
+server **outside** the auth middleware (they have to be reachable
+before a token exists):
+
+| Endpoint | Spec | Purpose |
+|---|---|---|
+| `GET /.well-known/oauth-protected-resource` | [RFC 9728](https://datatracker.ietf.org/doc/html/rfc9728) | Points MCP clients at the authorization server for this resource. |
+| `GET /.well-known/oauth-authorization-server` | [RFC 8414](https://datatracker.ietf.org/doc/html/rfc8414) | Advertises the token endpoint, supported grants (`client_credentials`), and supported auth methods (`client_secret_basic`, `client_secret_post`). |
+| `POST /oauth/token` | [RFC 6749 §4.4](https://datatracker.ietf.org/doc/html/rfc6749#section-4.4) | Exchanges client credentials for an opaque access token (default 1-hour TTL). Accepts credentials via HTTP Basic or form body. |
+
+The discovery endpoints are always public; the token endpoint is
+public but authenticates via client credentials rather than bearer
+tokens. The MCP and `/api/*` routes continue to require
+`Authorization: Bearer <access_token>` and are unchanged.
+
+#### Clients file format
+
+One JSON object per line, with a **bcrypt** secret hash. The
+plaintext secret is printed exactly once by `pagefault oauth-client
+create` and is not stored anywhere else:
+
+```jsonl
+# OAuth2 clients — managed via `pagefault oauth-client`
+{"id":"claude-desktop","label":"Claude Desktop","secret_hash":"$2a$10$...","scopes":["mcp"],"metadata":{"created_at":"2026-04-11T00:00:00Z"}}
+```
+
+The CLI workflow mirrors `pagefault token`:
+
+```bash
+pagefault oauth-client create --label "Claude Desktop" --config ./pagefault.yaml
+pagefault oauth-client ls                                --config ./pagefault.yaml
+pagefault oauth-client revoke claude-desktop             --config ./pagefault.yaml
+```
+
+Scopes can be narrowed per-client via `--scopes "mcp mcp.read"`; the
+default is `["mcp"]`. Revoking a client removes future token
+issuance but does NOT invalidate access tokens that have already
+been issued — those remain valid until their TTL expires or the
+server restarts. Restart pagefault if you need immediate
+invalidation.
+
+#### Compound mode (`oauth2` + legacy `bearer`)
+
+Set `auth.mode: oauth2` **and** populate `auth.bearer.tokens_file` at
+the same time. The OAuth2 provider validates issued access tokens
+first, and falls back to the bearer token store on no match. This
+lets operators move Claude Desktop to OAuth2 one client at a time
+while Claude Code (or any other client already using a long-lived
+bearer token) keeps working unchanged. Audit log entries look the
+same either way — the caller id + label come from whichever store
+matched.
+
+#### Worked example: Claude Desktop via native SSE
+
+```yaml
+server:
+  host: "0.0.0.0"
+  port: 8444
+  public_url: "https://pagefault.example.com"
+  mcp:
+    sse_enabled: true
+    # Keepalive pings protect long pf_fault calls against idle
+    # proxy timeouts on the native /sse stream.
+    sse_keepalive: true
+
+auth:
+  mode: "oauth2"
+  oauth2:
+    clients_file: "/etc/pagefault/oauth-clients.jsonl"
+    access_token_ttl_seconds: 3600
+    default_scopes: ["mcp"]
+  bearer:
+    # Claude Code keeps using its static bearer token via this
+    # fallback path; only Claude Desktop needs the OAuth2 flow.
+    tokens_file: "/etc/pagefault/tokens.jsonl"
+```
+
+```bash
+# 1. Register Claude Desktop as an OAuth2 client.
+pagefault oauth-client create --label "Claude Desktop" \
+  --config /etc/pagefault/pagefault.yaml
+#   id:     claude-desktop
+#   label:  Claude Desktop
+#   scopes: mcp
+#   secret: pf_cs_XXXXXXXXXXXXXXXXXXXXXXXX
+#
+#   Record this secret now — it will not be shown again.
+
+# 2. Start pagefault.
+pagefault serve --config /etc/pagefault/pagefault.yaml
+```
+
+Then in Claude Desktop's MCP SSE configuration, set the server URL
+to `https://pagefault.example.com/sse`, paste `claude-desktop` into
+the Client ID field, and paste the printed `pf_cs_...` string into
+the Client Secret field. Claude Desktop will hit
+`POST /oauth/token` with HTTP Basic credentials, receive a
+short-lived bearer token, and attach it to every subsequent
+request. The 0.6.1 SSE keepalive ensures long `pf_fault` calls
+survive idle proxy timeouts.
+
+#### Issuer resolution and reverse proxies
+
+The discovery endpoints advertise an `issuer` URL. Preference:
+
+1. `auth.oauth2.issuer` explicit override
+2. `server.public_url`
+3. Inferred from the incoming request's scheme + host (checking
+   `X-Forwarded-Proto` and `X-Forwarded-Host` headers)
+
+Behind a reverse proxy that rewrites the Host header without
+setting the corresponding `X-Forwarded-*` headers, paths (2) and
+(3) can misreport. Set `auth.oauth2.issuer` explicitly (or at least
+`server.public_url`) for any deployment that clients will reach via
+a proxy.
 
 ---
 

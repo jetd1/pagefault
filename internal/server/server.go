@@ -47,8 +47,13 @@ type Server struct {
 	cfg        *config.Config
 	dispatcher *dispatcher.ToolDispatcher
 	authP      auth.AuthProvider
-	mcpSrv     *mcpserver.MCPServer
-	sseSrv     *mcpserver.SSEServer
+	// oauth2P is the same provider as authP when auth.mode is
+	// "oauth2", stashed as a concrete type so the token endpoint
+	// handler can call IssueToken without a type assertion on
+	// every request. Nil when OAuth2 is not the active mode.
+	oauth2P *auth.OAuth2Provider
+	mcpSrv  *mcpserver.MCPServer
+	sseSrv  *mcpserver.SSEServer
 
 	Handler http.Handler
 }
@@ -130,6 +135,13 @@ func New(cfg *config.Config, d *dispatcher.ToolDispatcher, authP auth.AuthProvid
 		mcpSrv:     mcpSrv,
 		sseSrv:     sseSrv,
 	}
+	// Stash the OAuth2 provider as a concrete pointer so the token
+	// endpoint can call IssueToken directly. Safe because auth.NewProvider
+	// is the only constructor that can return a *OAuth2Provider and
+	// it only does so when Mode == "oauth2".
+	if op, ok := authP.(*auth.OAuth2Provider); ok {
+		s.oauth2P = op
+	}
 
 	r := chi.NewRouter()
 	r.Use(middleware.Recoverer)
@@ -144,6 +156,18 @@ func New(cfg *config.Config, d *dispatcher.ToolDispatcher, authP auth.AuthProvid
 	// can fetch it without a bearer token. The spec itself advertises the
 	// BearerAuth scheme, so downstream calls to /api/pf_* still require auth.
 	r.Get("/api/openapi.json", s.handleOpenAPISpec)
+	// OAuth2 discovery + token endpoints (shipped in 0.7.0). The
+	// discovery endpoints MUST be public so MCP clients can bootstrap
+	// before they have a token; the token endpoint authenticates via
+	// client_credentials (Basic or form body), not via a bearer, so
+	// it also lives outside the auth middleware. Mounted unconditionally
+	// so curl-based operator testing still returns a clean 404 when
+	// OAuth2 isn't enabled — the handlers themselves short-circuit.
+	if s.oauth2P != nil {
+		r.Get("/.well-known/oauth-protected-resource", s.handleOAuthProtectedResource)
+		r.Get("/.well-known/oauth-authorization-server", s.handleOAuthAuthorizationServer)
+		r.Post("/oauth/token", s.handleOAuthToken)
+	}
 
 	// Authenticated endpoints. Rate limiting runs after auth so the
 	// limiter can key on the resolved caller id.
@@ -273,6 +297,11 @@ func (s *Server) handleRoot(w http.ResponseWriter, _ *http.Request) {
 	if s.sseSrv != nil {
 		_, _ = io.WriteString(w, "  GET  /sse                — MCP legacy-SSE stream (Claude Desktop, etc.)\n")
 		_, _ = io.WriteString(w, "  POST /message            — MCP legacy-SSE message endpoint\n")
+	}
+	if s.oauth2P != nil {
+		_, _ = io.WriteString(w, "  GET  /.well-known/oauth-protected-resource   — RFC 9728\n")
+		_, _ = io.WriteString(w, "  GET  /.well-known/oauth-authorization-server — RFC 8414\n")
+		_, _ = io.WriteString(w, "  POST /oauth/token        — OAuth2 client_credentials grant\n")
 	}
 	_, _ = io.WriteString(w, "  POST /api/pf_maps        — list memory regions (contexts)\n")
 	_, _ = io.WriteString(w, "  POST /api/pf_load        — load a region by name\n")

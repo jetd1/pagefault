@@ -299,6 +299,8 @@ func NewProvider(cfg config.AuthConfig) (AuthProvider, error) {
 		return NewBearerTokenAuth(cfg.Bearer.TokensFile)
 	case "trusted_header":
 		return NewTrustedHeaderAuth(cfg.TrustedHeader)
+	case "oauth2":
+		return NewOAuth2Provider(cfg)
 	default:
 		return nil, fmt.Errorf("auth: unknown mode %q", cfg.Mode)
 	}

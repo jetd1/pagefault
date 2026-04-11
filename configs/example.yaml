@@ -69,7 +69,38 @@ server:
     #   description; never set pf_fault.timeout_seconds below 120.
 
 auth:
-  mode: "none"   # for a live deployment, use "bearer" + a tokens file
+  mode: "none"   # for a live deployment, use "bearer" + a tokens file,
+                 # or "oauth2" + an oauth-clients file (see below).
+  #
+  # ── bearer (long-lived tokens from a JSONL file) ─────────
+  # bearer:
+  #   tokens_file: "./tokens.jsonl"
+  #
+  # ── oauth2 (RFC 6749 §4.4 client_credentials grant) ──────
+  # Shipped in 0.7.0. Primarily exists to make pagefault reachable
+  # from Claude Desktop's native SSE MCP configuration, which only
+  # exposes OAuth2 Client ID / Client Secret credential fields and
+  # cannot attach a plain `Authorization: Bearer` header to the
+  # SSE GET. Other SSE-capable MCP clients benefit from the same
+  # endpoints (RFC 9728 / RFC 8414 discovery + /oauth/token).
+  #
+  # When oauth2 is combined with a populated `bearer.tokens_file`,
+  # long-lived bearer tokens continue to work as a fallback — so
+  # Claude Code keeps its existing static token while Claude
+  # Desktop uses the new OAuth2 client. This is the
+  # "compound mode" migration path; see docs/config-doc.md for
+  # details.
+  # mode: "oauth2"
+  # oauth2:
+  #   clients_file: "./oauth-clients.jsonl"  # registered via
+  #                                           # `pagefault oauth-client create`
+  #   # issuer: "https://pagefault.example.com"  # optional; defaults to
+  #                                               # server.public_url or
+  #                                               # inferred from request
+  #   # access_token_ttl_seconds: 3600   # default 3600 (1 hour)
+  #   # default_scopes: ["mcp"]          # default ["mcp"]
+  # bearer:                               # kept alongside so Claude Code
+  #   tokens_file: "./tokens.jsonl"       # keeps using static tokens
 
 # ── Backends ────────────────────────────────────
 

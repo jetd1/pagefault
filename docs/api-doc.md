@@ -176,7 +176,56 @@ the config. The default mode is `bearer`:
 Authorization: Bearer pf_xxx...
 ```
 
-`/health` and `/` are public (no auth required).
+`/health`, `/`, and `/api/openapi.json` are public (no auth required).
+
+### OAuth2 client_credentials (0.7.0+)
+
+When `auth.mode: oauth2` is configured, three additional public
+endpoints are mounted on the root so MCP clients can bootstrap:
+
+| Endpoint | Method | Purpose |
+|---|---|---|
+| `/.well-known/oauth-protected-resource` | GET | [RFC 9728](https://datatracker.ietf.org/doc/html/rfc9728) protected-resource metadata; points at the authorization server. |
+| `/.well-known/oauth-authorization-server` | GET | [RFC 8414](https://datatracker.ietf.org/doc/html/rfc8414) metadata; advertises `token_endpoint`, supported grants, supported auth methods. |
+| `/oauth/token` | POST | [RFC 6749 §4.4](https://datatracker.ietf.org/doc/html/rfc6749#section-4.4) client_credentials grant. |
+
+A typical `POST /oauth/token` exchange looks like:
+
+```
+POST /oauth/token
+Authorization: Basic <base64(client_id:client_secret)>
+Content-Type: application/x-www-form-urlencoded
+
+grant_type=client_credentials
+```
+
+Or with form-body credentials:
+
+```
+POST /oauth/token
+Content-Type: application/x-www-form-urlencoded
+
+grant_type=client_credentials&client_id=claude-desktop&client_secret=pf_cs_...
+```
+
+Success (HTTP 200):
+
+```json
+{
+  "access_token": "pf_at_xxxxxxxxxxxxxxxxxxxxxxxx",
+  "token_type": "Bearer",
+  "expires_in": 3600,
+  "scope": "mcp"
+}
+```
+
+The access token is then attached to every subsequent request as
+`Authorization: Bearer <access_token>`. On credential failure the
+endpoint emits an RFC 6749 §5.2 envelope (`{"error":"invalid_client"}`)
+rather than the pagefault-standard `error.code` shape, because
+OAuth2 clients key on the top-level `error` field. See
+`docs/security.md → Auth → OAuth2 client_credentials` for the
+full cryptographic and revocation model.
 
 ## Common response shapes
 

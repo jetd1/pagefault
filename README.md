@@ -14,12 +14,15 @@ Phases 1–4 ship a Go binary that serves markdown files from a directory,
 answers search via subprocess or HTTP backends, spawns real subagents
 for deep retrieval, writes back through a sandboxed append path or a
 subagent, and exposes the surface over MCP, REST, and the CLI with
-opt-in rate limiting, CORS, and a live OpenAPI spec. Seven tools
-(`pf_maps`, `pf_load`, `pf_scan`, `pf_peek`, `pf_fault`, `pf_ps`,
-`pf_poke`), bearer-token auth, path/tag/redaction filters, and JSONL
-audit logging. Tool names follow a `pf_*` scheme borrowed from Unix
-memory management and kernel debugging — see `docs/api-doc.md` for
-the mapping.
+opt-in rate limiting, CORS, and a live OpenAPI spec. 0.7.0 adds an
+OAuth2 client_credentials auth provider so Claude Desktop's native
+SSE configuration (Client ID + Client Secret only) works without the
+`supergateway` bridge. Seven tools (`pf_maps`, `pf_load`, `pf_scan`,
+`pf_peek`, `pf_fault`, `pf_ps`, `pf_poke`), bearer-token or OAuth2
+auth (compound mode supported), path/tag/redaction filters, and
+JSONL audit logging. Tool names follow a `pf_*` scheme borrowed from
+Unix memory management and kernel debugging — see `docs/api-doc.md`
+for the mapping.
 
 ## Quick start
 
@@ -91,19 +94,60 @@ Restart Claude Code; the `pf_*` tools appear alongside the built-ins.
 Claude Desktop speaks MCP over legacy SSE, not streamable-http.
 pagefault mounts both transports in parallel (`/mcp` for
 streamable-http, `/sse` + `/message` for SSE — they share the same
-tool set, auth chain, and instructions), so the transport choice is
-driven entirely by what Claude Desktop supports.
+tool set, auth chain, and instructions), and as of 0.7.0 also
+ships an OAuth2 client_credentials auth provider so Claude Desktop
+can connect natively without a local bridge.
 
-**The catch:** as of 2026-04 Claude Desktop's built-in SSE
-configuration only accepts **OAuth2 Client ID / Client Secret** as
-credentials — it does not expose a way to attach a plain
-`Authorization: Bearer pf_...` header to the SSE GET. Until
-pagefault ships an OAuth2 auth provider (tracked for Phase 5), the
-practical paths for a bearer-authenticated deployment are:
+Claude Desktop's SSE config UI only exposes two extra credential
+fields: **Client ID** and **Client Secret**. It does not accept a
+plain `Authorization: Bearer pf_...` header. There are two paths,
+depending on how pagefault is authenticated:
 
-**(A) Recommended: the `supergateway` bridge against `/mcp`.** Run
-`npx supergateway` as a local stdio-to-HTTPS adapter that injects
-the bearer header on every request:
+**(A) Recommended (0.7.0+): native SSE with OAuth2.** Switch the
+server to OAuth2 mode and register a Claude Desktop client:
+
+```yaml
+# pagefault.yaml
+auth:
+  mode: "oauth2"
+  oauth2:
+    clients_file: "./oauth-clients.jsonl"
+  bearer:                         # optional: keep legacy bearer
+    tokens_file: "./tokens.jsonl" # tokens alive as a fallback
+```
+
+```bash
+./bin/pagefault oauth-client create \
+  --label "Claude Desktop" \
+  --config ./pagefault.yaml
+# prints:
+#   id:     claude-desktop
+#   label:  Claude Desktop
+#   scopes: mcp
+#   secret: pf_cs_XXXXXXXXXXXXXXXXXXXXXXXX
+#
+# Record this secret now — it will not be shown again.
+```
+
+Then, in Claude Desktop's MCP SSE configuration, set the server
+URL to `https://pagefault.example.com/sse`, paste `claude-desktop`
+into the Client ID field, and paste `pf_cs_...` into the Client
+Secret field. Claude Desktop will hit `POST /oauth/token` with
+those credentials, receive a short-lived access token, and use it
+as a bearer on every subsequent request. The 0.6.1 SSE keepalive
+fix protects the long-lived `/sse` stream against idle proxy
+timeouts, so long `pf_fault` calls survive cleanly.
+
+Because `auth.mode: "oauth2"` runs in **compound mode**, any
+bearer tokens you previously created in `tokens.jsonl` continue
+to work alongside OAuth2 — Claude Code deployments keep their
+existing config and only Claude Desktop needs the new client
+record.
+
+**(B) Fallback: the `supergateway` bridge against `/mcp`.** For
+deployments that have not (yet) enabled OAuth2, `npx supergateway`
+is still the way to inject a bearer header into Claude Desktop's
+request chain:
 
 ```json
 {
@@ -120,41 +164,22 @@ the bearer header on every request:
 }
 ```
 
-This is the only config that works today with plain bearer auth.
-**Important caveat:** long-running `pf_fault` calls on this path
-are vulnerable to intermediate proxy idle timeouts (nginx default
-60s, Node undici `headersTimeout` 60s, Cloudflare free plan 100s).
-The 0.6.1 SSE keepalive fix does *not* help here because the
-traffic flows through `/mcp` (streamable-http), not `/sse`. If you
-run a reverse proxy in front of pagefault, bump its read / idle
-timeout to 300s or more to accommodate long subagent calls.
+**Important caveat for (B):** long-running `pf_fault` calls on
+this path are vulnerable to intermediate proxy idle timeouts
+(nginx default 60s, Node undici `headersTimeout` 60s, Cloudflare
+free plan 100s). The 0.6.1 SSE keepalive fix does *not* help
+here because the traffic flows through `/mcp` (streamable-http),
+not `/sse`. If you run a reverse proxy in front of pagefault and
+use path (B), bump its read / idle timeout to 300s or more. Path
+(A) does not have this issue.
 
-**(B) Aspirational: native SSE when Claude Desktop supports it.**
-For future Claude Desktop versions that accept a plain
-`Authorization` header on the SSE URL, or for any other SSE-capable
-MCP client, the config looks like:
-
-```json
-{
-  "mcpServers": {
-    "pagefault": {
-      "transport": { "type": "sse", "url": "https://pagefault.example.com/sse" },
-      "headers":   { "Authorization": "Bearer pf_your_token_here" }
-    }
-  }
-}
-```
-
-On this path the 0.6.1 SSE keepalive fully protects against idle
-proxy timeouts — no workaround needed.
-
-> **Before 0.6.0:** pagefault only shipped the streamable-http
-> transport, so `supergateway` was literally the only way to
-> connect Claude Desktop at all. 0.6.0 added the native `/sse`
-> transport (which helps OAuth2 clients and non-Claude-Desktop SSE
-> clients); 0.6.1 added the SSE keepalive that makes long tool
-> calls survive proxy timeouts. Bearer-auth Claude Desktop users
-> still need the bridge until OAuth2 ships.
+> **History.** Before 0.6.0 pagefault only shipped the
+> streamable-http transport, so `supergateway` was literally
+> the only way to connect Claude Desktop at all. 0.6.0 added
+> the native `/sse` transport; 0.6.1 added SSE keepalive pings
+> that make long tool calls survive proxy timeouts; 0.7.0
+> added the OAuth2 auth provider that makes Claude Desktop's
+> native SSE config reachable without a local bridge.
 
 ### ChatGPT Custom GPT (Actions)
 
@@ -188,6 +213,33 @@ bash scripts/smoke.sh   # end-to-end smoke test
 - **`CLAUDE.md`** — developer guide for AI agents working on this repo
 
 ## Recent Changes
+
+### 0.7.0 — 2026-04-11
+
+- **OAuth2 client_credentials auth provider.** Shipped to unblock
+  Claude Desktop's native SSE MCP configuration, which as of
+  2026-04 only accepts **Client ID / Client Secret** in its
+  credential UI. New `auth.mode: "oauth2"` runs a full RFC 6749
+  §4.4 client_credentials grant: the three standard endpoints
+  (`GET /.well-known/oauth-protected-resource` per RFC 9728,
+  `GET /.well-known/oauth-authorization-server` per RFC 8414, and
+  `POST /oauth/token` for the grant itself) are mounted as
+  **public** so MCP clients can bootstrap before they have a
+  token. Opaque access tokens are issued with a configurable TTL
+  (default 3600s), held in an in-memory store with lazy expiry,
+  and scoped by intersection of the client's allowed scopes and
+  the caller-requested set. Clients are registered out-of-band
+  via a new `pagefault oauth-client create` CLI subcommand that
+  mirrors `pagefault token`; the client secret is printed exactly
+  once at creation time and stored only as a bcrypt hash
+  afterwards. The provider also runs as a **compound** mode —
+  when `auth.bearer.tokens_file` is populated alongside
+  `auth.oauth2.clients_file`, long-lived static bearer tokens
+  keep working as a fallback, so operators can move Claude
+  Desktop to OAuth2 without breaking Claude Code deployments on
+  the same server. The Claude Desktop connect section below has
+  been rewritten to lead with the native OAuth2 path and keep
+  `supergateway` only as a fallback for bearer-only deployments.
 
 ### 0.6.1 — 2026-04-11
 
@@ -313,36 +365,6 @@ behind a live client.
   the `server.mcp.instructions` operator override for
   installation-specific framing ("where does MY chat history
   live").
-
-### 0.5.1 — 2026-04-11
-
-- **Bug fix: `max_entry_size` now enforced on raw caller content,
-  not post-wrap bytes.** Before 0.5.1 the cap was measured in the
-  filesystem backend *after* `write.FormatEntry` had added its
-  ~40–60 byte header, silently penalising `format: "entry"` callers
-  by the wrapper overhead and breaking the documented "raw and
-  entry share one budget" promise. The check moved up into
-  `handleWriteDirect` and runs against `len(in.Content)` before
-  wrapping. No wire or config schema changes — only oversize
-  edge-case writes behave differently.
-- **Doc drift cleanups.** `configs/example.yaml` no longer marks
-  `pf_poke` as "not yet implemented"; it enables the tool and
-  ships a commented-out Phase-4 write block on the `fs` backend
-  plus a write-filter example. `docs/config-doc.md` now calls out
-  the `write_paths` URI-scheme footgun (patterns must include
-  `memory://…`) and the `max_entry_size: 0` default-rewrite gotcha.
-  `internal/write/writer.go` clarifies that `WriteModeAny`
-  currently only unlocks `format: "raw"` — prepend and overwrite
-  are reserved for a future phase. `plan.md`'s `pf_poke` error
-  table now correctly describes agent-mode timeouts as
-  `200 OK + timed_out: true` instead of `504`.
-- **New known-limitation notes** in `docs/security.md`: the
-  `resolveWritePath` TOCTOU window (single-operator deployments
-  only; a multi-tenant fix needs `openat(O_NOFOLLOW)`), agent-mode
-  writes showing up in the audit log as `tool: "pf_fault"` rather
-  than `"pf_poke"`, and the response-envelope `targets_written`
-  field being reserved but always absent until structured
-  subagent responses ship in Phase 5.
 
 See [`CHANGELOG.md`](CHANGELOG.md) for the full history.
 

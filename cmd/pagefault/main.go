@@ -6,6 +6,9 @@
 //	pagefault token create --label <label> [--config <path>] [--tokens-file <path>]
 //	pagefault token ls                     [--config <path>] [--tokens-file <path>]
 //	pagefault token revoke <id>            [--config <path>] [--tokens-file <path>]
+//	pagefault oauth-client create --label <label> [--id <id>] [--scopes "a b"] [--config <path>] [--clients-file <path>]
+//	pagefault oauth-client ls                     [--config <path>] [--clients-file <path>]
+//	pagefault oauth-client revoke <id>            [--config <path>] [--clients-file <path>]
 //
 //	pagefault maps        [--config] [--no-filter] [--json]
 //	pagefault load <name> [--config] [--format markdown|json] [--no-filter] [--json]
@@ -49,6 +52,11 @@ func main() {
 	case "token":
 		if err := runToken(os.Args[2:]); err != nil {
 			fmt.Fprintf(os.Stderr, "token: %v\n", err)
+			os.Exit(1)
+		}
+	case "oauth-client":
+		if err := runOAuthClient(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "oauth-client: %v\n", err)
 			os.Exit(1)
 		}
 	case "maps":
@@ -101,10 +109,16 @@ func usage() {
 Server:
   pagefault serve --config <path> [--host HOST] [--port PORT]
 
-Tokens:
+Tokens (bearer auth):
   pagefault token create --label <label> [--config <path>] [--tokens-file <path>]
   pagefault token ls                     [--config <path>] [--tokens-file <path>]
   pagefault token revoke <id>            [--config <path>] [--tokens-file <path>]
+
+OAuth2 clients (auth.mode: oauth2):
+  pagefault oauth-client create --label <label> [--id <id>] [--scopes "a b"]
+                                [--config <path>] [--clients-file <path>]
+  pagefault oauth-client ls     [--config <path>] [--clients-file <path>]
+  pagefault oauth-client revoke <id> [--config <path>] [--clients-file <path>]
 
 Tools (local CLI form of pf_maps / pf_load / pf_scan / pf_peek / pf_fault / pf_ps / pf_poke):
   pagefault maps                 — list configured memory regions
