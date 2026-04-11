@@ -1,90 +1,146 @@
-# pagefault
+<h1 align="center">pagefault</h1>
 
-> When your agent hits a context miss, pagefault loads the right page back in.
+<p align="center">
+  <em>When your agent hits a context miss, pagefault loads the right page back in.</em>
+</p>
 
-**pagefault** is a config-driven memory server that exposes personal
-knowledge (files, search indices, agent sessions) to external AI clients via
-**MCP** and **REST**. The metaphor: in an OS a page fault occurs when a
-process accesses memory that isn't resident — the handler fetches it from
-backing store and resumes execution. pagefault does the same for AI agents:
-when they need context they don't have, they fault to this server, which
-loads the right information from configured backends.
+<p align="center">
+  <code>v0.11.2</code>
+  ·
+  <a href="docs/api-doc.md">api</a>
+  ·
+  <a href="docs/architecture.md">architecture</a>
+  ·
+  <a href="docs/config-doc.md">config</a>
+  ·
+  <a href="docs/security.md">security</a>
+  ·
+  <a href="docs/design.md">design</a>
+  ·
+  <a href="CHANGELOG.md">changelog</a>
+</p>
 
-pagefault ships a Go binary that serves markdown files from a
-directory, answers search via subprocess or HTTP backends, spawns
-real subagents for deep retrieval, writes back through a sandboxed
-append path or a subagent, and exposes the surface over MCP
-(streamable-http **and** legacy SSE), REST, and the CLI with opt-in
-rate limiting, CORS, and a live OpenAPI spec. 0.8.0 added the
-MCP-standard **OAuth 2.1 authorization code + PKCE flow** so Claude
-Desktop (and any other browser-based MCP client) can authenticate
-natively without the `supergateway` bridge; 0.9.0 layered **RFC
-7591 Dynamic Client Registration** on top so the remote-connector
-UI can self-register a public client; 0.10.0 reshapes `pf_fault`
-into an **async task model** — the call returns a `task_id`
-immediately, the subagent runs on a detached goroutine, and the
-caller polls `pf_ps(task_id=...)` (30s × 6, ~3 minutes) for the
-result — so HTTP disconnects and proxy timeouts no longer kill
-long retrieval runs. 0.7.0's client_credentials grant remains
-available as a fallback for programmatic clients. Seven tools
-(`pf_maps`, `pf_load`, `pf_scan`, `pf_peek`, `pf_fault`, `pf_ps`,
-`pf_poke`), four auth modes (`none` / `bearer` / `trusted_header`
-/ `oauth2`, the last running compound with `bearer` for
-migration), path/tag/redaction filters, and JSONL audit logging.
-Tool names follow a `pf_*` scheme borrowed from Unix memory
-management and kernel debugging — see `docs/api-doc.md` for the
-mapping.
+---
+
+**pagefault** is a config-driven **memory server for AI agents**. Point it at a directory,
+hand the URL to Claude Code or ChatGPT, and your agent has a memory it didn't have five
+minutes ago. It takes its name from the OS primitive: when a process touches memory that
+isn't resident, the kernel's fault handler quietly fetches the right page from backing
+store and execution resumes. pagefault does the same for LLM agents over MCP, REST, and
+the CLI.
+
+```
+   agent needs a page
+            │
+            ▼
+      ┌───────────┐                ┌──────────────────────┐
+      │   FAULT   │  ─── handler ─▶│  backends            │
+      │ context   │                │   filesystem         │
+      │   miss    │                │   subprocess / http  │
+      └───────────┘                │   subagent-cli / http│
+            ▲                      └──────────┬───────────┘
+            │                                 │
+         resumed ◀─────────── resolved ───────┘
+            (the right page in context)
+```
+
+## Contents
+
+- [At a glance](#at-a-glance)
+- [Quick start](#quick-start)
+- [Tools](#tools)
+- [Transports](#transports)
+- [Clients](#clients)
+  - [Claude Code](#claude-code)
+  - [Claude Desktop](#claude-desktop)
+  - [ChatGPT Custom GPT](#chatgpt-custom-gpt-actions)
+- [Production config](#production-config)
+- [Development](#development)
+- [Documentation](#documentation)
+- [Recent changes](#recent-changes)
+- [License](#license)
+
+## At a glance
+
+| | |
+|---|---|
+| **Tools**          | 7 — `pf_maps`, `pf_load`, `pf_scan`, `pf_peek`, `pf_fault`, `pf_ps`, `pf_poke` |
+| **Transports**     | MCP streamable-http · MCP legacy SSE · REST · CLI                              |
+| **Backends**       | `filesystem` · `subprocess` · `http` · `subagent-cli` · `subagent-http`        |
+| **Auth modes**     | `none` · `bearer` · `trusted_header` · `oauth2`                                |
+| **OAuth2 grants**  | `client_credentials` · `authorization_code` + PKCE · RFC 7591 DCR              |
+| **Filters**        | path globs · tag allow-list · content redaction · write-path sandbox           |
+| **Observability**  | JSONL audit logging · live OpenAPI 3.1 spec · per-backend health probes        |
+| **Runtime**        | single Go binary, no external services, YAML config                            |
+| **Landing site**   | embedded HTML/CSS/JS served at `/` — see [`docs/design.md`](docs/design.md)    |
 
 ## Quick start
 
+From clone to first request in under a minute. No runtime dependencies.
+
 ```bash
-# Build
+# 1. Build
 make build
+./bin/pagefault --version
 
-# Drive the tools directly from the CLI — no server needed
-./bin/pagefault maps --config configs/minimal.yaml
-./bin/pagefault scan pagefault --config configs/minimal.yaml
-./bin/pagefault peek memory://README.md --config configs/minimal.yaml
-./bin/pagefault load demo --config configs/minimal.yaml
+# 2. Drive tools directly from the CLI — no server needed
+./bin/pagefault maps                      --config configs/minimal.yaml
+./bin/pagefault scan pagefault            --config configs/minimal.yaml
+./bin/pagefault peek memory://README.md   --config configs/minimal.yaml
+./bin/pagefault load demo                 --config configs/minimal.yaml
 
-# Or run the server and hit it over HTTP
+# 3. Or run the server and hit it over HTTP
 ./bin/pagefault serve --config configs/minimal.yaml
+```
+
+```bash
 # (in another terminal)
 curl -s http://127.0.0.1:8444/health | jq
 curl -s -X POST http://127.0.0.1:8444/api/pf_maps | jq
 curl -s -X POST http://127.0.0.1:8444/api/pf_scan \
   -H 'Content-Type: application/json' \
   -d '{"query":"pagefault"}' | jq
+
+# 4. Or open the embedded landing page in a browser
+open http://127.0.0.1:8444/          # macOS
+xdg-open http://127.0.0.1:8444/      # Linux
 ```
 
-MCP is served over two transports in parallel when `serve` is
-running: streamable-http at `POST /mcp` (for Claude Code and most
-programmatic clients) and legacy SSE at `GET /sse` + `POST /message`
-(for Claude Desktop and other SSE-only clients). Both share the same
-tool set, auth chain, and instructions — pick the one your client
-speaks. The CLI form (`pagefault peek`, `pagefault scan`, …) is the
-same vocabulary minus the `pf_` prefix — see `docs/api-doc.md` for the
-full reference.
+## Tools
 
-## Creating a production config
+All seven tools are exposed over MCP, REST, and the CLI with identical filter and audit
+semantics. The wire names (`pf_*`) are used for MCP registration, REST routes
+(`/api/pf_*`), YAML config toggles, and audit-log entries; the CLI drops the `pf_`
+prefix because the outer binary already namespaces the verbs.
 
-```bash
-# 1. Start from a template:
-#    - configs/minimal.yaml  — the smallest runnable config (filesystem only)
-#    - configs/example.yaml  — a tour of every backend type, with inline docs
-cp configs/example.yaml pagefault.yaml
+| Wire         | CLI      | Does                                                      | Unix analog         |
+|--------------|----------|-----------------------------------------------------------|---------------------|
+| `pf_maps`    | `maps`   | List available contexts and their resources              | `/proc/self/maps`   |
+| `pf_load`    | `load`   | Load a named, pre-composed context bundle                 | `mmap`              |
+| `pf_scan`    | `scan`   | Search across one or every backend                       | `grep -r`           |
+| `pf_peek`    | `peek`   | Read a single resource by `memory://` URI                 | `cat`               |
+| `pf_fault`   | `fault`  | Spawn a subagent for deep retrieval (async by default)    | page-fault handler  |
+| `pf_ps`      | `ps`     | List configured agents, or poll a task by `task_id`       | `ps`                |
+| `pf_poke`    | `poke`   | Write back through the sandboxed append path              | `write(2)`          |
 
-# 2. Enable bearer auth and point it at a tokens file
-# (see docs/config-doc.md for every field)
+See [`docs/api-doc.md`](docs/api-doc.md) for the full reference (arguments, return
+shapes, CLI flags, error codes).
 
-# 3. Create a token for your first client device
-./bin/pagefault token create --label "Claude Code" --tokens-file ./tokens.jsonl
+## Transports
 
-# 4. Run
-./bin/pagefault serve --config ./pagefault.yaml
-```
+| Transport            | Route                          | Primary use                                     |
+|----------------------|--------------------------------|-------------------------------------------------|
+| MCP streamable-http  | `POST /mcp`                    | Claude Code and most programmatic MCP clients   |
+| MCP legacy SSE       | `GET /sse` + `POST /message`   | Claude Desktop and other SSE-only clients       |
+| REST (OpenAPI 3.1)   | `POST /api/pf_*`               | ChatGPT Custom GPT actions, ad-hoc `curl`       |
+| CLI                  | `./bin/pagefault <verb>`       | Scripts, pipelines, human testing               |
 
-## Connect a client
+Both MCP transports share the same tool set, auth chain, and instructions — pick the one
+your client speaks. The SSE stream is protected against idle proxy timeouts by a
+keepalive ping (0.6.1+). The landing page at `/` gives a visual summary with live
+version.
+
+## Clients
 
 Once `pagefault serve` is running behind TLS (e.g. `https://pagefault.example.com`),
 pointing an AI client at it is one or two commands.
@@ -102,19 +158,15 @@ Restart Claude Code; the `pf_*` tools appear alongside the built-ins.
 
 ### Claude Desktop
 
-Claude Desktop speaks MCP over legacy SSE, not streamable-http.
-pagefault mounts both transports in parallel (`/mcp` for
-streamable-http, `/sse` + `/message` for SSE — they share the same
-tool set, auth chain, and instructions). Claude Desktop uses the
-MCP-standard **OAuth 2.1 authorization code + PKCE flow** to
-authenticate: it opens a browser tab, you approve, and it receives
-a short-lived access token. pagefault 0.8.0 supports this flow
-natively — no bridge required.
+Claude Desktop speaks MCP over legacy SSE, not streamable-http — pagefault mounts both
+transports in parallel so it works out of the box. There are three auth paths:
 
-**(A) Recommended (0.8.0+): native SSE with authorization code + PKCE.**
+> **Recommended:** **(A)** native SSE with authorization code + PKCE.
+> **(B)** and **(C)** are collapsed below for reference.
 
-1. Switch the server to OAuth2 mode and register a client with
-   redirect URIs for Claude Desktop's local callback:
+#### (A) Recommended — authorization code + PKCE *(0.8.0+)*
+
+Switch the server to OAuth2 mode and register a public client:
 
 ```yaml
 # pagefault.yaml
@@ -122,12 +174,9 @@ auth:
   mode: "oauth2"
   oauth2:
     clients_file: "./oauth-clients.jsonl"
-  bearer:                         # optional: keep legacy bearer
-    tokens_file: "./tokens.jsonl" # tokens alive as a fallback
+  bearer:                          # optional: keep legacy bearer tokens
+    tokens_file: "./tokens.jsonl"  # alive as a fallback
 ```
-
-2. Register a client. Claude Desktop is a **public client** (it
-   uses PKCE instead of a client_secret), so pass `--public`:
 
 ```bash
 ./bin/pagefault oauth-client create \
@@ -136,45 +185,36 @@ auth:
   --redirect-uris "http://localhost:3000/callback" \
   --config ./pagefault.yaml
 # prints:
-#   id:     claude-desktop
-#   label:  Claude Desktop
-#   scopes: mcp
-#   redirect_uris: http://localhost:3000/callback
-#   type:   public (PKCE-only, no client_secret)
-#
-# Use the id as the OAuth2 Client ID in your client configuration.
-# This is a public client — no client_secret is needed; PKCE protects the flow.
+#   id:             claude-desktop
+#   label:          Claude Desktop
+#   scopes:         mcp
+#   redirect_uris:  http://localhost:3000/callback
+#   type:           public (PKCE-only, no client_secret)
 ```
 
-3. In Claude Desktop's MCP SSE configuration, set the server URL
-   to `https://pagefault.example.com/sse` and paste
-   `claude-desktop` into the **Client ID** field. Leave the
-   **Client Secret** field empty. When you click connect, Claude
-   Desktop will:
+In Claude Desktop's MCP SSE configuration, point the server URL at
+`https://pagefault.example.com/sse` and paste `claude-desktop` into the **Client ID**
+field. Leave **Client Secret** empty. On connect, Claude Desktop:
 
-   - Fetch `/.well-known/oauth-authorization-server` and discover
-     the `authorization_endpoint`
-   - Generate a PKCE code verifier + challenge
-   - Open your browser to `/oauth/authorize?...` (pagefault
-     auto-approves and redirects back immediately)
-   - Exchange the authorization code for an access token via
-     `POST /oauth/token` with PKCE
-   - Use the token as a bearer on every subsequent request
+1. Fetches `/.well-known/oauth-authorization-server` and discovers the
+   `authorization_endpoint`.
+2. Generates a PKCE code verifier + challenge.
+3. Opens `/oauth/authorize?...` in your browser (pagefault auto-approves and redirects
+   back immediately).
+4. Exchanges the authorization code for an access token via `POST /oauth/token`.
+5. Sends the token as a bearer on every subsequent request.
 
-The 0.6.1 SSE keepalive fix protects the long-lived `/sse` stream
-against idle proxy timeouts, so long `pf_fault` calls survive
-cleanly.
+OAuth2 mode runs as a **compound provider** — bearer tokens in `tokens.jsonl` continue to
+work alongside OAuth2, so existing Claude Code deployments need no config change, only
+Claude Desktop needs the new client record.
 
-Because `auth.mode: "oauth2"` runs in **compound mode**, any
-bearer tokens you previously created in `tokens.jsonl` continue
-to work alongside OAuth2 — Claude Code deployments keep their
-existing config and only Claude Desktop needs the new client
-record.
+<details>
+<summary><strong>(B) Fallback — <code>client_credentials</code> grant</strong> <em>(0.7.0+)</em></summary>
 
-**(B) Fallback: client_credentials grant.** If you prefer the
-older client_credentials flow (where Claude Desktop exchanges a
-static client_id + client_secret for a token without opening a
-browser), register a confidential client instead:
+<br>
+
+For programmatic clients that prefer a static `client_id` + `client_secret` exchange,
+register a confidential client instead (no `--public`, no redirect URIs):
 
 ```bash
 ./bin/pagefault oauth-client create \
@@ -182,15 +222,19 @@ browser), register a confidential client instead:
   --config ./pagefault.yaml
 ```
 
-Then paste `claude-desktop` into the Client ID field and the
-printed `pf_cs_...` secret into the Client Secret field. This
-path does not open a browser tab but only works when Claude
-Desktop sends the `client_credentials` grant type.
+Paste `claude-desktop` into the Client ID field and the printed `pf_cs_...` secret into
+the Client Secret field. No browser tab, but only works when the client sends the
+`client_credentials` grant type.
 
-**(C) Legacy: the `supergateway` bridge against `/mcp`.** For
-deployments that have not (yet) enabled OAuth2, `npx supergateway`
-is still the way to inject a bearer header into Claude Desktop's
-request chain:
+</details>
+
+<details>
+<summary><strong>(C) Legacy — <code>supergateway</code> bridge against <code>/mcp</code></strong></summary>
+
+<br>
+
+For deployments that have not yet enabled OAuth2, `npx supergateway` is still the way to
+inject a bearer header into Claude Desktop's request chain:
 
 ```json
 {
@@ -207,126 +251,147 @@ request chain:
 }
 ```
 
-**Important caveat for (C):** long-running `pf_fault` calls on
-this path are vulnerable to intermediate proxy idle timeouts
-(nginx default 60s, Node undici `headersTimeout` 60s, Cloudflare
-free plan 100s). The 0.6.1 SSE keepalive fix does *not* help
-here because the traffic flows through `/mcp` (streamable-http),
-not `/sse`. If you run a reverse proxy in front of pagefault and
-use path (C), bump its read / idle timeout to 300s or more. Paths
-(A) and (B) do not have this issue.
+> **Caveat.** Long-running `pf_fault` calls on this path are vulnerable to intermediate
+> proxy idle timeouts (nginx default 60s, Node undici `headersTimeout` 60s, Cloudflare
+> free plan 100s). The 0.6.1 SSE keepalive fix does **not** apply — the traffic flows
+> through `/mcp` (streamable-http), not `/sse`. Bump your reverse proxy's read / idle
+> timeout to 300s or more, or switch to path (A) or (B).
 
-> **History.** Before 0.6.0 pagefault only shipped the
-> streamable-http transport, so `supergateway` was literally
-> the only way to connect Claude Desktop at all. 0.6.0 added
-> the native `/sse` transport; 0.6.1 added SSE keepalive pings
-> that make long tool calls survive proxy timeouts; 0.7.0
-> added the OAuth2 client_credentials auth provider; 0.8.0
-> added the authorization code + PKCE flow that Claude Desktop
-> uses natively.
+</details>
+
+<details>
+<summary><strong>History of Claude Desktop support</strong></summary>
+
+<br>
+
+| Version | Change                                                                                    |
+|---------|-------------------------------------------------------------------------------------------|
+| 0.6.0   | Native `/sse` transport added — before this, `supergateway` was the only Desktop option   |
+| 0.6.1   | SSE keepalive pings so long tool calls survive proxy idle timeouts                        |
+| 0.7.0   | OAuth2 `client_credentials` grant                                                         |
+| 0.8.0   | OAuth 2.1 authorization code + PKCE flow — Claude Desktop authenticates natively          |
+| 0.9.0   | RFC 7591 Dynamic Client Registration — remote-connector UI can self-register              |
+
+</details>
 
 ### ChatGPT Custom GPT (Actions)
 
-pagefault publishes a live OpenAPI spec at `/api/openapi.json`. In the
-Custom GPT editor, open **Actions → Import from URL** and paste:
+pagefault publishes a live OpenAPI 3.1 spec at `/api/openapi.json`. In the Custom GPT
+editor, open **Actions → Import from URL** and paste:
 
 ```
 https://pagefault.example.com/api/openapi.json
 ```
 
-Then, under **Authentication**, choose **API Key → Bearer** and paste
-your `pf_...` token. The GPT can now call every enabled `pf_*` tool as
-an Action.
+Under **Authentication**, choose **API Key → Bearer** and paste your `pf_*` token. Every
+enabled `pf_*` tool becomes a Custom GPT Action.
 
-## Tests and linting
+## Production config
 
 ```bash
-make test         # full test suite with race detector
-make lint         # go vet + gofmt check
-make cover        # coverage report (coverage.html)
-bash scripts/smoke.sh   # end-to-end smoke test
+# 1. Start from a template.
+#    configs/minimal.yaml — smallest runnable config (filesystem only)
+#    configs/example.yaml — tour of every backend type, with inline docs
+cp configs/example.yaml pagefault.yaml
+
+# 2. Edit pagefault.yaml: enable bearer auth, point it at a tokens file,
+#    wire up filters and backends. See docs/config-doc.md for every field.
+
+# 3. Create a token for your first client device.
+./bin/pagefault token create \
+  --label "Claude Code" \
+  --tokens-file ./tokens.jsonl
+
+# 4. Run it.
+./bin/pagefault serve --config ./pagefault.yaml
 ```
+
+## Development
+
+```bash
+make build                # build ./bin/pagefault
+make test                 # full test suite (with -race)
+make test-verbose         # verbose test output
+make cover                # coverage report → coverage.html
+make lint                 # go vet + gofmt + staticcheck (if installed)
+make fmt                  # format all Go files
+make run                  # build and run with configs/minimal.yaml
+make clean                # remove build artifacts
+bash scripts/smoke.sh     # end-to-end smoke test
+```
+
+See [`CLAUDE.md`](CLAUDE.md) for the agent-oriented developer guide — directory tree,
+conventions, versioning rules, and the "adding a new X" checklists.
 
 ## Documentation
 
-- **`docs/api-doc.md`** — tool reference for all seven `pf_*` tools (HTTP + CLI)
-- **`docs/config-doc.md`** — full YAML configuration reference
-- **`docs/architecture.md`** — architecture deep dive
-- **`docs/security.md`** — threat model, auth, filters, audit, write safety
-- **`CLAUDE.md`** — developer guide for AI agents working on this repo
-- **`CHANGELOG.md`** — authoritative history of shipped features
+| File                                              | Contents                                                                          |
+|---------------------------------------------------|-----------------------------------------------------------------------------------|
+| [`docs/api-doc.md`](docs/api-doc.md)              | Tool reference for all seven `pf_*` tools (HTTP + CLI)                            |
+| [`docs/config-doc.md`](docs/config-doc.md)        | Full YAML configuration reference                                                 |
+| [`docs/architecture.md`](docs/architecture.md)    | Architecture deep dive — request flow, backend model, transports, OAuth2 wiring   |
+| [`docs/security.md`](docs/security.md)            | Threat model, auth, filters, audit logging, rate limiting, CORS, write safety     |
+| [`docs/design.md`](docs/design.md)                | Design system — concept, voice, color, type, icons, spacing, motion, a11y         |
+| [`CLAUDE.md`](CLAUDE.md)                          | Developer guide for AI agents working on this repo                                |
+| [`CHANGELOG.md`](CHANGELOG.md)                    | Authoritative history of shipped features                                         |
 
-## Recent Changes
+## Recent changes
+
+### 0.11.2 — 2026-04-12
+
+- **README overhaul.** The README has been reorganized and visually tightened —
+  a crisper intro with an ASCII fault-flow diagram, a top-of-page nav strip,
+  a table of contents, an "At a glance" summary, dedicated **Tools** and
+  **Transports** tables, a cleaner **Clients** section where Claude Desktop's
+  three auth paths are collapsed behind `<details>` (the recommended PKCE flow
+  stays front-and-center while the `client_credentials` and `supergateway`
+  fallbacks become reference material), and a **Documentation** links table
+  that now includes `docs/design.md`. No content removed, no commands changed.
 
 ### 0.11.1 — 2026-04-12
 
-- **Two 0.11.0 follow-up fixes.** (1) The landing page's version
-  badge no longer drifts from `VERSION` — `web/index.html` now
-  carries a `{{version}}` sentinel in the three places where
-  the version string appears (nav badge, footer badge,
-  quickstart `pagefault --version` snippet), and
-  `internal/server.New` substitutes it at startup against the
-  injected `Version` variable, serving the rendered bytes
-  through `http.ServeContent` (so Content-Type, Content-Length,
-  Last-Modified, HEAD, and Range handling all stay correct).
-  0.11.0 shipped with `v0.10.1` literally hardcoded in the HTML —
-  cosmetic but embarrassing; this fix makes the class of bug
-  impossible on future bumps. (2) The Go module path has been
-  renamed from `github.com/jet/pagefault` to the vanity path
-  `jetd.one/pagefault`. `go.mod` plus every `import` statement
-  (144 occurrences across 51 Go files) has been rewritten; no
+- **Two 0.11.0 follow-up fixes.** (1) The landing page's version badge no
+  longer drifts from `VERSION` — `web/index.html` now carries a
+  `{{version}}` sentinel in the three places where the version string
+  appears (nav badge, footer badge, quickstart `pagefault --version`
+  snippet), and `internal/server.New` substitutes it at startup against
+  the injected `Version` variable, serving the rendered bytes through
+  `http.ServeContent` (so Content-Type, Content-Length, Last-Modified,
+  HEAD, and Range handling all stay correct). 0.11.0 shipped with
+  `v0.10.1` literally hardcoded in the HTML — cosmetic but embarrassing;
+  this fix makes the class of bug impossible on future bumps. (2) The Go
+  module path has been renamed from `github.com/jet/pagefault` to the
+  vanity path `jetd.one/pagefault`. `go.mod` plus every `import`
+  statement (144 occurrences across 51 Go files) has been rewritten; no
   runtime behaviour changes, and the GitHub hosting URL
-  (`github.com/jetd1/pagefault`) is unchanged. Module path and
-  hosting URL are now correctly treated as two independent
-  identifiers, closing the confusion that caused 0.11.0's
-  initial href bug.
+  (`github.com/jetd1/pagefault`) is unchanged. Module path and hosting
+  URL are now correctly treated as two independent identifiers, closing
+  the confusion that caused 0.11.0's initial href bug.
 
 ### 0.11.0 — 2026-04-12
 
-- **Landing site + design system.** `pagefault serve` now
-  answers `GET /` with a proper HTML landing page instead of
-  the plain-text endpoint dump — hero with an animated
-  `pf_fault` terminal, concept, seven-tool table with inline
-  glyph icons, four-step quickstart, transports, and an ASCII
-  architecture diagram. The static site lives in `web/` as pure
-  HTML / CSS / JS / SVG (no build step) and is embedded into
-  the binary via `//go:embed`, served through
-  `http.FileServerFS` with explicit GET + HEAD routes for each
-  of the five asset paths (`/`, `/styles.css`, `/script.js`,
-  `/favicon.svg`, `/icons.svg`) so it never shadows `/api/*`,
-  `/mcp`, `/sse`, or the OAuth2 surface. Governed by a new
-  `docs/design.md` — eleven sections covering concept, voice,
-  color tokens, typography, iconography, spacing, motion,
-  accessibility, and error-state vocabulary — whose semantic
-  palette maps directly onto the `task.Status` enum so HTML,
-  CLI, and HTTP error envelopes all speak the same color
-  language. The `handleRoot` plain-text endpoint list has been
-  removed; the obsolete `TestServer_SSE_Disabled_RootLandingHidesIt`
-  test (which asserted the old dynamic endpoint list) is
-  deleted, replaced with `TestServer_Root_ServesEmbeddedLanding`
-  and `TestServer_StaticAssets_Served`.
-
-### 0.10.1 — 2026-04-11
-
-- **Three regressions from 0.10.0 fixed.** (1) A panic in any
-  backend `Spawn` method no longer crashes the entire server — the
-  task manager's detached goroutine now recovers panics and
-  converts them into `StatusFailed` tasks (before, the goroutine
-  was outside `net/http`'s panic-recovery reach and an
-  unrecovered panic killed the whole `pagefault` binary). (2)
-  `pf_poke` mode:agent no longer reports failed subagent writes as
-  `{status:"written", result:""}` — the handler now inspects the
-  task snapshot's `Status` field and returns
-  `ErrBackendUnavailable` for `failed` / non-terminal tasks
-  instead of silently losing the content. (3) `pf_poke` mode:agent
-  surfaces caller-cancel-during-Wait as an error rather than a
-  false success. Plus three low-severity nits around the
-  `task.Manager.Wait` TTL-sweep race, task-manager cleanup on
-  `dispatcher.New` failure, and audit-log error wrapping for
-  `GenerateSpawnID`. Regression tests added under `-race`.
+- **Landing site + design system.** `pagefault serve` now answers
+  `GET /` with a proper HTML landing page instead of the plain-text
+  endpoint dump — hero with an animated `pf_fault` terminal, concept,
+  seven-tool table with inline glyph icons, four-step quickstart,
+  transports, and an ASCII architecture diagram. The static site lives
+  in `web/` as pure HTML / CSS / JS / SVG (no build step) and is
+  embedded into the binary via `//go:embed`, served through
+  `http.FileServerFS` with explicit GET + HEAD routes for each of the
+  five asset paths (`/`, `/styles.css`, `/script.js`, `/favicon.svg`,
+  `/icons.svg`) so it never shadows `/api/*`, `/mcp`, `/sse`, or the
+  OAuth2 surface. Governed by a new `docs/design.md` — eleven sections
+  covering concept, voice, color tokens, typography, iconography,
+  spacing, motion, accessibility, and error-state vocabulary — whose
+  semantic palette maps directly onto the `task.Status` enum so HTML,
+  CLI, and HTTP error envelopes all speak the same color language.
+  The `handleRoot` plain-text endpoint list has been removed; the
+  obsolete `TestServer_SSE_Disabled_RootLandingHidesIt` test is
+  deleted, replaced with `TestServer_Root_ServesEmbeddedLanding` and
+  `TestServer_StaticAssets_Served`.
 
 See [`CHANGELOG.md`](CHANGELOG.md) for the full history.
 
 ## License
 
-(Not yet decided. Private code until then.)
+Not yet decided. Private source until then.

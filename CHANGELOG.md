@@ -7,6 +7,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+## 0.11.2 (2026-04-12)
+
+Documentation-only patch. The top-level README has been reorganized
+and visually tightened; no code, config, wire formats, CLI verbs, or
+tool semantics have changed. Every factual claim, command, version
+gate, and URL in the new README was preserved verbatim from the
+0.11.1 README — only structure, hierarchy, and presentation were
+edited.
+
+### Changed
+
+- **`README.md` overhaul.** Restructured for readability without
+  removing content:
+  - Centered `<h1>` / tagline / nav strip at the top, linking to
+    the docs and changelog directly.
+  - Tight 3-sentence intro followed by an ASCII `fault → handler
+    → resolved` flow diagram that mirrors the landing page's
+    concept section, replacing the previous ~25-line wall of
+    version history in prose form.
+  - **Contents** table of navigation anchors.
+  - **At a glance** summary table — tools / transports / backends
+    / auth modes / OAuth2 grants / filters / observability /
+    runtime / landing site — so a new reader can size pagefault
+    up without scrolling.
+  - New **Tools** table (wire · CLI · does · Unix analog) mirroring
+    the landing page's tools table, moved up into the main
+    narrative rather than buried in the intro paragraph.
+  - New **Transports** table (transport · route · primary use).
+  - **Clients** section restructured: Claude Code stays flat, the
+    recommended PKCE flow stays front-and-center under Claude
+    Desktop, and the `client_credentials` fallback plus the
+    `supergateway` legacy bridge are collapsed behind `<details>`
+    so the main flow reads cleanly. A fourth `<details>` block
+    now holds a compact Claude Desktop support history table
+    (0.6.0 → 0.9.0), replacing the free-form "History" blockquote
+    at the bottom of the old section.
+  - **Production config** (renamed from "Creating a production
+    config") with the same numbered walkthrough.
+  - **Development** (renamed from "Tests and linting") expanded
+    to list every `make` target documented in CLAUDE.md's quick
+    reference, and now points at CLAUDE.md for the full developer
+    guide.
+  - **Documentation** list converted to a table and gained a row
+    for `docs/design.md` (added in 0.11.0 but previously
+    un-linked from the README).
+  - Recent Changes now lists 0.11.2, 0.11.1, 0.11.0 — 0.10.1
+    rotated out per the three-most-recent policy in CLAUDE.md.
+
+### Not changed
+
+- Every command, flag, route, port, environment variable, version
+  gate, and URL in the README is identical to the 0.11.1 version.
+- No binary code, server routing, auth logic, tool wiring, wire
+  format, YAML config key, or test assertion was touched.
+
 ## 0.11.1 (2026-04-12)
 
 Two follow-ups to 0.11.0 bundled into one patch release — both of
