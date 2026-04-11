@@ -20,7 +20,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
 	"time"
@@ -35,6 +34,7 @@ import (
 	"github.com/jet/pagefault/internal/dispatcher"
 	"github.com/jet/pagefault/internal/model"
 	"github.com/jet/pagefault/internal/tool"
+	"github.com/jet/pagefault/web"
 )
 
 // Version is injected by cmd/pagefault so the /health endpoint can report it.
@@ -149,9 +149,28 @@ func New(cfg *config.Config, d *dispatcher.ToolDispatcher, authP auth.AuthProvid
 	r.Use(requestLogger)
 	r.Use(corsMiddleware(cfg.Server.CORS))
 
+	// Static landing site served from the embedded `web` package.
+	// Governed by docs/design.md — index.html at `/` plus the
+	// named assets. Served via net/http.FileServerFS so content
+	// types come from the file extension and ETag / Last-Modified
+	// headers are handled by the stdlib. Each asset is registered
+	// as an explicit GET+HEAD pair rather than a catch-all so it
+	// never shadows /api/*, /mcp, /sse, or the OAuth2 routes below.
+	// HEAD matters for link-preview crawlers and proxy probes —
+	// chi.Get does not imply HEAD the way net/http.FileServer does.
+	webAssets := http.FileServerFS(web.Files)
+	static := func(path string) {
+		r.Get(path, webAssets.ServeHTTP)
+		r.Head(path, webAssets.ServeHTTP)
+	}
+	static("/")
+	static("/styles.css")
+	static("/script.js")
+	static("/favicon.svg")
+	static("/icons.svg")
+
 	// Public endpoints (no auth).
 	r.Get("/health", s.handleHealth)
-	r.Get("/", s.handleRoot)
 	// OpenAPI spec is public so importers (ChatGPT Custom GPT Actions, etc.)
 	// can fetch it without a bearer token. The spec itself advertises the
 	// BearerAuth scheme, so downstream calls to /api/pf_* still require auth.
@@ -301,37 +320,6 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		"version":  Version,
 		"backends": backends,
 	})
-}
-
-// handleRoot is a minimal landing page with links to /health and /mcp.
-func (s *Server) handleRoot(w http.ResponseWriter, _ *http.Request) {
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	_, _ = fmt.Fprintf(w, "pagefault %s\n\n", Version)
-	_, _ = io.WriteString(w, "Endpoints:\n")
-	_, _ = io.WriteString(w, "  GET  /health             — health probe\n")
-	_, _ = io.WriteString(w, "  GET  /api/openapi.json   — live OpenAPI 3.1 spec (public)\n")
-	_, _ = io.WriteString(w, "  *    /mcp                — MCP streamable-http (Claude Code, etc.)\n")
-	if s.sseSrv != nil {
-		_, _ = io.WriteString(w, "  GET  /sse                — MCP legacy-SSE stream (Claude Desktop, etc.)\n")
-		_, _ = io.WriteString(w, "  POST /message            — MCP legacy-SSE message endpoint\n")
-	}
-	if s.oauth2P != nil {
-		_, _ = io.WriteString(w, "  GET  /.well-known/oauth-protected-resource   — RFC 9728\n")
-		_, _ = io.WriteString(w, "  GET  /.well-known/oauth-authorization-server — RFC 8414\n")
-		_, _ = io.WriteString(w, "  POST /oauth/token        — OAuth2 token endpoint\n")
-		_, _ = io.WriteString(w, "  GET  /oauth/authorize    — OAuth2 authorization endpoint\n")
-		_, _ = io.WriteString(w, "  POST /oauth/authorize    — OAuth2 consent form handler\n")
-		if s.oauth2P.DCREnabled() {
-			_, _ = io.WriteString(w, "  POST /register             — RFC 7591 dynamic client registration\n")
-		}
-	}
-	_, _ = io.WriteString(w, "  POST /api/pf_maps        — list memory regions (contexts)\n")
-	_, _ = io.WriteString(w, "  POST /api/pf_load        — load a region by name\n")
-	_, _ = io.WriteString(w, "  POST /api/pf_scan        — scan backends for content\n")
-	_, _ = io.WriteString(w, "  POST /api/pf_peek        — peek at a resource by URI\n")
-	_, _ = io.WriteString(w, "  POST /api/pf_fault       — spawn a subagent to answer a query\n")
-	_, _ = io.WriteString(w, "  POST /api/pf_ps          — list configured subagents\n")
-	_, _ = io.WriteString(w, "  POST /api/pf_poke        — poke content back into memory\n")
 }
 
 // ───────────────── REST handler adapter ─────────────────

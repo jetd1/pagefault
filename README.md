@@ -258,6 +258,31 @@ bash scripts/smoke.sh   # end-to-end smoke test
 
 ## Recent Changes
 
+### 0.11.0 — 2026-04-12
+
+- **Landing site + design system.** `pagefault serve` now
+  answers `GET /` with a proper HTML landing page instead of
+  the plain-text endpoint dump — hero with an animated
+  `pf_fault` terminal, concept, seven-tool table with inline
+  glyph icons, four-step quickstart, transports, and an ASCII
+  architecture diagram. The static site lives in `web/` as pure
+  HTML / CSS / JS / SVG (no build step) and is embedded into
+  the binary via `//go:embed`, served through
+  `http.FileServerFS` with explicit GET + HEAD routes for each
+  of the five asset paths (`/`, `/styles.css`, `/script.js`,
+  `/favicon.svg`, `/icons.svg`) so it never shadows `/api/*`,
+  `/mcp`, `/sse`, or the OAuth2 surface. Governed by a new
+  `docs/design.md` — eleven sections covering concept, voice,
+  color tokens, typography, iconography, spacing, motion,
+  accessibility, and error-state vocabulary — whose semantic
+  palette maps directly onto the `task.Status` enum so HTML,
+  CLI, and HTTP error envelopes all speak the same color
+  language. The `handleRoot` plain-text endpoint list has been
+  removed; the obsolete `TestServer_SSE_Disabled_RootLandingHidesIt`
+  test (which asserted the old dynamic endpoint list) is
+  deleted, replaced with `TestServer_Root_ServesEmbeddedLanding`
+  and `TestServer_StaticAssets_Served`.
+
 ### 0.10.1 — 2026-04-11
 
 - **Three regressions from 0.10.0 fixed.** (1) A panic in any
@@ -301,19 +326,6 @@ bash scripts/smoke.sh   # end-to-end smoke test
   write path expects placement confirmation before returning),
   but the spawn still runs on the detached goroutine so proxy
   timeouts no longer kill it.
-
-### 0.9.1 — 2026-04-11
-
-- **0.9.0 follow-up: doc drift + two minor code polish items.**
-  `README.md` Recent Changes and intro paragraph now reflect 0.9.0's
-  DCR; `docs/security.md` updated to cover the fifth public OAuth2
-  endpoint (`POST /register`) in the rate-limiter discussion,
-  including its per-request disk + memory cost. Code polish: the DCR
-  bearer-token gate in `handleOAuthRegister` now uses
-  `subtle.ConstantTimeCompare` (matches the bcrypt / PKCE
-  comparisons elsewhere), and a misleading comment in
-  `isLocalhostOrHTTPS` was rewritten. No behavior change beyond the
-  constant-time compare. See CHANGELOG.md for details.
 
 See [`CHANGELOG.md`](CHANGELOG.md) for the full history.
 

@@ -158,11 +158,20 @@ pagefault/
 │   ├── api-doc.md                        # Tool reference (HTTP + CLI) for all seven `pf_*` tools
 │   ├── config-doc.md                     # Full YAML config reference (incl. filesystem write fields + OAuth2)
 │   ├── architecture.md                   # Architecture deep dive (request flow, backend model, prompt templates, transports, OAuth2 wiring)
-│   └── security.md                       # Threat model, auth (bearer / trusted_header / oauth2 / none), filters, audit, rate limit, CORS, write safety
+│   ├── security.md                       # Threat model, auth (bearer / trusted_header / oauth2 / none), filters, audit, rate limit, CORS, write safety
+│   └── design.md                         # Design system — concept, voice, color, type, icons, spacing, motion, a11y (governs `web/` + any future user-facing surface)
 │
 ├── demo-data/
 │   ├── README.md                         # Sample content for minimal.yaml
 │   └── notes.md                          # Second sample file
+│
+├── web/                                  # Static landing site (governed by docs/design.md) — embedded into the binary via //go:embed and served at / by internal/server
+│   ├── embed.go                          # `package web` — `//go:embed` directive exporting `Files embed.FS` consumed by internal/server
+│   ├── index.html                        # Landing page — hero + concept + tools table (inline glyphs) + quickstart + transports + architecture + outro
+│   ├── styles.css                        # Full stylesheet — design tokens, components, sections, reduced-motion, print
+│   ├── script.js                         # Hero terminal animation (cycles pf_fault → fault → handler → resolved; IntersectionObserver pause, prefers-reduced-motion honored)
+│   ├── favicon.svg                       # Logomark — rounded page w/ diagonal fault slice + inward load chevron; ships `#mark` + `#mark-16` symbols
+│   └── icons.svg                         # Tool-glyph sprite — seven `<symbol>`s (maps/load/scan/peek/fault/ps/poke) referenced via `<use href="./icons.svg#X">`
 │
 └── scripts/
     └── smoke.sh                          # End-to-end smoke test script

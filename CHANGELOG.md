@@ -7,6 +7,101 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+## 0.11.0 (2026-04-12)
+
+First user-facing surface beyond the API. `pagefault serve` now
+answers `GET /` with a proper HTML landing page — hero, concept,
+tools table with inline glyph icons, quickstart, transports, and
+an ASCII architecture diagram — instead of the plain-text endpoint
+dump. Everything lives in the `web/` directory as pure HTML / CSS
+/ JS / SVG with no build step and is embedded into the binary via
+`//go:embed`, so deployment is still "drop one file on a box".
+
+### Added
+
+- **Design system (`docs/design.md`).** Eleven sections defining
+  concept, voice, color tokens, typography, iconography, spacing,
+  motion, accessibility, and error-state vocabulary for every
+  future user-facing surface. The "fault / running / resolved"
+  semantic palette maps directly onto the `task.Status` enum in
+  `internal/task/task.go`, so HTML, CLI output, and HTTP error
+  envelopes all speak the same color language. The `web/` landing
+  site is the first surface built against the doc; any new UI —
+  dashboard, admin panel, future interactive demo — should update
+  the doc first or follow it.
+
+- **Embedded landing site (`web/`).** New `web` Go package with
+  `embed.go` exporting `Files embed.FS` plus five static assets
+  (no build step, openable as `file://` in a browser too):
+  - `index.html` — hero + concept + tools table + quickstart +
+    transports + architecture + outro + footer
+  - `styles.css` — CSS custom-property design tokens, components,
+    responsive breakpoints, `prefers-reduced-motion` compliance,
+    and a print stylesheet
+  - `script.js` — hero terminal animation cycling a canonical
+    `pf_fault` call through `fault → handler → resolved` using a
+    cancellation-token state machine, with IntersectionObserver
+    pause when offscreen and reduced-motion skip-to-end
+  - `favicon.svg` — the pagefault logomark (rounded page with a
+    diagonal "fault" slice at one corner and an inward load
+    chevron), shipping both a full `#mark` symbol and a
+    simplified `#mark-16` favicon preset
+  - `icons.svg` — seven tool-glyph symbols (`#maps`, `#load`,
+    `#scan`, `#peek`, `#fault`, `#ps`, `#poke`) drawn to design
+    doc §5.2, inlined into the tools-table row leading columns
+    via `<use href="./icons.svg#X">`
+
+- **Static asset routes (`internal/server`).** Five explicit GET
+  + HEAD pairs mount the embedded FS on the router: `/` serves
+  `index.html`, and `/styles.css`, `/script.js`, `/favicon.svg`,
+  `/icons.svg` each serve their own file, all through
+  `http.FileServerFS(web.Files)` so content types come from the
+  file extension and conditional requests / range handling come
+  from the stdlib. Each path is registered explicitly rather than
+  as a catch-all so it never shadows `/api/*`, `/mcp`, `/sse`, or
+  the OAuth2 endpoints. HEAD is registered alongside GET because
+  `chi.Get` does not imply HEAD the way `net/http.FileServer`
+  does, and HEAD matters for link-preview crawlers (Slack,
+  Discord, Twitter) and reverse-proxy health probes.
+
+- **Test coverage.** New `TestServer_Root_ServesEmbeddedLanding`
+  asserts the `text/html` content type, the `<!doctype html>`
+  header, the brand / hero anchor, and every `pf_*` tool name on
+  the page. New `TestServer_StaticAssets_Served` is table-driven
+  across all four assets, checking status + content-type + a
+  body substring that proves it's the right file (`--accent` in
+  styles.css, `IntersectionObserver` in script.js,
+  `<symbol id="mark"` in favicon.svg, `<symbol id="fault"` in
+  icons.svg).
+
+### Changed
+
+- **`GET /` serves HTML instead of plain text.** The 30-line
+  plain-text `handleRoot` method in `internal/server/server.go`
+  that emitted a hand-formatted endpoint list has been deleted
+  and replaced with the static file server. Content type flips
+  from `text/plain; charset=utf-8` to `text/html; charset=utf-8`;
+  response body is now the landing site.
+
+- **Obsolete landing-text test deleted.**
+  `TestServer_SSE_Disabled_RootLandingHidesIt` is gone. Its
+  premise — that `/` only mentions `/sse` when SSE is actually
+  mounted — applied to the old plain-text handler that
+  dynamically enumerated the live route set, and does not apply
+  to a static marketing HTML that describes the product. The
+  underlying behavioural property ("SSE disabled → `GET /sse`
+  returns 404") is already covered by
+  `TestServer_SSE_DisabledReturns404` immediately above it, so
+  no coverage is lost.
+
+### Internal
+
+- `CLAUDE.md` directory tree now lists `docs/design.md`, the
+  `web/` package, `web/embed.go`, and every asset file under it.
+  Any new surface added under `web/` (or any new design-governed
+  file added elsewhere) should append itself to both `CLAUDE.md`
+  and the "Surfaces" table in `docs/design.md` §11.
+
 ## 0.10.1 (2026-04-11)
 
 Retrospective-driven fixes for three regressions introduced with the

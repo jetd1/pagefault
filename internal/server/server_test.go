@@ -592,11 +592,56 @@ func TestServer_OpenAPISpec_IncludesPoke(t *testing.T) {
 	assert.True(t, hasOut, "WriteOutput schema should be defined")
 }
 
-func TestServer_Root_Landing_MentionsPoke(t *testing.T) {
+// TestServer_Root_ServesEmbeddedLanding proves `/` is wired to the
+// embedded landing site in the `web` package: the response is HTML,
+// the brand and tagline are present, and every `pf_*` tool is
+// referenced by name in the tools table. This is a smoke test — if
+// it fails after a redesign, rewrite the assertions, don't loosen
+// them.
+func TestServer_Root_ServesEmbeddedLanding(t *testing.T) {
 	ts, _ := newTestServer(t, "none", "")
 	resp, body := get(t, ts, "/", "")
 	assert.Equal(t, http.StatusOK, resp.StatusCode)
-	assert.Contains(t, string(body), "/api/pf_poke")
+	assert.Contains(t, resp.Header.Get("Content-Type"), "text/html",
+		"root should serve HTML, got %q", resp.Header.Get("Content-Type"))
+	s := string(body)
+	assert.Contains(t, s, "<!doctype html>")
+	assert.Contains(t, s, "pagefault")
+	assert.Contains(t, s, "Memory,") // hero headline anchor
+	for _, name := range []string{
+		"pf_maps", "pf_load", "pf_scan", "pf_peek",
+		"pf_fault", "pf_ps", "pf_poke",
+	} {
+		assert.Contains(t, s, name,
+			"tool %q should appear on the landing page", name)
+	}
+}
+
+// TestServer_StaticAssets_Served verifies the four static asset
+// routes served from the embedded `web` package return 200 with the
+// content type the stdlib file server infers from the extension.
+func TestServer_StaticAssets_Served(t *testing.T) {
+	ts, _ := newTestServer(t, "none", "")
+	cases := []struct {
+		path        string
+		wantCTPart  string
+		wantBodyHas string
+	}{
+		{"/styles.css", "text/css", "--accent"},
+		{"/script.js", "javascript", "IntersectionObserver"},
+		{"/favicon.svg", "image/svg+xml", "<symbol id=\"mark\""},
+		{"/icons.svg", "image/svg+xml", "<symbol id=\"fault\""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.path, func(t *testing.T) {
+			resp, body := get(t, ts, tc.path, "")
+			assert.Equal(t, http.StatusOK, resp.StatusCode)
+			assert.Contains(t, resp.Header.Get("Content-Type"), tc.wantCTPart,
+				"content type for %s", tc.path)
+			assert.Contains(t, string(body), tc.wantBodyHas,
+				"body of %s should contain %q", tc.path, tc.wantBodyHas)
+		})
+	}
 }
 
 // TestServer_MCP_Initialize verifies the /mcp endpoint accepts the MCP
@@ -846,45 +891,6 @@ func TestServer_SSE_DisabledReturns404(t *testing.T) {
 	// the streamable-http transport.
 	initBody := doInitializeOverStreamable(t, ts)
 	assert.Contains(t, initBody, "result")
-}
-
-// TestServer_SSE_Disabled_RootLandingHidesIt checks that / only mentions
-// /sse when the SSE transport is actually enabled.
-func TestServer_SSE_Disabled_RootLandingHidesIt(t *testing.T) {
-	dir := t.TempDir()
-	require.NoError(t, os.WriteFile(filepath.Join(dir, "hello.md"), []byte("hi"), 0o600))
-	fsCfg := &config.FilesystemBackendConfig{
-		Name: "fs", Type: "filesystem", Root: dir,
-		Include: []string{"**/*.md"}, URIScheme: "memory", Sandbox: true,
-	}
-	fsBackend, err := backend.NewFilesystemBackend(fsCfg)
-	require.NoError(t, err)
-	d, err := dispatcher.New(dispatcher.Options{
-		Backends: []backend.Backend{fsBackend},
-		Filter:   filter.NewCompositeFilter(),
-		Audit:    audit.NopLogger{},
-	})
-	require.NoError(t, err)
-
-	disabled := false
-	cfg := &config.Config{
-		Server: config.ServerConfig{
-			Host: "127.0.0.1", Port: 0,
-			MCP: config.MCPConfig{SSEEnabled: &disabled},
-		},
-		Auth: config.AuthConfig{Mode: "none"},
-	}
-	p, err := auth.NewProvider(cfg.Auth)
-	require.NoError(t, err)
-	srv, err := New(cfg, d, p)
-	require.NoError(t, err)
-	ts := httptest.NewServer(srv.Handler)
-	defer ts.Close()
-
-	resp, body := get(t, ts, "/", "")
-	require.Equal(t, http.StatusOK, resp.StatusCode)
-	assert.NotContains(t, string(body), "/sse")
-	assert.NotContains(t, string(body), "/message")
 }
 
 // TestServer_SSE_KeepAliveEmitsPing verifies that pagefault enables

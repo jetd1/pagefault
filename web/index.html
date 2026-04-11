@@ -1,0 +1,455 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>pagefault — memory, mapped</title>
+  <meta name="description" content="When your agent hits a context miss, pagefault loads the right page back in. A config-driven memory server for AI agents, over MCP and REST." />
+
+  <link rel="icon" type="image/svg+xml" href="./favicon.svg" />
+
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;700&family=JetBrains+Mono:wght@400;500;700&display=swap" />
+
+  <link rel="stylesheet" href="./styles.css" />
+
+  <meta property="og:title" content="pagefault — memory, mapped" />
+  <meta property="og:description" content="When your agent hits a context miss, pagefault loads the right page back in." />
+  <meta property="og:type" content="website" />
+  <meta name="twitter:card" content="summary_large_image" />
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to main content</a>
+
+  <header class="site-header">
+    <nav class="nav" aria-label="Primary">
+      <a class="brand" href="#top" aria-label="pagefault home">
+        <svg class="brand-mark" width="28" height="28" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+          <use href="./favicon.svg#mark" />
+        </svg>
+        <span class="brand-word">pagefault</span>
+        <span class="brand-cursor" aria-hidden="true">_</span>
+      </a>
+      <ul class="nav-links">
+        <li><a href="#concept">concept</a></li>
+        <li><a href="#tools">tools</a></li>
+        <li><a href="#quickstart">quick start</a></li>
+        <li><a href="#architecture">architecture</a></li>
+      </ul>
+      <div class="nav-meta">
+        <span class="badge badge--version" title="current shipped version">v0.10.1</span>
+        <a class="btn btn--ghost btn--sm" href="https://github.com/jetd1/pagefault" rel="noopener">github ↗</a>
+      </div>
+    </nav>
+  </header>
+
+  <main id="main">
+
+    <!-- ─────────────────────────────────────────────── HERO ─── -->
+    <section class="hero" id="top">
+      <div class="hero__grid">
+        <div class="hero__copy">
+          <p class="hero__eyebrow">
+            <span class="eyebrow-dot" aria-hidden="true"></span>
+            a memory server for ai agents
+          </p>
+          <h1 class="hero__headline">
+            Memory,<br />
+            <span class="hero__headline-accent">mapped.</span>
+          </h1>
+          <p class="hero__lede">
+            When your agent hits a context miss,
+            <strong>pagefault</strong> loads the right page back in
+            from configured backends — no context stuffing, no RAG
+            ceremony, no ticket-driven retrieval service. Seven
+            tools, four transports, one config file.
+          </p>
+          <div class="hero__cta">
+            <a class="btn btn--primary" href="#quickstart">
+              <span>get started</span>
+              <span class="btn-arrow" aria-hidden="true">→</span>
+            </a>
+            <a class="btn btn--ghost" href="https://github.com/jetd1/pagefault" rel="noopener">
+              view on github
+            </a>
+          </div>
+          <dl class="hero__stats" aria-label="at a glance">
+            <div><dt>tools</dt><dd>7</dd></div>
+            <div><dt>transports</dt><dd>4</dd></div>
+            <div><dt>backends</dt><dd>5</dd></div>
+            <div><dt>auth modes</dt><dd>4</dd></div>
+          </dl>
+        </div>
+
+        <!-- Terminal-style animated demo of a pf_fault call. -->
+        <aside class="terminal" aria-label="animated pf_fault demo">
+          <header class="terminal__bar">
+            <span class="terminal__dot terminal__dot--fault" aria-hidden="true"></span>
+            <span class="terminal__dot terminal__dot--running" aria-hidden="true"></span>
+            <span class="terminal__dot terminal__dot--resolved" aria-hidden="true"></span>
+            <span class="terminal__title">pagefault · pf_fault · session 0x7f4a1c</span>
+          </header>
+          <div class="terminal__body" id="terminalBody" aria-live="polite">
+            <!-- JS writes frames here. Non-JS fallback follows. -->
+            <noscript>
+              <div class="terminal-line"><span class="tl-prompt">$</span> pagefault fault &quot;find my notes on virtual memory&quot;</div>
+              <div class="terminal-line tl-dim">→ spawning subagent <span class="mono">pf_sp_9c4d…</span></div>
+              <div class="terminal-line tl-running">→ status: running <span class="mono">pf_tk_7a3f…</span> (elapsed 2.1s)</div>
+              <div class="terminal-line tl-resolved">→ status: done (847 tokens, 2.3s)</div>
+              <div class="terminal-line">    loaded: <span class="mono">memory://notes/os/paging.md</span></div>
+              <div class="terminal-line tl-dim">    loaded: <span class="mono">memory://notes/os/tlb.md</span></div>
+            </noscript>
+          </div>
+          <footer class="terminal__legend">
+            <span><span class="dot dot--fault" aria-hidden="true"></span>fault</span>
+            <span><span class="dot dot--running" aria-hidden="true"></span>running</span>
+            <span><span class="dot dot--resolved" aria-hidden="true"></span>resolved</span>
+          </footer>
+        </aside>
+      </div>
+    </section>
+
+    <!-- ────────────────────────────────────────── CONCEPT ─── -->
+    <section class="section section--concept" id="concept">
+      <div class="section__header">
+        <span class="section__number">§ 01</span>
+        <h2 class="section__title">The name is the spec.</h2>
+      </div>
+      <div class="prose">
+        <p>
+          In an operating system, a <strong>page fault</strong>
+          fires the instant a process touches memory that isn't
+          resident. The CPU raises an exception, the kernel's
+          handler quietly fetches the right page from backing
+          store, and execution resumes — invisible, precise, below
+          the program's awareness. The whole beauty of the
+          mechanism is the split-second of resolution: the gap
+          between <em>&ldquo;I need this&rdquo;</em> and
+          <em>&ldquo;here it is&rdquo;</em> closes without
+          ceremony.
+        </p>
+        <p>
+          pagefault does the same for AI agents. When a model
+          needs context it doesn't have, it faults to this
+          server, which loads the right information from
+          configured backends — files, search indices, spawned
+          subagents — and hands it back. No stuffing the context
+          window with everything a session <em>might</em> need.
+          No elaborate retrieval pipeline to sit between agent
+          and memory. Just the primitive, in the shape the
+          metaphor promises.
+        </p>
+      </div>
+
+      <!-- 3-beat "fault → handler → resolved" mini-diagram -->
+      <ol class="fault-flow" aria-label="page fault resolution flow">
+        <li class="fault-flow__step fault-flow__step--fault">
+          <div class="fault-flow__glyph" aria-hidden="true">01</div>
+          <div class="fault-flow__label">fault</div>
+          <p class="fault-flow__body">
+            agent references a page that isn't in context — a
+            file it hasn't seen, a memory it was never given.
+          </p>
+        </li>
+        <li class="fault-flow__arrow" aria-hidden="true">→</li>
+        <li class="fault-flow__step fault-flow__step--running">
+          <div class="fault-flow__glyph" aria-hidden="true">02</div>
+          <div class="fault-flow__label">handler</div>
+          <p class="fault-flow__body">
+            pagefault picks the right backend, applies filters
+            + redaction, optionally spawns a subagent for deep
+            retrieval, and runs the fetch on a detached
+            goroutine that survives HTTP disconnects.
+          </p>
+        </li>
+        <li class="fault-flow__arrow" aria-hidden="true">→</li>
+        <li class="fault-flow__step fault-flow__step--resolved">
+          <div class="fault-flow__glyph" aria-hidden="true">03</div>
+          <div class="fault-flow__label">resolved</div>
+          <p class="fault-flow__body">
+            the agent receives the page and resumes execution.
+            Every call is audited in JSONL for
+            after-the-fact forensics.
+          </p>
+        </li>
+      </ol>
+    </section>
+
+    <!-- ────────────────────────────────────────────── TOOLS ─── -->
+    <section class="section section--tools" id="tools">
+      <div class="section__header">
+        <span class="section__number">§ 02</span>
+        <h2 class="section__title">Seven tools. One surface.</h2>
+        <p class="section__lede">
+          Tool names follow a <code>pf_*</code> scheme borrowed from
+          Unix memory management and kernel debugging — one verb per
+          primitive, nothing cute. Every tool is exposed over MCP,
+          REST, and the CLI with the same filter and audit
+          semantics.
+        </p>
+      </div>
+
+      <div class="tools-table-wrap">
+        <table class="tools-table">
+          <thead>
+            <tr>
+              <th scope="col">wire</th>
+              <th scope="col">cli</th>
+              <th scope="col">does</th>
+              <th scope="col">unix analog</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td class="mono tool-cell"><svg class="tool-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><use href="./icons.svg#maps" /></svg><span class="t-prefix">pf_</span>maps</td>
+              <td class="mono">maps</td>
+              <td>list available contexts &amp; their resources</td>
+              <td class="mono dim">/proc/self/maps</td>
+            </tr>
+            <tr>
+              <td class="mono tool-cell"><svg class="tool-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><use href="./icons.svg#load" /></svg><span class="t-prefix">pf_</span>load</td>
+              <td class="mono">load</td>
+              <td>load a named, pre-composed context bundle</td>
+              <td class="mono dim">mmap</td>
+            </tr>
+            <tr>
+              <td class="mono tool-cell"><svg class="tool-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><use href="./icons.svg#scan" /></svg><span class="t-prefix">pf_</span>scan</td>
+              <td class="mono">scan</td>
+              <td>search across one or every backend</td>
+              <td class="mono dim">grep -r</td>
+            </tr>
+            <tr>
+              <td class="mono tool-cell"><svg class="tool-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><use href="./icons.svg#peek" /></svg><span class="t-prefix">pf_</span>peek</td>
+              <td class="mono">peek</td>
+              <td>read a single resource by <code>memory://</code> uri</td>
+              <td class="mono dim">cat</td>
+            </tr>
+            <tr>
+              <td class="mono tool-cell"><svg class="tool-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><use href="./icons.svg#fault" /></svg><span class="t-prefix">pf_</span>fault</td>
+              <td class="mono">fault</td>
+              <td>spawn a subagent for deep retrieval, async-by-default</td>
+              <td class="mono dim">page-fault handler</td>
+            </tr>
+            <tr>
+              <td class="mono tool-cell"><svg class="tool-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><use href="./icons.svg#ps" /></svg><span class="t-prefix">pf_</span>ps</td>
+              <td class="mono">ps</td>
+              <td>list agents, or poll a task by <code>task_id</code></td>
+              <td class="mono dim">ps</td>
+            </tr>
+            <tr>
+              <td class="mono tool-cell"><svg class="tool-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><use href="./icons.svg#poke" /></svg><span class="t-prefix">pf_</span>poke</td>
+              <td class="mono">poke</td>
+              <td>write back through the sandboxed append path</td>
+              <td class="mono dim">write(2)</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p class="footnote">
+        Seven tools, memorable names, clean namespace. See
+        <a href="https://github.com/jetd1/pagefault/blob/main/docs/api-doc.md" rel="noopener">
+          <code>docs/api-doc.md</code>
+        </a>
+        for the full reference.
+      </p>
+    </section>
+
+    <!-- ───────────────────────────────────────── QUICKSTART ─── -->
+    <section class="section section--quickstart" id="quickstart">
+      <div class="section__header">
+        <span class="section__number">§ 03</span>
+        <h2 class="section__title">Quick start.</h2>
+        <p class="section__lede">
+          From clone to first request in under a minute. The
+          binary is a single Go file with no runtime dependencies.
+        </p>
+      </div>
+
+      <ol class="steps">
+        <li class="step">
+          <div class="step__marker">01</div>
+          <div class="step__body">
+            <h3 class="step__title">Build the binary.</h3>
+            <pre class="code-block"><code><span class="c-prompt">$</span> <span class="c-cmd">make</span> build
+<span class="c-prompt">$</span> <span class="c-cmd">./bin/pagefault</span> --version
+pagefault 0.10.1</code></pre>
+          </div>
+        </li>
+        <li class="step">
+          <div class="step__marker">02</div>
+          <div class="step__body">
+            <h3 class="step__title">Drive tools from the CLI — no server needed.</h3>
+            <pre class="code-block"><code><span class="c-prompt">$</span> <span class="c-cmd">./bin/pagefault</span> maps --config configs/minimal.yaml
+<span class="c-prompt">$</span> <span class="c-cmd">./bin/pagefault</span> scan pagefault --config configs/minimal.yaml
+<span class="c-prompt">$</span> <span class="c-cmd">./bin/pagefault</span> peek memory://README.md \
+    --config configs/minimal.yaml</code></pre>
+          </div>
+        </li>
+        <li class="step">
+          <div class="step__marker">03</div>
+          <div class="step__body">
+            <h3 class="step__title">Or run the server and hit it over HTTP.</h3>
+            <pre class="code-block"><code><span class="c-prompt">$</span> <span class="c-cmd">./bin/pagefault</span> serve --config configs/minimal.yaml
+<span class="c-prompt">$</span> <span class="c-cmd">curl</span> -s http://127.0.0.1:8444/health | jq
+<span class="c-prompt">$</span> <span class="c-cmd">curl</span> -s -X POST http://127.0.0.1:8444/api/pf_scan \
+    -H <span class="c-str">'Content-Type: application/json'</span> \
+    -d <span class="c-str">'{"query":"pagefault"}'</span> | jq</code></pre>
+          </div>
+        </li>
+        <li class="step">
+          <div class="step__marker">04</div>
+          <div class="step__body">
+            <h3 class="step__title">Wire it into Claude Code.</h3>
+            <pre class="code-block"><code><span class="c-prompt">$</span> <span class="c-cmd">claude</span> mcp add pagefault \
+    --transport http \
+    --url https://pagefault.example.com/mcp \
+    --header <span class="c-str">"Authorization: Bearer pf_your_token_here"</span></code></pre>
+            <p class="step__note">
+              Claude Desktop uses legacy SSE and the OAuth 2.1
+              authorization-code + PKCE flow out of the box — see
+              <code>README.md</code> for the full walkthrough.
+            </p>
+          </div>
+        </li>
+      </ol>
+    </section>
+
+    <!-- ───────────────────────────────────────── TRANSPORTS ─── -->
+    <section class="section section--transports">
+      <div class="section__header">
+        <span class="section__number">§ 04</span>
+        <h2 class="section__title">Every transport your client speaks.</h2>
+      </div>
+      <ul class="transport-grid">
+        <li class="transport-card">
+          <div class="transport-card__head">
+            <span class="transport-card__label">mcp</span>
+            <span class="badge">streamable-http</span>
+          </div>
+          <div class="transport-card__route">POST /mcp</div>
+          <p>For Claude Code and most programmatic MCP clients. The default.</p>
+        </li>
+        <li class="transport-card">
+          <div class="transport-card__head">
+            <span class="transport-card__label">mcp</span>
+            <span class="badge">sse</span>
+          </div>
+          <div class="transport-card__route">GET /sse + POST /message</div>
+          <p>Legacy SSE for Claude Desktop and other SSE-only clients. Keepalive pings survive proxy idle timeouts.</p>
+        </li>
+        <li class="transport-card">
+          <div class="transport-card__head">
+            <span class="transport-card__label">rest</span>
+            <span class="badge">openapi 3.1</span>
+          </div>
+          <div class="transport-card__route">POST /api/pf_*</div>
+          <p>Live OpenAPI spec at <code>/api/openapi.json</code> — paste the URL into a ChatGPT Custom GPT and every tool becomes an Action.</p>
+        </li>
+        <li class="transport-card">
+          <div class="transport-card__head">
+            <span class="transport-card__label">cli</span>
+            <span class="badge">local</span>
+          </div>
+          <div class="transport-card__route">./bin/pagefault &lt;verb&gt;</div>
+          <p>Same vocabulary, minus the <code>pf_</code> prefix. No server required — handy for scripts and pipelines.</p>
+        </li>
+      </ul>
+    </section>
+
+    <!-- ─────────────────────────────────────── ARCHITECTURE ─── -->
+    <section class="section section--arch" id="architecture">
+      <div class="section__header">
+        <span class="section__number">§ 05</span>
+        <h2 class="section__title">Under the hood.</h2>
+        <p class="section__lede">
+          A single <code>chi</code> router, an auth middleware, a
+          tool dispatcher, and a set of backends pluggable through
+          YAML. The detached task manager runs every
+          <code>pf_fault</code> spawn on a goroutine outside the
+          caller's HTTP request, so proxy timeouts and client
+          disconnects no longer kill long retrievals.
+        </p>
+      </div>
+
+      <pre class="ascii-diagram" aria-label="request flow diagram">
+ ┌────────────────────────────────────────────────────────────┐
+ │  clients   claude code   ·   claude desktop   ·   curl     │
+ └───┬──────────────┬───────────────┬──────────────────┬─────┘
+     │ /mcp         │ /sse /message │ /api/pf_*        │ cli
+     ▼              ▼               ▼                  ▼
+ ┌────────────────────────────────────────────────────────────┐
+ │  chi router · cors · ratelimit · recover · logger          │
+ │  ┌──────────────────────────────────────────────────────┐  │
+ │  │  auth    bearer · trusted_header · oauth2 · none     │  │
+ │  └───────────────────────┬──────────────────────────────┘  │
+ │                          ▼                                 │
+ │  ┌──────────────────────────────────────────────────────┐  │
+ │  │  tool dispatcher                                     │  │
+ │  │    pf_maps  pf_load  pf_scan  pf_peek                │  │
+ │  │    pf_fault ┄┄┄ async ┄┄┄ task manager               │  │
+ │  │    pf_ps    pf_poke                                  │  │
+ │  └──────┬───────────┬──────────────┬────────────────────┘  │
+ │         ▼           ▼              ▼                       │
+ │     filter       audit        backends                     │
+ │   path / tag    jsonl    fs · subproc · http               │
+ │   redaction              · subagent-cli · subagent-http    │
+ └────────────────────────────────────────────────────────────┘</pre>
+
+      <p class="footnote">
+        Full walkthrough in
+        <a href="https://github.com/jetd1/pagefault/blob/main/docs/architecture.md" rel="noopener">
+          <code>docs/architecture.md</code>
+        </a>.
+      </p>
+    </section>
+
+    <!-- ──────────────────────────────────────────── OUTRO ─── -->
+    <section class="section section--outro">
+      <div class="outro">
+        <p class="outro__tagline">
+          <span aria-hidden="true">{&nbsp;</span>
+          memory, mapped.
+          <span aria-hidden="true">&nbsp;}</span>
+        </p>
+        <p class="outro__sub">
+          pagefault is a single-binary Go server. Point it at a
+          directory, give it a token, and your agent has a memory
+          it didn't have five minutes ago.
+        </p>
+        <div class="outro__cta">
+          <a class="btn btn--primary" href="https://github.com/jetd1/pagefault" rel="noopener">
+            <span>read the source</span>
+            <span class="btn-arrow" aria-hidden="true">→</span>
+          </a>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <div class="site-footer__inner">
+      <div class="site-footer__brand">
+        <svg width="20" height="20" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+          <use href="./favicon.svg#mark" />
+        </svg>
+        <span class="mono">pagefault</span>
+        <span class="badge badge--version">v0.10.1</span>
+      </div>
+      <ul class="site-footer__links">
+        <li><a href="https://github.com/jetd1/pagefault" rel="noopener">source</a></li>
+        <li><a href="https://github.com/jetd1/pagefault/blob/main/docs/api-doc.md" rel="noopener">api</a></li>
+        <li><a href="https://github.com/jetd1/pagefault/blob/main/docs/architecture.md" rel="noopener">architecture</a></li>
+        <li><a href="https://github.com/jetd1/pagefault/blob/main/docs/security.md" rel="noopener">security</a></li>
+        <li><a href="https://github.com/jetd1/pagefault/blob/main/CHANGELOG.md" rel="noopener">changelog</a></li>
+      </ul>
+      <p class="site-footer__note">
+        private source until a license is decided. built in go.
+      </p>
+    </div>
+  </footer>
+
+  <script src="./script.js" defer></script>
+</body>
+</html>
