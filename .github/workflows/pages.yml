@@ -1,0 +1,93 @@
+name: Pages
+
+# Deploy the embedded landing site to GitHub Pages. Runs on every
+# push to main that touches the `web/` directory, the `VERSION`
+# file, or the workflow itself. Can also be triggered manually
+# from the Actions tab.
+#
+# One-time setup (required before the first run):
+#   Settings → Pages → Source: "GitHub Actions"
+#
+# The static site lives in `web/` and is canonically served two
+# ways: (1) by the `pagefault serve` binary via
+# `internal/server.New` → `http.ServeContent`, which substitutes
+# the `{{version}}` sentinel at server startup against the
+# injected `Version` variable, and (2) here, where CI substitutes
+# the same sentinel before upload because GitHub Pages serves
+# static files as-is. Keeping a single source of truth (the
+# sentinel in committed HTML) avoids the need for a client-side
+# JS fallback and the flash-of-raw-sentinel that would come with
+# it. See docs/design.md §11 and CHANGELOG.md 0.11.1.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'web/**'
+      - 'VERSION'
+      - '.github/workflows/pages.yml'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Allow one concurrent deploy; don't cancel an in-progress run
+# so a rapid-fire push sequence still deploys the last state.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Build & deploy landing site
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build static site with version substitution
+        run: |
+          set -euo pipefail
+          VERSION="$(tr -d '[:space:]' < VERSION)"
+          if [ -z "${VERSION}" ]; then
+            echo "::error::VERSION file is empty"
+            exit 1
+          fi
+          echo "Building pagefault landing site for version: ${VERSION}"
+          mkdir -p _site
+          cp web/index.html \
+             web/styles.css \
+             web/script.js \
+             web/favicon.svg \
+             web/icons.svg \
+             _site/
+          # Substitute the {{version}} sentinel — the Go binary does
+          # this at server startup via bytes.ReplaceAll; CI has to
+          # do it before upload because GitHub Pages serves static
+          # files as-is. Fail loudly if substitution leaves anything
+          # behind so we catch "forgot to add a new sentinel to the
+          # sed" bugs early.
+          sed -i "s|{{version}}|${VERSION}|g" _site/index.html
+          if grep -q '{{version}}' _site/index.html; then
+            echo "::error::version sentinel still present after substitution"
+            grep -n '{{version}}' _site/index.html || true
+            exit 1
+          fi
+          echo "::notice::landing site built; size: $(wc -c < _site/index.html) bytes"
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+      - name: Deploy to GitHub Pages
+        id: deploy
+        uses: actions/deploy-pages@v4

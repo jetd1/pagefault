@@ -5,7 +5,9 @@
 </p>
 
 <p align="center">
-  <code>v0.11.2</code>
+  <code>v0.11.3</code>
+  ·
+  <a href="https://jetd1.github.io/pagefault/"><strong>live preview</strong> ↗</a>
   ·
   <a href="docs/api-doc.md">api</a>
   ·
@@ -18,6 +20,14 @@
   <a href="docs/design.md">design</a>
   ·
   <a href="CHANGELOG.md">changelog</a>
+</p>
+
+<p align="center">
+  <sub>
+    the embedded landing site is <a href="https://jetd1.github.io/pagefault/">auto-deployed to GitHub Pages</a>
+    on every push to <code>main</code> via <a href=".github/workflows/pages.yml"><code>.github/workflows/pages.yml</code></a>,
+    with the <code>{{version}}</code> sentinel rewritten against the current <code>VERSION</code> at build time
+  </sub>
 </p>
 
 ---
@@ -72,7 +82,7 @@ the CLI.
 | **Filters**        | path globs · tag allow-list · content redaction · write-path sandbox           |
 | **Observability**  | JSONL audit logging · live OpenAPI 3.1 spec · per-backend health probes        |
 | **Runtime**        | single Go binary, no external services, YAML config                            |
-| **Landing site**   | embedded HTML/CSS/JS served at `/` — see [`docs/design.md`](docs/design.md)    |
+| **Landing site**   | embedded HTML/CSS/JS served at `/` by the binary + auto-deployed to [GitHub Pages](https://jetd1.github.io/pagefault/) — see [`docs/design.md`](docs/design.md) |
 
 ## Quick start
 
@@ -337,6 +347,22 @@ conventions, versioning rules, and the "adding a new X" checklists.
 
 ## Recent changes
 
+### 0.11.3 — 2026-04-12
+
+- **Landing site auto-deployed to GitHub Pages.** New
+  `.github/workflows/pages.yml` triggers on every push to `main`
+  that touches `web/**` or `VERSION`, copies the five static
+  assets into a build directory, substitutes the `{{version}}`
+  sentinel against the current `VERSION` via `sed` (mirroring
+  what `internal/server.New` does at binary startup), and
+  deploys the result via the official `actions/deploy-pages@v4`
+  action. The workflow fails loudly if the substitution leaves
+  a literal sentinel behind, so "forgot to update the sed" bugs
+  surface at deploy time instead of in production. The README
+  nav strip now links directly to
+  [the live preview](https://jetd1.github.io/pagefault/). One-time
+  setup: Settings → Pages → Source: GitHub Actions.
+
 ### 0.11.2 — 2026-04-12
 
 - **README overhaul.** The README has been reorganized and visually tightened —
@@ -367,28 +393,6 @@ conventions, versioning rules, and the "adding a new X" checklists.
   (`github.com/jetd1/pagefault`) is unchanged. Module path and hosting
   URL are now correctly treated as two independent identifiers, closing
   the confusion that caused 0.11.0's initial href bug.
-
-### 0.11.0 — 2026-04-12
-
-- **Landing site + design system.** `pagefault serve` now answers
-  `GET /` with a proper HTML landing page instead of the plain-text
-  endpoint dump — hero with an animated `pf_fault` terminal, concept,
-  seven-tool table with inline glyph icons, four-step quickstart,
-  transports, and an ASCII architecture diagram. The static site lives
-  in `web/` as pure HTML / CSS / JS / SVG (no build step) and is
-  embedded into the binary via `//go:embed`, served through
-  `http.FileServerFS` with explicit GET + HEAD routes for each of the
-  five asset paths (`/`, `/styles.css`, `/script.js`, `/favicon.svg`,
-  `/icons.svg`) so it never shadows `/api/*`, `/mcp`, `/sse`, or the
-  OAuth2 surface. Governed by a new `docs/design.md` — eleven sections
-  covering concept, voice, color tokens, typography, iconography,
-  spacing, motion, accessibility, and error-state vocabulary — whose
-  semantic palette maps directly onto the `task.Status` enum so HTML,
-  CLI, and HTTP error envelopes all speak the same color language.
-  The `handleRoot` plain-text endpoint list has been removed; the
-  obsolete `TestServer_SSE_Disabled_RootLandingHidesIt` test is
-  deleted, replaced with `TestServer_Root_ServesEmbeddedLanding` and
-  `TestServer_StaticAssets_Served`.
 
 See [`CHANGELOG.md`](CHANGELOG.md) for the full history.
 

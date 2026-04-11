@@ -7,6 +7,78 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+## 0.11.3 (2026-04-12)
+
+The embedded landing site is now auto-deployed to GitHub Pages so
+the README can link to a live preview. No binary or wire-surface
+changes; this is strictly deploy-time infrastructure.
+
+### Added
+
+- **`.github/workflows/pages.yml`** — GitHub Actions workflow that
+  builds and deploys the static landing site to GitHub Pages on
+  every push to `main` that touches `web/**` or `VERSION`, plus a
+  `workflow_dispatch` hook for manual runs. Implementation:
+  1. Checkout at the commit being pushed.
+  2. Copy `web/index.html`, `web/styles.css`, `web/script.js`,
+     `web/favicon.svg`, `web/icons.svg` into a `_site/` build
+     directory.
+  3. `sed` replace the `{{version}}` sentinel in
+     `_site/index.html` against the trimmed contents of
+     `VERSION` — the same substitution
+     `internal/server.New` does at binary startup via
+     `bytes.ReplaceAll`, just running in a different place
+     because GitHub Pages serves static files as-is.
+  4. Fail the job loudly if any literal `{{version}}` survives
+     substitution (defends against adding a new sentinel site
+     without updating the workflow).
+  5. Upload + deploy via the official
+     `actions/configure-pages@v5` +
+     `actions/upload-pages-artifact@v3` +
+     `actions/deploy-pages@v4` chain.
+  Concurrency is `group: pages, cancel-in-progress: false`, so a
+  rapid-fire push sequence still deploys the latest state.
+  Permissions are the minimum Pages needs: `contents: read`,
+  `pages: write`, `id-token: write`.
+
+- **README live-preview link.** The README header nav strip now
+  has a `live preview ↗` link pointing at
+  `https://jetd1.github.io/pagefault/`. The sub-line under the
+  strip explains the auto-deploy pipeline and links to the
+  workflow file. The "Landing site" row in the At-a-glance
+  table was expanded to mention both serving contexts — the
+  binary and GitHub Pages.
+
+- **Design system surfaces table.** `docs/design.md` §11 now
+  lists the landing site twice: once under the binary
+  (`web/` + `internal/server/server.go`, runtime substitution)
+  and once under GitHub Pages (`web/` +
+  `.github/workflows/pages.yml`, CI substitution). Single
+  source of truth, two render contexts, both substitute the
+  sentinel.
+
+### Setup note
+
+GitHub Pages must be enabled before the workflow can deploy:
+**Settings → Pages → Source: "GitHub Actions"**. This is a
+one-time manual step per repository; subsequent pushes will
+deploy automatically. Until Pages is enabled, the
+`actions/deploy-pages@v4` step will error; the build and
+substitution steps preceding it still succeed, so the diff can
+be reviewed end-to-end before the Pages setting is flipped.
+
+### Not changed
+
+- No Go code, no binary behaviour, no wire format.
+- The `web/` source files are identical to 0.11.2 — the sentinel
+  still lives in `web/index.html` as it did before.
+- `internal/server/server.go`'s startup substitution still runs
+  for the binary-served case; the CI substitution runs for
+  GitHub Pages. Both render the same result against the same
+  `VERSION` file.
+- The GitHub hosting URL (`github.com/jetd1/pagefault`) and the
+  Go module path (`jetd.one/pagefault`) are unchanged.
+
 ## 0.11.2 (2026-04-12)
 
 Documentation-only patch. The top-level README has been reorganized

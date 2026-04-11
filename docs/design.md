@@ -303,13 +303,14 @@ Map semantic colors to the `task.Status` values from the codebase:
 Everything user-facing that ships today, and the design files that
 govern it:
 
-| Surface                        | Lives in                             | Style source |
-|--------------------------------|--------------------------------------|--------------|
-| Landing site                   | `web/index.html` + `web/styles.css`  | this doc     |
-| CLI output (color, formatting) | `cmd/pagefault/tools.go`             | this doc §10 |
-| Error envelopes (HTTP)         | `internal/server/server.go`          | this doc §10 |
-| MCP tool descriptions          | `internal/tool/mcp.go`               | this doc §2  |
-| OpenAPI titles & descriptions  | `internal/server/openapi.go`         | this doc §2  |
+| Surface                        | Lives in                                                    | Style source |
+|--------------------------------|-------------------------------------------------------------|--------------|
+| Landing site (binary)          | `web/` + `internal/server/server.go` (runtime `{{version}}` sub) | this doc |
+| Landing site (GitHub Pages)    | `web/` + `.github/workflows/pages.yml` (CI `{{version}}` sub)    | this doc |
+| CLI output (color, formatting) | `cmd/pagefault/tools.go`                                    | this doc §10 |
+| Error envelopes (HTTP)         | `internal/server/server.go`                                 | this doc §10 |
+| MCP tool descriptions          | `internal/tool/mcp.go`                                      | this doc §2  |
+| OpenAPI titles & descriptions  | `internal/server/openapi.go`                                | this doc §2  |
 
 When we add a surface, add a row here. When a surface drifts from
 this doc, the doc wins — either fix the surface or propose an

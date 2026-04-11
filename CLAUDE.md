@@ -42,12 +42,16 @@ bash scripts/smoke.sh  # End-to-end smoke test (builds, runs, curls every endpoi
 pagefault/
 ├── CLAUDE.md                             # This file — agent dev guide
 ├── CHANGELOG.md                          # Version history
-├── VERSION                               # Current version (single line, read by the Makefile and -ldflags)
+├── VERSION                               # Current version (single line, read by the Makefile and -ldflags, and substituted into `web/index.html`'s `{{version}}` sentinel by both `internal/server.New` and `.github/workflows/pages.yml`)
 ├── README.md                             # Quick-start guide
 ├── Makefile                              # build/test/lint/run/clean/smoke targets
 ├── go.mod                                # Go module: jetd.one/pagefault (vanity path; repo lives at github.com/jetd1/pagefault)
 ├── go.sum                                # Module checksums
 ├── .gitignore                            # Go-standard ignores
+│
+├── .github/
+│   └── workflows/
+│       └── pages.yml                     # GitHub Actions: deploy embedded landing site to GitHub Pages on push to main (substitutes `{{version}}` from VERSION, uploads `web/*` via actions/deploy-pages) — see docs/design.md §11
 │
 ├── cmd/
 │   └── pagefault/
