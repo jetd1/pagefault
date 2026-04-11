@@ -7,6 +7,105 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+## 0.8.0 (2026-04-11)
+
+### Added
+
+- **OAuth2 authorization code + PKCE flow.** The MCP specification
+  requires OAuth 2.1 with PKCE for browser-based clients like Claude
+  Desktop. pagefault now supports the full authorization_code grant
+  alongside the existing client_credentials grant. New public
+  endpoints:
+
+  - `GET /oauth/authorize` — the authorization endpoint; validates
+    `response_type=code`, `client_id`, `redirect_uri`, `state`,
+    `code_challenge`, `code_challenge_method=S256`, then either
+    auto-approves (redirects immediately with the code) or renders a
+    consent page (configurable, default auto-approve).
+  - `POST /oauth/authorize` — consent form handler (when
+    auto_approve is false).
+  - `POST /oauth/token` extended — now also accepts
+    `grant_type=authorization_code` with `code`, `redirect_uri`,
+    `client_id`, and `code_verifier` (PKCE).
+
+- **PKCE with S256.** The only `code_challenge_method` supported is
+  `S256` (`BASE64URL(SHA256(code_verifier))`), as required by OAuth
+  2.1. The `plain` method is rejected. PKCE verification uses
+  constant-time comparison (`crypto/subtle.ConstantTimeCompare`).
+
+- **Public clients.** ClientRecords with an empty `secret_hash` and
+  at least one `redirect_uri` are treated as public clients. They
+  authenticate via PKCE alone — no `client_secret` is needed at the
+  token endpoint. This is the pattern Claude Desktop uses.
+
+- **Updated RFC 8414 metadata.** The
+  `/.well-known/oauth-authorization-server` response now includes
+  `authorization_endpoint`, `code_challenge_methods_supported`,
+  `grant_types_supported: ["client_credentials", "authorization_code"]`,
+  `response_types_supported: ["code"]`, and
+  `token_endpoint_auth_methods_supported: ["client_secret_basic",
+  "client_secret_post", "none"]`.
+
+- **`--redirect-uris` flag on `oauth-client create`.** Comma-separated
+  list of allowed redirect URIs for the authorization_code flow.
+  Required for any client that will use the auth code flow.
+
+- **`--public` flag on `oauth-client create`.** Creates a public client
+  (no `client_secret`, PKCE-only). Requires `--redirect-uris`.
+
+- **`oauth-client ls` now shows client type and redirect URIs.** The
+  table includes a TYPE column (confidential/public) and a
+  REDIRECT_URIS column.
+
+- **New config fields.** `auth.oauth2.auth_code_ttl_seconds` (default
+  60) controls authorization code lifetime. `auth.oauth2.auto_approve`
+  (default true) controls whether the authorize endpoint skips the
+  consent page.
+
+- **`OAuth2Provider.ValidateClientSecret` method.** Validates a
+  client_secret against the stored bcrypt hash without issuing a token.
+  Used by the authorization_code token exchange for confidential
+  clients.
+
+- **`OAuth2Provider.LookupClient` method.** Returns a ClientRecord by
+  client ID. Used by the authorize endpoint to validate client_id and
+  look up registered redirect URIs.
+
+- **`OAuth2Provider.IssueAuthorizationCode` method.** Issues a
+  short-lived, one-time-use authorization code bound to a client,
+  redirect_uri, and PKCE code_challenge.
+
+- **`OAuth2Provider.ExchangeAuthorizationCode` method.** Validates and
+  consumes an authorization code, verifies PKCE, and issues an access
+  token.
+
+### Changed
+
+- **`ReloadClients` now allows public clients.** ClientRecords with an
+  empty `secret_hash` are accepted when they have at least one
+  `redirect_uri`. Previously any record with an empty `secret_hash`
+  was rejected.
+
+- **`ClientRecord` has a new `RedirectURIs` field.** Additive change —
+  existing JSONL files without this field parse correctly with an
+  empty slice.
+
+- **`sweepExpiredLocked` also sweeps auth codes.** Expired
+  authorization codes are cleaned up alongside expired access tokens.
+
+### Notes
+
+- No dynamic client registration (DCR) endpoint is provided. Operators
+  pre-register clients via `pagefault oauth-client create` and paste
+  credentials into the MCP client's configuration UI. This is a
+  deliberate security decision for internet-facing deployments — an
+  open registration endpoint would let anyone create a client.
+
+- The consent page (when `auto_approve: false`) renders minimal HTML
+  with CSP headers. The default is `auto_approve: true` because on a
+  single-operator self-hosted server the operator is authorizing
+  themselves.
+
 ## 0.7.1 (2026-04-11)
 
 OAuth2 review-pass hardening. External reviewer flagged three

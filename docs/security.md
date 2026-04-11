@@ -38,7 +38,7 @@ Configured under `auth:` in the YAML config. Four modes are supported:
 |-------------------|-------------------------------------------|-----------------------|
 | `bearer`          | Normal remote access                      | `Authorization: Bearer <tok>` matched against `tokens.jsonl` |
 | `trusted_header`  | Behind a reverse proxy that authenticates | Reads a header (e.g. `X-Pagefault-User`) and enforces `trusted_proxies` |
-| `oauth2`          | Claude Desktop native SSE (0.7.0+)        | RFC 6749 §4.4 client_credentials grant against `oauth-clients.jsonl`; can run compound with `bearer` as a fallback |
+| `oauth2`          | Claude Desktop native SSE (0.7.0+)        | RFC 6749 client_credentials + authorization_code (PKCE) grants against `oauth-clients.jsonl`; can run compound with `bearer` as a fallback |
 | `none`            | Local dev / loopback only                 | Every request is treated as `anonymous` |
 
 Tokens are managed by the `pagefault token` subcommand — `create`, `ls`,
@@ -51,27 +51,54 @@ Tokens are managed by the `pagefault token` subcommand — `create`, `ls`,
 - The tokens file is written atomically (temp file + rename) and should be
   mode `0600`.
 
-### OAuth2 client_credentials (0.7.0+)
+### OAuth2 (0.7.0+, authorization code + PKCE in 0.8.0)
 
-`mode: "oauth2"` runs an RFC 6749 §4.4 client_credentials grant
-against an operator-managed client registry (`oauth-clients.jsonl`,
-managed by `pagefault oauth-client create / ls / revoke`). The
-provider exists primarily to make pagefault reachable from Claude
-Desktop's native SSE MCP configuration, which only exposes Client
-ID / Client Secret credential fields.
+`mode: "oauth2"` runs two RFC 6749 grant types against an
+operator-managed client registry (`oauth-clients.jsonl`,
+managed by `pagefault oauth-client create / ls / revoke`):
+
+1. **client_credentials** (0.7.0) — for programmatic clients that
+   exchange a static client_id + client_secret for a token.
+2. **authorization_code + PKCE** (0.8.0) — for interactive clients
+   (Claude Desktop) that use the MCP-standard browser-based OAuth
+   2.1 flow with PKCE.
+
+Both grant types share the same client registry, token store, and
+discovery endpoints. The 0.8.0 addition is what makes Claude
+Desktop's native SSE configuration work: when Claude Desktop
+connects, it discovers the authorization endpoint via RFC 8414
+metadata, opens a browser tab for consent, and exchanges the
+resulting authorization code for a token using PKCE.
 
 Security-relevant properties of the implementation:
 
 - **Client secrets are bcrypt-hashed** (`golang.org/x/crypto/bcrypt`
-  at `DefaultCost`). The plaintext secret is printed exactly once
-  at `oauth-client create` time and stored only as the hash. A
-  dumped `oauth-clients.jsonl` therefore reveals client IDs +
-  labels + scopes but not the secrets themselves.
+  at `DefaultCost`) for confidential clients. The plaintext secret
+  is printed exactly once at `oauth-client create` time and stored
+  only as the hash. A dumped `oauth-clients.jsonl` therefore reveals
+  client IDs + labels + scopes but not the secrets themselves.
+  **Public clients** (created with `--public`) have no secret at
+  all — they authenticate via PKCE alone, which is the correct
+  model for browser-based clients like Claude Desktop.
 - **Access tokens are 32 bytes of `crypto/rand`**, base64-URL
   encoded, prefixed `pf_at_` (distinct from the long-lived `pf_`
   prefix used by bearer tokens). Tokens live in an in-memory map
   only — they do not persist across server restarts, so a restart
   is an authoritative way to invalidate every outstanding token.
+- **Authorization codes are 32 bytes of `crypto/rand`**, base64-URL
+  encoded, prefixed `pf_ac_`. They are short-lived (default 60s,
+  configurable via `auth_code_ttl_seconds`), one-time-use, and
+  bound to the client_id, redirect_uri, and PKCE code_challenge
+  that were present at issuance. A consumed code cannot be
+  replayed — the exchange marks it consumed and any subsequent
+  attempt returns `invalid_grant`.
+- **PKCE is mandatory for the authorization code flow.** Only
+  `S256` (`BASE64URL(SHA256(code_verifier))`) is supported as a
+  `code_challenge_method`; the plaintext method is rejected. This
+  prevents authorization code interception attacks even on public
+  clients that have no client_secret. Verification uses
+  `crypto/subtle.ConstantTimeCompare` to avoid timing side
+  channels.
 - **Token TTL is enforced on lookup.** `Authenticate` compares the
   stored `ExpiresAt` against `time.Now()` and both rejects the
   request *and* evicts the entry when expired. A follow-up write
@@ -79,21 +106,42 @@ Security-relevant properties of the implementation:
   another request refreshed the same key. Opportunistic sweeps
   also run on every `IssueToken` call, bounding memory even if
   no expired lookups happen.
-- **The two discovery endpoints are intentionally public.** RFC
+- **The discovery endpoints are intentionally public.** RFC
   9728 and RFC 8414 require them to be reachable without
   credentials because clients bootstrap through them *before*
-  they have a token. They advertise only the issuer, token
-  endpoint, supported grants, and supported auth methods — no
-  scope-sensitive or client-sensitive information.
+  they have a token. They advertise the issuer, token endpoint,
+  authorization endpoint, supported grants (`client_credentials`,
+  `authorization_code`), response types (`code`), code challenge
+  methods (`S256`), and supported auth methods — no scope-sensitive
+  or client-sensitive information.
 - **`POST /oauth/token` is outside the bearer middleware.** It
   authenticates via the client credentials carried in either the
   Authorization Basic header (RFC 6749 §2.3.1) or the form body
-  (§2.3.2). Credential failure returns RFC 6749 §5.2 error
-  envelopes: 401 + `WWW-Authenticate: Basic` when the client used
-  Basic, 400 when it used form body. The error code is always
-  `invalid_client`; we do not leak whether the failure was
-  "unknown id" vs "wrong secret" to avoid enabling client-id
-  enumeration.
+  (§2.3.2) for client_credentials. For authorization_code,
+  confidential clients authenticate the same way; public clients
+  (no client_secret) authenticate via PKCE alone. Credential
+  failure returns RFC 6749 §5.2 error envelopes: 401 +
+  `WWW-Authenticate: Basic` when the client used Basic, 400 when
+  it used form body. The error code is always `invalid_client`;
+  we do not leak whether the failure was "unknown id" vs "wrong
+  secret" to avoid enabling client-id enumeration.
+- **`GET/POST /oauth/authorize` is outside the bearer middleware.**
+  It validates the client_id, redirect_uri (must match a
+  registered URI), PKCE code_challenge, and state parameter. By
+  default, `auto_approve: true` means the server immediately
+  redirects with the authorization code — no consent page is
+  shown. The rationale: pagefault is a single-operator server;
+  the operator authorizes themselves. Set `auto_approve: false`
+  to render an HTML consent page (future use for multi-operator
+  deployments). On validation errors where redirect_uri + state
+  are both valid, the server redirects with an `error` parameter
+  per RFC 6749 §4.1.2.1; otherwise it returns a JSON error to
+  prevent open redirects.
+- **Redirect URI validation is strict.** The `redirect_uri`
+  parameter in the authorize request must exactly match one of the
+  URIs registered on the client record. This prevents open-redirect
+  attacks that could leak authorization codes to an attacker's
+  endpoint.
 - **Compound mode** (`oauth2` + populated `bearer.tokens_file`)
   runs the OAuth2 store first and falls back to the bearer store
   on no match. The fallback re-uses the existing `BearerTokenAuth`
@@ -101,29 +149,26 @@ Security-relevant properties of the implementation:
   identical regardless of which store matched. Operators can
   audit by checking `caller.metadata.auth` — it is `"oauth2"`
   for OAuth2-issued tokens and absent for legacy bearer tokens.
-- **Scope enforcement is coarse in 0.7.0.** Scopes are attached
-  to issued tokens (as the intersection of the client's allowed
-  set and the caller-requested set) but no tool currently
-  branches on them — any authenticated caller can invoke any
-  enabled tool. Per-scope tool ACLs are a future addition;
-  until then, scope narrowing is primarily a forward-compatibility
-  knob plus an audit trail hint.
+- **Scope enforcement is coarse.** Scopes are attached to issued
+  tokens (as the intersection of the client's allowed set and the
+  caller-requested set) but no tool currently branches on them —
+  any authenticated caller can invoke any enabled tool. Per-scope
+  tool ACLs are a future addition; until then, scope narrowing is
+  primarily a forward-compatibility knob plus an audit trail hint.
 - **Revocation semantics.** `pagefault oauth-client revoke <id>`
   removes the client record so no new tokens can be issued for
   that client, but **access tokens that have already been issued
   remain valid until their TTL expires or the server restarts**.
   The CLI prints this explicitly after every revoke. For
   immediate invalidation, restart pagefault.
-- **No refresh tokens, no PKCE, no dynamic client registration**
-  in the 0.7.0 implementation. Claude Desktop re-exchanges
-  client_id/client_secret for a new access token automatically
-  when its cached one expires, so refresh tokens are unnecessary
-  for the target workload. PKCE protects against authorization
-  code interception in the authorization_code flow, which we do
-  not implement. Dynamic client registration would open a
-  zero-auth endpoint that creates privileged records on a
-  single-operator server — operators can register clients via
-  the CLI instead.
+- **No refresh tokens, no dynamic client registration (DCR).**
+  Claude Desktop re-exchanges its credentials for a new access
+  token automatically when its cached one expires (either via
+  client_credentials or by re-running the authorization code
+  flow), so refresh tokens are unnecessary for the target
+  workload. DCR would open a zero-auth endpoint that creates
+  privileged records on a single-operator server — operators
+  register clients via the CLI instead.
 
 Auth middleware is applied to every authenticated route, including both
 MCP transports: streamable-http at `/mcp` and `/mcp/*`, and legacy SSE
@@ -142,17 +187,17 @@ returns `403` if the source IP is not in `trusted_proxies`.
 > should report it. Audit log entries will show the caller as
 > `anonymous` if the token is missing, which is a useful signal.
 
-> **Claude Desktop caveat (as of 2026-04).** Claude Desktop's built-in
-> SSE configuration UI only exposes **OAuth2 Client ID / Client
-> Secret** fields for extra credentials — it does not expose a way to
-> attach a plain `Authorization: Bearer pf_...` header to the SSE GET.
-> For a bearer-auth deployment of pagefault, the practical paths are
-> (a) use the `npx supergateway --streamableHttp` bridge to inject the
-> bearer header via a local stdio adapter (the supergateway config in
-> `README.md`), or (b) switch to `auth.mode: oauth2` (shipped in 0.7.0)
-> and register a Claude Desktop OAuth2 client via
-> `pagefault oauth-client create`. See the `Auth → OAuth2` section
-> below for the full flow.
+> **Claude Desktop (as of 2026-04).** Claude Desktop uses the
+> MCP-standard OAuth 2.1 authorization code + PKCE flow. When
+> configured with the pagefault SSE URL and a Client ID, it discovers
+> the authorization endpoint via RFC 8414 metadata, opens a browser
+> tab for consent (auto-approved by default), and exchanges the
+> resulting authorization code for a token using PKCE. Register a
+> public client with `pagefault oauth-client create --public
+> --redirect-uris "http://localhost:3000/callback"` — no client_secret
+> is needed. For bearer-auth deployments where OAuth2 is not enabled,
+> the fallback is `npx supergateway --streamableHttp` to inject a
+> bearer header via a local stdio adapter.
 
 ## Sandbox & path traversal
 

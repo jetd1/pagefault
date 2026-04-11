@@ -1,27 +1,36 @@
-// This file implements the public HTTP surface for the 0.7.0 OAuth2
-// provider: two discovery endpoints (RFC 9728 + RFC 8414) and the
-// token endpoint (RFC 6749 §4.4 client_credentials grant). The
-// handlers are mounted outside the auth middleware because:
+// This file implements the public HTTP surface for the OAuth2 provider:
+// two discovery endpoints (RFC 9728 + RFC 8414), the token endpoint
+// (RFC 6749 — client_credentials and authorization_code grants), and
+// the authorization endpoint (GET/POST /oauth/authorize for the
+// authorization_code + PKCE flow). The handlers are mounted outside
+// the auth middleware because:
 //
 //   - The discovery endpoints MUST be publicly reachable so MCP
 //     clients can bootstrap before they have a token.
 //   - The token endpoint authenticates via client credentials
-//     (either HTTP Basic or form body), not via a bearer token, so
-//     routing it through the bearer middleware would reject every
-//     legitimate request with a 401.
+//     (either HTTP Basic or form body) or via PKCE code_verifier,
+//     not via a bearer token, so routing it through the bearer
+//     middleware would reject every legitimate request with a 401.
+//   - The authorization endpoint is a browser-facing redirect flow
+//     that does not use bearer tokens at all.
 //
 // The provider itself lives in internal/auth.OAuth2Provider — this
 // file is a thin adapter that translates HTTP forms into calls on
-// OAuth2Provider.IssueToken and JSON-encodes the results.
+// OAuth2Provider methods and JSON-encodes the results.
 package server
 
 import (
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
+	"html"
 	"net/http"
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/jet/pagefault/internal/auth"
 )
 
 // oauthError is the RFC 6749 §5.2 error envelope emitted by the
@@ -83,8 +92,8 @@ func (s *Server) resolveIssuer(r *http.Request) string {
 }
 
 // handleOAuthProtectedResource serves RFC 9728 (OAuth Protected
-// Resource Metadata). MCP clients hit this endpoint first when
-// they get a 401 from a tool call, and follow the
+// Resource Metadata). MCP clients hit this endpoint first when they
+// get a 401 from a tool call, and follow the
 // `authorization_servers` pointer to discover where to exchange
 // credentials for a token. pagefault acts as both the protected
 // resource (MCP endpoints) and the authorization server in the
@@ -105,20 +114,21 @@ func (s *Server) handleOAuthProtectedResource(w http.ResponseWriter, r *http.Req
 }
 
 // handleOAuthAuthorizationServer serves RFC 8414 (OAuth 2.0
-// Authorization Server Metadata). We advertise exactly the subset
-// of OAuth2 we support: client_credentials grant, Basic + POST
-// client authentication at the token endpoint, and an empty
-// response_types list because we do not implement the
-// authorization_code flow. The `mcp` scope is listed as
-// `scopes_supported` to match MCP client conventions.
+// Authorization Server Metadata). We advertise both grant types
+// (client_credentials and authorization_code), the authorization
+// endpoint, and the S256 PKCE code challenge method. The `mcp`
+// scope is listed as `scopes_supported` to match MCP client
+// conventions.
 func (s *Server) handleOAuthAuthorizationServer(w http.ResponseWriter, r *http.Request) {
 	issuer := s.resolveIssuer(r)
 	body := map[string]any{
 		"issuer":                                issuer,
+		"authorization_endpoint":                issuer + "/oauth/authorize",
 		"token_endpoint":                        issuer + "/oauth/token",
-		"grant_types_supported":                 []string{"client_credentials"},
-		"token_endpoint_auth_methods_supported": []string{"client_secret_basic", "client_secret_post"},
-		"response_types_supported":              []string{},
+		"grant_types_supported":                 []string{"client_credentials", "authorization_code"},
+		"response_types_supported":              []string{"code"},
+		"code_challenge_methods_supported":      []string{"S256"},
+		"token_endpoint_auth_methods_supported": []string{"client_secret_basic", "client_secret_post", "none"},
 		"scopes_supported":                      s.cfg.Auth.OAuth2.DefaultScopesOrDefault(),
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -126,8 +136,10 @@ func (s *Server) handleOAuthAuthorizationServer(w http.ResponseWriter, r *http.R
 	_ = json.NewEncoder(w).Encode(body)
 }
 
-// handleOAuthToken implements the RFC 6749 §4.4 client_credentials
-// grant. Credentials may arrive in either of two places:
+// handleOAuthToken implements the RFC 6749 token endpoint for both
+// client_credentials (§4.4) and authorization_code (§4.1) grants.
+//
+// client_credentials: credentials may arrive in either of two places:
 //
 //   - `Authorization: Basic base64(client_id:client_secret)` per §2.3.1,
 //     which is what Claude Desktop sends.
@@ -135,15 +147,11 @@ func (s *Server) handleOAuthAuthorizationServer(w http.ResponseWriter, r *http.R
 //     per §2.3.2, which is what curl examples and many programmatic
 //     clients use.
 //
-// A token endpoint MUST support at least one of these; we support
-// both because the cost is trivial and it makes operator testing
-// much easier. Per §2.3, if the Authorization header is present
-// it takes precedence and we do not fall back to the form fields.
+// authorization_code: the client sends `code`, `redirect_uri`,
+// `client_id`, and `code_verifier` (PKCE). Public clients (those
+// without a client_secret) authenticate via PKCE alone.
 func (s *Server) handleOAuthToken(w http.ResponseWriter, r *http.Request) {
 	if s.oauth2P == nil {
-		// Endpoint mounted but no provider configured — should not
-		// happen because mountOAuth2 only mounts when the provider
-		// is non-nil, but be defensive.
 		writeOAuthError(w, http.StatusNotFound, "invalid_request", "oauth2 is not enabled on this server")
 		return
 	}
@@ -151,38 +159,35 @@ func (s *Server) handleOAuthToken(w http.ResponseWriter, r *http.Request) {
 		writeOAuthError(w, http.StatusBadRequest, "invalid_request", "failed to parse request body")
 		return
 	}
-	// RFC 6749 §4.4 requires grant_type to be sent in the
-	// application/x-www-form-urlencoded POST body. Reading from
-	// r.PostForm (not r.Form) rejects values passed via the URL
-	// query string so non-compliant clients see a clear
-	// unsupported_grant_type error instead of silently succeeding.
-	grant := r.PostForm.Get("grant_type")
-	if grant != "client_credentials" {
-		writeOAuthError(w, http.StatusBadRequest, "unsupported_grant_type", "only client_credentials is supported")
-		return
-	}
 
+	grant := r.PostForm.Get("grant_type")
+	switch grant {
+	case "client_credentials":
+		s.handleClientCredentialsGrant(w, r)
+	case "authorization_code":
+		s.handleAuthorizationCodeGrant(w, r)
+	default:
+		writeOAuthError(w, http.StatusBadRequest, "unsupported_grant_type", "only client_credentials and authorization_code are supported")
+	}
+}
+
+// handleClientCredentialsGrant processes the client_credentials
+// grant type on the token endpoint.
+func (s *Server) handleClientCredentialsGrant(w http.ResponseWriter, r *http.Request) {
 	clientID, clientSecret, authMethod, ok := extractClientCredentials(r)
 	if !ok {
-		// No credentials at all — challenge with WWW-Authenticate
-		// Basic so a confused operator running `curl -v` sees the
-		// right hint.
 		w.Header().Set("WWW-Authenticate", `Basic realm="pagefault"`)
 		writeOAuthError(w, http.StatusUnauthorized, "invalid_client", "missing client credentials")
 		return
 	}
 
 	var requestedScopes []string
-	if s := strings.TrimSpace(r.PostForm.Get("scope")); s != "" {
-		requestedScopes = strings.Fields(s)
+	if sc := strings.TrimSpace(r.PostForm.Get("scope")); sc != "" {
+		requestedScopes = strings.Fields(sc)
 	}
 
 	issued, err := s.oauth2P.IssueToken(r.Context(), clientID, clientSecret, requestedScopes)
 	if err != nil {
-		// Per RFC 6749 §5.2, an invalid_client error MAY be
-		// returned with a 401 when the client authenticated via
-		// Basic. We follow the spec: 401 + WWW-Authenticate on
-		// Basic, 400 on form-body creds.
 		status := http.StatusBadRequest
 		if authMethod == "basic" {
 			status = http.StatusUnauthorized
@@ -192,6 +197,88 @@ func (s *Server) handleOAuthToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	s.writeTokenResponse(w, issued)
+}
+
+// handleAuthorizationCodeGrant processes the authorization_code
+// grant type on the token endpoint. Public clients (no client_secret)
+// authenticate via PKCE code_verifier alone.
+func (s *Server) handleAuthorizationCodeGrant(w http.ResponseWriter, r *http.Request) {
+	code := r.PostForm.Get("code")
+	redirectURI := r.PostForm.Get("redirect_uri")
+	clientID := r.PostForm.Get("client_id")
+	codeVerifier := r.PostForm.Get("code_verifier")
+
+	// client_id may also come from the Authorization header (Basic auth).
+	// If it's absent from the form body, try extracting from Basic auth.
+	if clientID == "" {
+		if id, _, _, ok := extractClientCredentials(r); ok {
+			clientID = id
+		}
+	}
+
+	if code == "" {
+		writeOAuthError(w, http.StatusBadRequest, "invalid_request", "missing code parameter")
+		return
+	}
+	if clientID == "" {
+		writeOAuthError(w, http.StatusBadRequest, "invalid_request", "missing client_id parameter")
+		return
+	}
+
+	// For confidential clients, validate the client_secret.
+	// For public clients (PKCE-only), client_secret is absent.
+	rec, clientExists := s.oauth2P.LookupClient(clientID)
+	if !clientExists {
+		writeOAuthError(w, http.StatusBadRequest, "invalid_client", "unknown client")
+		return
+	}
+
+	// If the client has a secret_hash, it must authenticate with
+	// client_secret. If it's a public client (empty secret_hash),
+	// PKCE provides the authentication.
+	if rec.SecretHash != "" {
+		// Confidential client: extract and validate secret.
+		extractedID, secret, authMethod, gotCreds := extractClientCredentials(r)
+		if !gotCreds {
+			w.Header().Set("WWW-Authenticate", `Basic realm="pagefault"`)
+			writeOAuthError(w, http.StatusUnauthorized, "invalid_client", "missing client credentials")
+			return
+		}
+		// Use the ID from extractClientCredentials if present
+		// (Basic auth), otherwise fall back to the form field.
+		if extractedID != "" {
+			clientID = extractedID
+		}
+		if !s.oauth2P.ValidateClientSecret(clientID, secret) {
+			status := http.StatusBadRequest
+			if authMethod == "basic" {
+				status = http.StatusUnauthorized
+				w.Header().Set("WWW-Authenticate", `Basic realm="pagefault"`)
+			}
+			writeOAuthError(w, status, "invalid_client", "client authentication failed")
+			return
+		}
+	}
+
+	issued, err := s.oauth2P.ExchangeAuthorizationCode(code, redirectURI, clientID, codeVerifier)
+	if err != nil {
+		switch {
+		case isErrInvalidGrant(err):
+			writeOAuthError(w, http.StatusBadRequest, "invalid_grant", err.Error())
+		case isErrInvalidClient(err):
+			writeOAuthError(w, http.StatusBadRequest, "invalid_client", err.Error())
+		default:
+			writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "authorization code exchange failed")
+		}
+		return
+	}
+
+	s.writeTokenResponse(w, issued)
+}
+
+// writeTokenResponse writes a standard OAuth2 token success response.
+func (s *Server) writeTokenResponse(w http.ResponseWriter, issued *auth.IssuedToken) {
 	resp := map[string]any{
 		"access_token": issued.AccessToken,
 		"token_type":   "Bearer",
@@ -205,6 +292,206 @@ func (s *Server) handleOAuthToken(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Pragma", "no-cache")
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(resp)
+}
+
+// handleOAuthAuthorize implements the authorization endpoint for
+// the authorization_code + PKCE flow (RFC 6749 §4.1 + RFC 7636).
+// It handles both GET (initial request from the client, typically
+// via browser redirect) and POST (consent form submission when
+// auto_approve is false).
+//
+// When auto_approve is true (the default), the endpoint immediately
+// issues an authorization code and redirects to the client's
+// redirect_uri. When false, a minimal HTML consent page is rendered.
+func (s *Server) handleOAuthAuthorize(w http.ResponseWriter, r *http.Request) {
+	if s.oauth2P == nil {
+		writeOAuthError(w, http.StatusNotFound, "invalid_request", "oauth2 is not enabled on this server")
+		return
+	}
+
+	// For GET, params come from the query string. For POST (consent
+	// form), params come from the form body.
+	var responseType, clientID, redirectURI, scope, state, codeChallenge, codeChallengeMethod string
+	if r.Method == http.MethodPost {
+		if err := r.ParseForm(); err != nil {
+			writeOAuthError(w, http.StatusBadRequest, "invalid_request", "failed to parse request body")
+			return
+		}
+		responseType = r.PostForm.Get("response_type")
+		clientID = r.PostForm.Get("client_id")
+		redirectURI = r.PostForm.Get("redirect_uri")
+		scope = r.PostForm.Get("scope")
+		state = r.PostForm.Get("state")
+		codeChallenge = r.PostForm.Get("code_challenge")
+		codeChallengeMethod = r.PostForm.Get("code_challenge_method")
+	} else {
+		responseType = r.URL.Query().Get("response_type")
+		clientID = r.URL.Query().Get("client_id")
+		redirectURI = r.URL.Query().Get("redirect_uri")
+		scope = r.URL.Query().Get("scope")
+		state = r.URL.Query().Get("state")
+		codeChallenge = r.URL.Query().Get("code_challenge")
+		codeChallengeMethod = r.URL.Query().Get("code_challenge_method")
+	}
+
+	// Validate required parameters.
+	if responseType != "code" {
+		s.authorizeError(w, r, redirectURI, state, "unsupported_response_type", "only 'code' response_type is supported")
+		return
+	}
+	if clientID == "" {
+		writeOAuthError(w, http.StatusBadRequest, "invalid_request", "missing client_id")
+		return
+	}
+	rec, ok := s.oauth2P.LookupClient(clientID)
+	if !ok {
+		writeOAuthError(w, http.StatusBadRequest, "invalid_client", "unknown client")
+		return
+	}
+	if redirectURI == "" {
+		writeOAuthError(w, http.StatusBadRequest, "invalid_request", "missing redirect_uri")
+		return
+	}
+	// Validate redirect_uri is registered.
+	if len(rec.RedirectURIs) > 0 {
+		found := false
+		for _, ru := range rec.RedirectURIs {
+			if ru == redirectURI {
+				found = true
+				break
+			}
+		}
+		if !found {
+			// Don't redirect with the error — the redirect_uri is
+			// not registered, so redirecting would be unsafe.
+			writeOAuthError(w, http.StatusBadRequest, "invalid_request", "redirect_uri not registered for this client")
+			return
+		}
+	}
+	if state == "" {
+		s.authorizeError(w, r, redirectURI, state, "invalid_request", "missing state parameter")
+		return
+	}
+	if codeChallenge == "" {
+		s.authorizeError(w, r, redirectURI, state, "invalid_request", "missing code_challenge (PKCE is required)")
+		return
+	}
+	if codeChallengeMethod != "S256" {
+		s.authorizeError(w, r, redirectURI, state, "invalid_request", "only S256 code_challenge_method is supported")
+		return
+	}
+
+	// If auto_approve is false and this is a GET, render the consent
+	// page. POST with action=allow proceeds; POST with action=deny
+	// redirects with access_denied.
+	if !s.oauth2P.AutoApprove() {
+		if r.Method == http.MethodGet {
+			s.renderConsentPage(w, rec, r.URL.Query())
+			return
+		}
+		if r.Method == http.MethodPost && r.PostForm.Get("action") == "deny" {
+			s.authorizeError(w, r, redirectURI, state, "access_denied", "resource owner denied the request")
+			return
+		}
+	}
+
+	// Parse requested scopes.
+	var scopes []string
+	if scope != "" {
+		scopes = strings.Fields(scope)
+	}
+
+	// Issue the authorization code.
+	ac, err := s.oauth2P.IssueAuthorizationCode(clientID, redirectURI, scopes, state, codeChallenge, codeChallengeMethod)
+	if err != nil {
+		writeOAuthError(w, http.StatusInternalServerError, "server_error", "failed to issue authorization code")
+		return
+	}
+
+	// Redirect to the client's redirect_uri with code and state.
+	redirectTo := buildRedirectURI(redirectURI, ac.Code, state)
+	http.Redirect(w, r, redirectTo, http.StatusFound)
+}
+
+// authorizeError either redirects to the client's redirect_uri with
+// the error (when the redirect_uri and state are valid) or writes a
+// JSON error response (when redirecting would be unsafe).
+func (s *Server) authorizeError(w http.ResponseWriter, r *http.Request, redirectURI, state, errorCode, description string) {
+	if redirectURI != "" && state != "" {
+		u, err := url.Parse(redirectURI)
+		if err == nil {
+			q := u.Query()
+			q.Set("error", errorCode)
+			q.Set("error_description", description)
+			if state != "" {
+				q.Set("state", state)
+			}
+			u.RawQuery = q.Encode()
+			http.Redirect(w, r, u.String(), http.StatusFound)
+			return
+		}
+	}
+	writeOAuthError(w, http.StatusBadRequest, errorCode, description)
+}
+
+// buildRedirectURI constructs the redirect URL with code and state.
+func buildRedirectURI(base, code, state string) string {
+	u, err := url.Parse(base)
+	if err != nil {
+		// Should not happen — redirect_uri was validated earlier.
+		return base + "?code=" + url.QueryEscape(code) + "&state=" + url.QueryEscape(state)
+	}
+	q := u.Query()
+	q.Set("code", code)
+	q.Set("state", state)
+	u.RawQuery = q.Encode()
+	return u.String()
+}
+
+// renderConsentPage writes a minimal HTML consent page. This is only
+// reached when auto_approve is false.
+func (s *Server) renderConsentPage(w http.ResponseWriter, rec auth.ClientRecord, params url.Values) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'")
+
+	clientName := html.EscapeString(rec.Label)
+	if clientName == "" {
+		clientName = html.EscapeString(rec.ID)
+	}
+
+	// Build hidden form fields preserving all original query params.
+	var hiddenFields strings.Builder
+	for key, values := range params {
+		for _, v := range values {
+			hiddenFields.WriteString(fmt.Sprintf(
+				`<input type="hidden" name="%s" value="%s">`,
+				html.EscapeString(key), html.EscapeString(v),
+			))
+		}
+	}
+
+	fmt.Fprintf(w, `<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Authorize - pagefault</title>
+<style>
+body{font-family:system-ui,sans-serif;max-width:480px;margin:80px auto;padding:0 20px;color:#1a1a1a}
+h1{font-size:1.2em}form{margin-top:24px}
+button{padding:8px 24px;margin-right:12px;cursor:pointer;border:1px solid #ccc;border-radius:4px;background:#fff}
+button[name=action][value=allow]{background:#1a7f37;color:#fff;border-color:#1a7f37}
+button[name=action][value=deny]{background:#fff;color:#cf222e;border-color:#cf222e}
+</style>
+</head>
+<body>
+<h1>Authorize %s</h1>
+<p>Allow this application to access your pagefault server?</p>
+<form method="POST" action="/oauth/authorize">
+%s
+<button type="submit" name="action" value="allow">Allow</button>
+<button type="submit" name="action" value="deny">Deny</button>
+</form>
+</body>
+</html>`, clientName, hiddenFields.String())
 }
 
 // extractClientCredentials pulls (client_id, client_secret) from
@@ -225,8 +512,6 @@ func extractClientCredentials(r *http.Request) (id, secret, authMethod string, o
 				if colon >= 0 {
 					rawID := string(decoded[:colon])
 					rawSec := string(decoded[colon+1:])
-					// Per RFC 6749 §2.3.1 the values are
-					// form-urlencoded in the Basic string.
 					if unID, err := url.QueryUnescape(rawID); err == nil {
 						rawID = unID
 					}
@@ -246,4 +531,23 @@ func extractClientCredentials(r *http.Request) (id, secret, authMethod string, o
 		return id, secret, "post", true
 	}
 	return "", "", "", false
+}
+
+// isErrInvalidGrant checks if the error is an invalid_grant error.
+func isErrInvalidGrant(err error) bool {
+	return err.Error() == "oauth2: invalid grant" ||
+		strings.Contains(err.Error(), "invalid grant")
+}
+
+// isErrInvalidClient checks if the error is an invalid_client error.
+func isErrInvalidClient(err error) bool {
+	return err.Error() == "oauth2: invalid client" ||
+		strings.Contains(err.Error(), "invalid client")
+}
+
+// computePKCEChallenge computes BASE64URL(SHA256(verifier)), the S256
+// code_challenge method per RFC 7636. Exported for tests.
+func computePKCEChallenge(verifier string) string {
+	h := sha256.Sum256([]byte(verifier))
+	return base64.RawURLEncoding.EncodeToString(h[:])
 }

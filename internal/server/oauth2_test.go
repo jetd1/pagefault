@@ -3,6 +3,7 @@ package server
 import (
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -60,10 +61,11 @@ func newOAuth2TestServer(t *testing.T, extraBearerTokenFile string) (ts *httptes
 	hash, err := auth.HashClientSecret(clientSecret)
 	require.NoError(t, err)
 	rec := auth.ClientRecord{
-		ID:         clientID,
-		Label:      "Claude Desktop",
-		SecretHash: hash,
-		Scopes:     []string{"mcp"},
+		ID:           clientID,
+		Label:        "Claude Desktop",
+		SecretHash:   hash,
+		Scopes:       []string{"mcp"},
+		RedirectURIs: []string{"http://localhost:3000/callback"},
 	}
 	f, err := os.Create(clientsPath)
 	require.NoError(t, err)
@@ -132,10 +134,31 @@ func TestOAuth2_Discovery_AuthorizationServer(t *testing.T) {
 
 	grants, _ := body["grant_types_supported"].([]any)
 	require.NotEmpty(t, grants)
-	assert.Equal(t, "client_credentials", grants[0].(string))
+	grantStrs := make([]string, len(grants))
+	for i, g := range grants {
+		grantStrs[i] = g.(string)
+	}
+	assert.Contains(t, grantStrs, "client_credentials")
+	assert.Contains(t, grantStrs, "authorization_code")
 
 	methods, _ := body["token_endpoint_auth_methods_supported"].([]any)
-	require.Len(t, methods, 2)
+	require.Len(t, methods, 3)
+
+	// Authorization endpoint must be present for auth code flow.
+	assert.Contains(t, body, "authorization_endpoint")
+	authzEndpoint, ok := body["authorization_endpoint"].(string)
+	require.True(t, ok)
+	assert.Contains(t, authzEndpoint, "/oauth/authorize")
+
+	// PKCE code challenge methods must include S256.
+	challengeMethods, _ := body["code_challenge_methods_supported"].([]any)
+	require.NotEmpty(t, challengeMethods)
+	assert.Equal(t, "S256", challengeMethods[0].(string))
+
+	// Response types must include "code".
+	respTypes, _ := body["response_types_supported"].([]any)
+	require.NotEmpty(t, respTypes)
+	assert.Equal(t, "code", respTypes[0].(string))
 }
 
 // TestOAuth2_Token_BasicAuth exercises the client_secret_basic path,
@@ -392,4 +415,366 @@ func TestExtractClientCredentials_URLEncodedBasic(t *testing.T) {
 	assert.Equal(t, "my id", gotID)
 	assert.Equal(t, "a:b+c", gotSecret)
 	assert.Equal(t, "basic", method)
+}
+
+// ── Authorization code + PKCE integration tests ──
+
+// newOAuth2TestServerWithPublicClient creates a test server seeded with
+// a public client (no secret, redirect URIs only).
+func newOAuth2TestServerWithPublicClient(t *testing.T) (ts *httptest.Server, clientID string) {
+	t.Helper()
+
+	dir := t.TempDir()
+	hello := filepath.Join(dir, "hello.md")
+	require.NoError(t, os.WriteFile(hello, []byte("# hello\n\nhello world\n"), 0o600))
+
+	fsCfg := &config.FilesystemBackendConfig{
+		Name:      "fs",
+		Type:      "filesystem",
+		Root:      dir,
+		Include:   []string{"**/*.md"},
+		URIScheme: "memory",
+		Sandbox:   true,
+	}
+	fsBackend, err := backend.NewFilesystemBackend(fsCfg)
+	require.NoError(t, err)
+
+	d, err := dispatcher.New(dispatcher.Options{
+		Backends: []backend.Backend{fsBackend},
+		Filter:   filter.NewCompositeFilter(),
+		Audit:    audit.NopLogger{},
+	})
+	require.NoError(t, err)
+
+	clientID = "public-client"
+	clientsPath := filepath.Join(dir, "oauth-clients.jsonl")
+	rec := auth.ClientRecord{
+		ID:           clientID,
+		Label:        "Public Client",
+		RedirectURIs: []string{"http://localhost:3000/callback"},
+		Scopes:       []string{"mcp"},
+	}
+	f, err := os.Create(clientsPath)
+	require.NoError(t, err)
+	require.NoError(t, json.NewEncoder(f).Encode(&rec))
+	require.NoError(t, f.Close())
+
+	cfg := &config.Config{
+		Server: config.ServerConfig{Host: "127.0.0.1", Port: 0},
+		Auth: config.AuthConfig{
+			Mode: "oauth2",
+			OAuth2: config.OAuth2Config{
+				ClientsFile:           clientsPath,
+				AccessTokenTTLSeconds: 3600,
+				DefaultScopes:         []string{"mcp"},
+			},
+		},
+	}
+
+	provider, err := auth.NewProvider(cfg.Auth)
+	require.NoError(t, err)
+
+	srv, err := New(cfg, d, provider)
+	require.NoError(t, err)
+
+	ts = httptest.NewServer(srv.Handler)
+	t.Cleanup(ts.Close)
+	return ts, clientID
+}
+
+func TestOAuth2_Authorize_AutoApprove(t *testing.T) {
+	ts, clientID := newOAuth2TestServerWithPublicClient(t)
+
+	verifier := "my-code-verifier"
+	challenge := computePKCEChallenge(verifier)
+
+	// GET /oauth/authorize should redirect immediately with code+state.
+	u := fmt.Sprintf("%s/oauth/authorize?response_type=code&client_id=%s&redirect_uri=%s&code_challenge=%s&code_challenge_method=S256&state=teststate",
+		ts.URL, clientID, url.QueryEscape("http://localhost:3000/callback"), challenge)
+
+	// Use a client that doesn't follow redirects so we can inspect the 302.
+	client := &http.Client{CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		return http.ErrUseLastResponse
+	}}
+	resp, err := client.Get(u)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+
+	assert.Equal(t, http.StatusFound, resp.StatusCode)
+	location := resp.Header.Get("Location")
+	assert.Contains(t, location, "http://localhost:3000/callback?")
+	assert.Contains(t, location, "code=pf_ac_")
+	assert.Contains(t, location, "state=teststate")
+}
+
+func TestOAuth2_Authorize_MissingParams(t *testing.T) {
+	ts, clientID := newOAuth2TestServerWithPublicClient(t)
+
+	// Missing state → 400 (no redirect because state is missing).
+	u := fmt.Sprintf("%s/oauth/authorize?response_type=code&client_id=%s&redirect_uri=%s&code_challenge=test&code_challenge_method=S256",
+		ts.URL, clientID, url.QueryEscape("http://localhost:3000/callback"))
+	resp, err := http.Get(u)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+
+	// Missing code_challenge → error redirect.
+	u2 := fmt.Sprintf("%s/oauth/authorize?response_type=code&client_id=%s&redirect_uri=%s&state=s1&code_challenge_method=S256",
+		ts.URL, clientID, url.QueryEscape("http://localhost:3000/callback"))
+	client := &http.Client{CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		return http.ErrUseLastResponse
+	}}
+	resp2, err := client.Get(u2)
+	require.NoError(t, err)
+	defer resp2.Body.Close()
+	// Should redirect with error.
+	loc := resp2.Header.Get("Location")
+	assert.Contains(t, loc, "error=invalid_request")
+	assert.Contains(t, loc, "state=s1")
+}
+
+func TestOAuth2_Authorize_InvalidRedirectURI(t *testing.T) {
+	ts, clientID := newOAuth2TestServerWithPublicClient(t)
+
+	// redirect_uri not registered → 400 (no redirect, prevents open redirect).
+	u := fmt.Sprintf("%s/oauth/authorize?response_type=code&client_id=%s&redirect_uri=%s&code_challenge=test&code_challenge_method=S256&state=s1",
+		ts.URL, clientID, url.QueryEscape("http://evil.com/callback"))
+	resp, err := http.Get(u)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+}
+
+func TestOAuth2_Authorize_UnsupportedResponseType(t *testing.T) {
+	ts, clientID := newOAuth2TestServerWithPublicClient(t)
+
+	u := fmt.Sprintf("%s/oauth/authorize?response_type=token&client_id=%s&redirect_uri=%s&code_challenge=test&code_challenge_method=S256&state=s1",
+		ts.URL, clientID, url.QueryEscape("http://localhost:3000/callback"))
+	client := &http.Client{CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		return http.ErrUseLastResponse
+	}}
+	resp, err := client.Get(u)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	loc := resp.Header.Get("Location")
+	assert.Contains(t, loc, "error=unsupported_response_type")
+}
+
+func TestOAuth2_Authorize_UnsupportedCodeChallengeMethod(t *testing.T) {
+	ts, clientID := newOAuth2TestServerWithPublicClient(t)
+
+	u := fmt.Sprintf("%s/oauth/authorize?response_type=code&client_id=%s&redirect_uri=%s&code_challenge=test&code_challenge_method=plain&state=s1",
+		ts.URL, clientID, url.QueryEscape("http://localhost:3000/callback"))
+	client := &http.Client{CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		return http.ErrUseLastResponse
+	}}
+	resp, err := client.Get(u)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	loc := resp.Header.Get("Location")
+	assert.Contains(t, loc, "error=invalid_request")
+}
+
+func TestOAuth2_Token_AuthCodeGrant_PublicClient(t *testing.T) {
+	ts, clientID := newOAuth2TestServerWithPublicClient(t)
+
+	// Step 1: GET /oauth/authorize to get a code.
+	verifier := "my-code-verifier"
+	challenge := computePKCEChallenge(verifier)
+	u := fmt.Sprintf("%s/oauth/authorize?response_type=code&client_id=%s&redirect_uri=%s&code_challenge=%s&code_challenge_method=S256&state=s1",
+		ts.URL, clientID, url.QueryEscape("http://localhost:3000/callback"), challenge)
+
+	client := &http.Client{CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		return http.ErrUseLastResponse
+	}}
+	resp, err := client.Get(u)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusFound, resp.StatusCode)
+
+	location := resp.Header.Get("Location")
+	locURL, err := url.Parse(location)
+	require.NoError(t, err)
+	code := locURL.Query().Get("code")
+	require.NotEmpty(t, code)
+	assert.Equal(t, "s1", locURL.Query().Get("state"))
+
+	// Step 2: POST /oauth/token with grant_type=authorization_code.
+	form := url.Values{}
+	form.Set("grant_type", "authorization_code")
+	form.Set("code", code)
+	form.Set("redirect_uri", "http://localhost:3000/callback")
+	form.Set("client_id", clientID)
+	form.Set("code_verifier", verifier)
+
+	tokResp, err := http.Post(ts.URL+"/oauth/token", "application/x-www-form-urlencoded", strings.NewReader(form.Encode()))
+	require.NoError(t, err)
+	defer tokResp.Body.Close()
+	require.Equal(t, http.StatusOK, tokResp.StatusCode)
+
+	var tokenBody map[string]any
+	require.NoError(t, json.NewDecoder(tokResp.Body).Decode(&tokenBody))
+	assert.Equal(t, "Bearer", tokenBody["token_type"])
+	assert.NotEmpty(t, tokenBody["access_token"])
+	assert.True(t, strings.HasPrefix(tokenBody["access_token"].(string), "pf_at_"))
+}
+
+func TestOAuth2_Token_AuthCodeGrant_PKCEFailure(t *testing.T) {
+	ts, clientID := newOAuth2TestServerWithPublicClient(t)
+
+	verifier := "correct-verifier"
+	challenge := computePKCEChallenge(verifier)
+	u := fmt.Sprintf("%s/oauth/authorize?response_type=code&client_id=%s&redirect_uri=%s&code_challenge=%s&code_challenge_method=S256&state=s1",
+		ts.URL, clientID, url.QueryEscape("http://localhost:3000/callback"), challenge)
+
+	client := &http.Client{CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		return http.ErrUseLastResponse
+	}}
+	resp, err := client.Get(u)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	locURL, err := url.Parse(resp.Header.Get("Location"))
+	require.NoError(t, err)
+	code := locURL.Query().Get("code")
+
+	// Exchange with wrong code_verifier.
+	form := url.Values{}
+	form.Set("grant_type", "authorization_code")
+	form.Set("code", code)
+	form.Set("redirect_uri", "http://localhost:3000/callback")
+	form.Set("client_id", clientID)
+	form.Set("code_verifier", "wrong-verifier")
+
+	tokResp, err := http.Post(ts.URL+"/oauth/token", "application/x-www-form-urlencoded", strings.NewReader(form.Encode()))
+	require.NoError(t, err)
+	defer tokResp.Body.Close()
+	assert.Equal(t, http.StatusBadRequest, tokResp.StatusCode)
+
+	var errBody map[string]any
+	require.NoError(t, json.NewDecoder(tokResp.Body).Decode(&errBody))
+	assert.Equal(t, "invalid_grant", errBody["error"])
+}
+
+func TestOAuth2_Token_AuthCodeGrant_ConsumedCode(t *testing.T) {
+	ts, clientID := newOAuth2TestServerWithPublicClient(t)
+
+	verifier := "my-verifier"
+	challenge := computePKCEChallenge(verifier)
+	u := fmt.Sprintf("%s/oauth/authorize?response_type=code&client_id=%s&redirect_uri=%s&code_challenge=%s&code_challenge_method=S256&state=s1",
+		ts.URL, clientID, url.QueryEscape("http://localhost:3000/callback"), challenge)
+
+	client := &http.Client{CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		return http.ErrUseLastResponse
+	}}
+	resp, err := client.Get(u)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	locURL, err := url.Parse(resp.Header.Get("Location"))
+	require.NoError(t, err)
+	code := locURL.Query().Get("code")
+
+	form := url.Values{}
+	form.Set("grant_type", "authorization_code")
+	form.Set("code", code)
+	form.Set("redirect_uri", "http://localhost:3000/callback")
+	form.Set("client_id", clientID)
+	form.Set("code_verifier", verifier)
+
+	// First exchange succeeds.
+	tokResp, err := http.Post(ts.URL+"/oauth/token", "application/x-www-form-urlencoded", strings.NewReader(form.Encode()))
+	require.NoError(t, err)
+	_ = tokResp.Body.Close()
+	require.Equal(t, http.StatusOK, tokResp.StatusCode)
+
+	// Second exchange fails.
+	tokResp2, err := http.Post(ts.URL+"/oauth/token", "application/x-www-form-urlencoded", strings.NewReader(form.Encode()))
+	require.NoError(t, err)
+	defer tokResp2.Body.Close()
+	assert.Equal(t, http.StatusBadRequest, tokResp2.StatusCode)
+}
+
+func TestOAuth2_EndToEnd_AuthCodeFlow(t *testing.T) {
+	ts, clientID := newOAuth2TestServerWithPublicClient(t)
+
+	// Full flow: authorize → token → API call.
+	verifier := "end-to-end-verifier"
+	challenge := computePKCEChallenge(verifier)
+	u := fmt.Sprintf("%s/oauth/authorize?response_type=code&client_id=%s&redirect_uri=%s&code_challenge=%s&code_challenge_method=S256&state=e2e",
+		ts.URL, clientID, url.QueryEscape("http://localhost:3000/callback"), challenge)
+
+	client := &http.Client{CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		return http.ErrUseLastResponse
+	}}
+	resp, err := client.Get(u)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	locURL, err := url.Parse(resp.Header.Get("Location"))
+	require.NoError(t, err)
+	code := locURL.Query().Get("code")
+
+	form := url.Values{}
+	form.Set("grant_type", "authorization_code")
+	form.Set("code", code)
+	form.Set("redirect_uri", "http://localhost:3000/callback")
+	form.Set("client_id", clientID)
+	form.Set("code_verifier", verifier)
+
+	tokResp, err := http.Post(ts.URL+"/oauth/token", "application/x-www-form-urlencoded", strings.NewReader(form.Encode()))
+	require.NoError(t, err)
+	defer tokResp.Body.Close()
+	require.Equal(t, http.StatusOK, tokResp.StatusCode)
+
+	var tokenBody map[string]any
+	require.NoError(t, json.NewDecoder(tokResp.Body).Decode(&tokenBody))
+	accessToken := tokenBody["access_token"].(string)
+
+	// Use the access token on a protected API route.
+	apiReq, err := http.NewRequest(http.MethodPost, ts.URL+"/api/pf_maps", strings.NewReader("{}"))
+	require.NoError(t, err)
+	apiReq.Header.Set("Content-Type", "application/json")
+	apiReq.Header.Set("Authorization", "Bearer "+accessToken)
+	apiResp, err := http.DefaultClient.Do(apiReq)
+	require.NoError(t, err)
+	defer apiResp.Body.Close()
+	assert.Equal(t, http.StatusOK, apiResp.StatusCode)
+}
+
+func TestOAuth2_Token_AuthCodeGrant_ConfidentialClient(t *testing.T) {
+	ts, clientID, clientSecret := newOAuth2TestServer(t, "")
+
+	verifier := "confidential-verifier"
+	challenge := computePKCEChallenge(verifier)
+	u := fmt.Sprintf("%s/oauth/authorize?response_type=code&client_id=%s&redirect_uri=%s&code_challenge=%s&code_challenge_method=S256&state=s1",
+		ts.URL, clientID, url.QueryEscape("http://localhost:3000/callback"), challenge)
+
+	client := &http.Client{CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		return http.ErrUseLastResponse
+	}}
+	resp, err := client.Get(u)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	locURL, err := url.Parse(resp.Header.Get("Location"))
+	require.NoError(t, err)
+	code := locURL.Query().Get("code")
+
+	// Confidential client: use Basic auth + code_verifier.
+	form := url.Values{}
+	form.Set("grant_type", "authorization_code")
+	form.Set("code", code)
+	form.Set("redirect_uri", "http://localhost:3000/callback")
+	form.Set("code_verifier", verifier)
+
+	req, err := http.NewRequest(http.MethodPost, ts.URL+"/oauth/token", strings.NewReader(form.Encode()))
+	require.NoError(t, err)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.SetBasicAuth(clientID, clientSecret)
+
+	tokResp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer tokResp.Body.Close()
+	require.Equal(t, http.StatusOK, tokResp.StatusCode)
+
+	var tokenBody map[string]any
+	require.NoError(t, json.NewDecoder(tokResp.Body).Decode(&tokenBody))
+	assert.NotEmpty(t, tokenBody["access_token"])
 }

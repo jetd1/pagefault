@@ -169,23 +169,31 @@ type TrustedHeaderConfig struct {
 	TrustedProxies []string `yaml:"trusted_proxies,omitempty"`
 }
 
-// OAuth2Config configures the OAuth2 client_credentials grant provider
-// (shipped in 0.7.0). The minimum viable implementation targets Claude
-// Desktop's native SSE configuration UI, which as of 2026-04 only
-// exposes Client ID / Client Secret fields — no redirect URI, no
-// browser popup, no refresh flow. The provider mounts three public
-// endpoints at the server root:
+// OAuth2Config configures the OAuth2 provider (shipped in 0.7.0,
+// extended in 0.8.0). The provider supports two grant types:
+//
+//   - client_credentials (0.7.0): machine-to-machine auth where the
+//     client authenticates with a pre-registered client_secret.
+//   - authorization_code + PKCE (0.8.0): the MCP-standard browser-
+//     based flow that Claude Desktop requires. Public clients (no
+//     secret) use PKCE to protect the code exchange.
+//
+// The provider mounts public endpoints at the server root:
 //
 //   - GET  /.well-known/oauth-protected-resource   (RFC 9728 pointer)
 //   - GET  /.well-known/oauth-authorization-server (RFC 8414 metadata)
-//   - POST /oauth/token                            (client_credentials)
+//   - POST /oauth/token                            (both grant types)
+//   - GET  /oauth/authorize                        (authorization_code)
 //
 // Clients are registered out-of-band via `pagefault oauth-client
 // create`, which appends a bcrypt-hashed secret to ClientsFile.
+// No dynamic client registration (DCR) endpoint is provided —
+// operators pre-register clients and paste credentials into the
+// MCP client's configuration UI.
 type OAuth2Config struct {
 	// ClientsFile is a JSONL file where each line is an OAuth2 client
-	// record (id, label, bcrypt secret_hash, scopes, metadata).
-	// Required when Mode is "oauth2".
+	// record (id, label, bcrypt secret_hash, scopes, redirect_uris,
+	// metadata). Required when Mode is "oauth2".
 	ClientsFile string `yaml:"clients_file,omitempty"`
 	// Issuer overrides the `iss` value advertised in the RFC 8414
 	// metadata document and the `resource` value in RFC 9728. Empty
@@ -204,8 +212,21 @@ type OAuth2Config struct {
 	// token when the client does not request any. Empty means
 	// ["mcp"] — a single broad scope that matches the MCP client
 	// ecosystem convention. Fine-grained per-tool scopes are not
-	// supported in 0.7.0.
+	// supported.
 	DefaultScopes []string `yaml:"default_scopes,omitempty"`
+	// AuthCodeTTLSeconds controls how long an authorization code is
+	// valid. Zero means "use the default of 60 seconds". Short TTLs
+	// limit the window for code interception; PKCE provides the
+	// cryptographic protection against use by anyone other than the
+	// code_verifier holder.
+	AuthCodeTTLSeconds int `yaml:"auth_code_ttl_seconds,omitempty"`
+	// AutoApprove controls whether GET /oauth/authorize immediately
+	// redirects with an authorization code (true) or renders a
+	// consent page for the operator to click (false). Nil (unset)
+	// defaults to true — on a single-operator self-hosted server the
+	// operator is authorizing themselves, so clicking a consent
+	// button adds no security value.
+	AutoApprove *bool `yaml:"auto_approve,omitempty"`
 }
 
 // AccessTokenTTLOrDefault returns the access token TTL as a Go
@@ -224,6 +245,24 @@ func (o OAuth2Config) DefaultScopesOrDefault() []string {
 		return []string{"mcp"}
 	}
 	return o.DefaultScopes
+}
+
+// AuthCodeTTLOrDefault returns the authorization code TTL in seconds,
+// defaulting to 60 when zero or unset.
+func (o OAuth2Config) AuthCodeTTLOrDefault() int {
+	if o.AuthCodeTTLSeconds <= 0 {
+		return 60
+	}
+	return o.AuthCodeTTLSeconds
+}
+
+// AutoApproveOrDefault returns whether the authorize endpoint should
+// skip the consent page, defaulting to true when nil.
+func (o OAuth2Config) AutoApproveOrDefault() bool {
+	if o.AutoApprove == nil {
+		return true
+	}
+	return *o.AutoApprove
 }
 
 // BackendConfig is a generic backend configuration. Type-specific fields are

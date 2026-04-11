@@ -167,6 +167,8 @@ func New(cfg *config.Config, d *dispatcher.ToolDispatcher, authP auth.AuthProvid
 		r.Get("/.well-known/oauth-protected-resource", s.handleOAuthProtectedResource)
 		r.Get("/.well-known/oauth-authorization-server", s.handleOAuthAuthorizationServer)
 		r.Post("/oauth/token", s.handleOAuthToken)
+		r.Get("/oauth/authorize", s.handleOAuthAuthorize)
+		r.Post("/oauth/authorize", s.handleOAuthAuthorize)
 	}
 
 	// Authenticated endpoints. Rate limiting runs after auth so the
@@ -301,7 +303,9 @@ func (s *Server) handleRoot(w http.ResponseWriter, _ *http.Request) {
 	if s.oauth2P != nil {
 		_, _ = io.WriteString(w, "  GET  /.well-known/oauth-protected-resource   — RFC 9728\n")
 		_, _ = io.WriteString(w, "  GET  /.well-known/oauth-authorization-server — RFC 8414\n")
-		_, _ = io.WriteString(w, "  POST /oauth/token        — OAuth2 client_credentials grant\n")
+		_, _ = io.WriteString(w, "  POST /oauth/token        — OAuth2 token endpoint\n")
+		_, _ = io.WriteString(w, "  GET  /oauth/authorize    — OAuth2 authorization endpoint\n")
+		_, _ = io.WriteString(w, "  POST /oauth/authorize    — OAuth2 consent form handler\n")
 	}
 	_, _ = io.WriteString(w, "  POST /api/pf_maps        — list memory regions (contexts)\n")
 	_, _ = io.WriteString(w, "  POST /api/pf_load        — load a region by name\n")

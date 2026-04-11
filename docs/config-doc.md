@@ -237,6 +237,8 @@ auth:
     # issuer: "https://pagefault.example.com"  # optional override
     # access_token_ttl_seconds: 3600
     # default_scopes: ["mcp"]
+    # auth_code_ttl_seconds: 60               # authorization code lifetime (default 60)
+    # auto_approve: true                       # skip consent page (default true)
 ```
 
 | Field                           | Type     | Required when          | Notes |
@@ -249,6 +251,8 @@ auth:
 | `oauth2.issuer`                 | URL      | optional               | Override for the `iss` / `authorization_servers` value in the RFC 9728 + RFC 8414 discovery documents. Empty falls back to `server.public_url`, then to the incoming request's scheme + host (honouring `X-Forwarded-Proto` / `X-Forwarded-Host` when present). |
 | `oauth2.access_token_ttl_seconds` | int    | optional               | Access token lifetime in seconds. Default `3600` (1 hour). Claude Desktop re-exchanges its credentials automatically when its cached token expires, so a short TTL is safe and limits the blast radius of a leaked token. |
 | `oauth2.default_scopes`         | string[] | optional               | Scope list attached to newly issued tokens when the caller requests none. Default `["mcp"]` matches the MCP client ecosystem convention. |
+| `oauth2.auth_code_ttl_seconds`  | int      | optional               | Authorization code lifetime in seconds. Default `60`. Short TTL limits the window for code interception; 60s is generous enough for a browser redirect round-trip. |
+| `oauth2.auto_approve`           | bool     | optional               | When `true` (default), `GET /oauth/authorize` immediately redirects with the authorization code — no consent page is shown. Set `false` to render an HTML consent page before issuing the code. Single-operator servers should leave this at the default; the operator is authorizing themselves. |
 
 ### Token file format (`bearer`)
 
@@ -262,25 +266,29 @@ One JSON object per line, blank lines and `#`-prefixed comment lines allowed:
 
 Tokens are managed with `pagefault token create / ls / revoke`.
 
-### `mode: oauth2` — client_credentials grant (shipped in 0.7.0)
+### `mode: oauth2` — client_credentials + authorization code (shipped in 0.7.0, auth code + PKCE in 0.8.0)
 
-`mode: "oauth2"` runs an RFC 6749 §4.4 client_credentials provider
-against an operator-managed client registry. It exists to make
-pagefault reachable from Claude Desktop's built-in SSE MCP
-configuration, whose credential UI only exposes **Client ID** and
-**Client Secret** fields — there is no way to attach a plain
-`Authorization: Bearer` header to the SSE GET. Other SSE-capable MCP
-clients benefit from the same endpoints.
+`mode: "oauth2"` runs two RFC 6749 grant types against an
+operator-managed client registry:
 
-When oauth2 mode is active, three new endpoints are mounted on the
+1. **client_credentials** (0.7.0) — for programmatic clients that
+   exchange a static client_id + client_secret for a token.
+2. **authorization_code + PKCE** (0.8.0) — for interactive clients
+   like Claude Desktop that use the MCP-standard browser-based
+   OAuth 2.1 flow. PKCE (S256 only) protects the flow; public
+   clients (no client_secret) authenticate via PKCE alone.
+
+When oauth2 mode is active, five public endpoints are mounted on the
 server **outside** the auth middleware (they have to be reachable
 before a token exists):
 
 | Endpoint | Spec | Purpose |
 |---|---|---|
 | `GET /.well-known/oauth-protected-resource` | [RFC 9728](https://datatracker.ietf.org/doc/html/rfc9728) | Points MCP clients at the authorization server for this resource. |
-| `GET /.well-known/oauth-authorization-server` | [RFC 8414](https://datatracker.ietf.org/doc/html/rfc8414) | Advertises the token endpoint, supported grants (`client_credentials`), and supported auth methods (`client_secret_basic`, `client_secret_post`). |
-| `POST /oauth/token` | [RFC 6749 §4.4](https://datatracker.ietf.org/doc/html/rfc6749#section-4.4) | Exchanges client credentials for an opaque access token (default 1-hour TTL). Accepts credentials via HTTP Basic or form body. |
+| `GET /.well-known/oauth-authorization-server` | [RFC 8414](https://datatracker.ietf.org/doc/html/rfc8414) | Advertises the authorization endpoint, token endpoint, supported grants (`client_credentials`, `authorization_code`), response types (`code`), code challenge methods (`S256`), and supported auth methods. |
+| `GET /oauth/authorize` | [RFC 6749 §4.1](https://datatracker.ietf.org/doc/html/rfc6749#section-4.1) | Authorization endpoint for the auth code flow. Validates client_id, redirect_uri, PKCE code_challenge, and state. Auto-approves by default (redirects immediately with code). |
+| `POST /oauth/authorize` | [RFC 6749 §4.1](https://datatracker.ietf.org/doc/html/rfc6749#section-4.1) | Consent form submission (when `auto_approve: false`). |
+| `POST /oauth/token` | [RFC 6749](https://datatracker.ietf.org/doc/html/rfc6749) | Exchanges client credentials (client_credentials) or authorization code (authorization_code + PKCE) for an access token. |
 
 The discovery endpoints are always public; the token endpoint is
 public but authenticates via client credentials rather than bearer
@@ -289,19 +297,33 @@ tokens. The MCP and `/api/*` routes continue to require
 
 #### Clients file format
 
-One JSON object per line, with a **bcrypt** secret hash. The
-plaintext secret is printed exactly once by `pagefault oauth-client
-create` and is not stored anywhere else:
+One JSON object per line, with a **bcrypt** secret hash (confidential
+clients) or no secret at all (public clients). The plaintext secret
+is printed exactly once by `pagefault oauth-client create` and is
+not stored anywhere else:
 
 ```jsonl
-# OAuth2 clients — managed via `pagefault oauth-client`
-{"id":"claude-desktop","label":"Claude Desktop","secret_hash":"$2a$10$...","scopes":["mcp"],"metadata":{"created_at":"2026-04-11T00:00:00Z"}}
+# Confidential client (client_credentials or authorization_code with secret)
+{"id":"claude-desktop","label":"Claude Desktop","secret_hash":"$2a$10$...","scopes":["mcp"],"redirect_uris":["http://localhost:3000/callback"],"metadata":{"created_at":"2026-04-11T00:00:00Z"}}
+# Public client (authorization_code + PKCE only, no secret)
+{"id":"claude-desktop-public","label":"Claude Desktop (PKCE)","secret_hash":"","scopes":["mcp"],"redirect_uris":["http://localhost:3000/callback"],"metadata":{"created_at":"2026-04-11T00:00:00Z"}}
 ```
 
 The CLI workflow mirrors `pagefault token`:
 
 ```bash
+# Confidential client (has a secret, can use client_credentials)
 pagefault oauth-client create --label "Claude Desktop" --config ./pagefault.yaml
+
+# Public client (no secret, PKCE-only authorization code flow)
+pagefault oauth-client create --label "Claude Desktop" --public \
+  --redirect-uris "http://localhost:3000/callback" --config ./pagefault.yaml
+
+# With explicit redirect URIs (required for authorization_code flow)
+pagefault oauth-client create --label "Claude Desktop" \
+  --redirect-uris "http://localhost:3000/callback,http://localhost:4000/callback" \
+  --config ./pagefault.yaml
+
 pagefault oauth-client ls                                --config ./pagefault.yaml
 pagefault oauth-client revoke claude-desktop             --config ./pagefault.yaml
 ```
@@ -324,7 +346,10 @@ bearer token) keeps working unchanged. Audit log entries look the
 same either way — the caller id + label come from whichever store
 matched.
 
-#### Worked example: Claude Desktop via native SSE
+#### Worked example: Claude Desktop via authorization code + PKCE
+
+Claude Desktop uses the MCP-standard OAuth 2.1 flow with PKCE. The
+recommended setup is a **public client** (no client_secret):
 
 ```yaml
 server:
@@ -343,6 +368,8 @@ auth:
     clients_file: "/etc/pagefault/oauth-clients.jsonl"
     access_token_ttl_seconds: 3600
     default_scopes: ["mcp"]
+    auth_code_ttl_seconds: 60    # auth code lifetime (default 60)
+    auto_approve: true           # skip consent page (default true)
   bearer:
     # Claude Code keeps using its static bearer token via this
     # fallback path; only Claude Desktop needs the OAuth2 flow.
@@ -350,28 +377,33 @@ auth:
 ```
 
 ```bash
-# 1. Register Claude Desktop as an OAuth2 client.
+# 1. Register Claude Desktop as a public OAuth2 client.
 pagefault oauth-client create --label "Claude Desktop" \
+  --public \
+  --redirect-uris "http://localhost:3000/callback" \
   --config /etc/pagefault/pagefault.yaml
 #   id:     claude-desktop
 #   label:  Claude Desktop
 #   scopes: mcp
-#   secret: pf_cs_XXXXXXXXXXXXXXXXXXXXXXXX
-#
-#   Record this secret now — it will not be shown again.
+#   redirect_uris: http://localhost:3000/callback
+#   type:   public (PKCE-only, no client_secret)
 
 # 2. Start pagefault.
 pagefault serve --config /etc/pagefault/pagefault.yaml
 ```
 
 Then in Claude Desktop's MCP SSE configuration, set the server URL
-to `https://pagefault.example.com/sse`, paste `claude-desktop` into
-the Client ID field, and paste the printed `pf_cs_...` string into
-the Client Secret field. Claude Desktop will hit
-`POST /oauth/token` with HTTP Basic credentials, receive a
-short-lived bearer token, and attach it to every subsequent
-request. The 0.6.1 SSE keepalive ensures long `pf_fault` calls
-survive idle proxy timeouts.
+to `https://pagefault.example.com/sse` and paste `claude-desktop`
+into the Client ID field. Leave the Client Secret field empty.
+When you click connect, Claude Desktop will discover the
+authorization endpoint, open a browser tab (auto-approved by
+default), and exchange the authorization code for a token using
+PKCE — no client_secret needed.
+
+If you prefer the older client_credentials flow instead, register
+a confidential client (omit `--public`) and paste both the Client
+ID and the printed `pf_cs_...` secret into Claude Desktop's
+configuration.
 
 #### Issuer resolution and reverse proxies
 

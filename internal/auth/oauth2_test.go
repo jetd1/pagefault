@@ -2,11 +2,14 @@ package auth
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -52,6 +55,24 @@ func newOAuth2ProviderForTest(t *testing.T, path string, ttlSeconds int) *OAuth2
 		OAuth2: config.OAuth2Config{
 			ClientsFile:           path,
 			AccessTokenTTLSeconds: ttlSeconds,
+			DefaultScopes:         []string{"mcp"},
+		},
+	}
+	p, err := NewOAuth2Provider(cfg)
+	require.NoError(t, err)
+	return p
+}
+
+// newOAuth2ProviderWithAuthCodeTTL is like newOAuth2ProviderForTest
+// but also sets a custom auth code TTL (for expiry tests).
+func newOAuth2ProviderWithAuthCodeTTL(t *testing.T, path string, accessTokenTTL, authCodeTTL int) *OAuth2Provider {
+	t.Helper()
+	cfg := config.AuthConfig{
+		Mode: "oauth2",
+		OAuth2: config.OAuth2Config{
+			ClientsFile:           path,
+			AccessTokenTTLSeconds: accessTokenTTL,
+			AuthCodeTTLSeconds:    authCodeTTL,
 			DefaultScopes:         []string{"mcp"},
 		},
 	}
@@ -441,4 +462,294 @@ func TestGenerateAccessTokenAndClientSecret_Unique(t *testing.T) {
 	require.NoError(t, err)
 	assert.NotEqual(t, s1, s2)
 	assert.True(t, len(s1) > len("pf_cs_")+20)
+}
+
+// ── Authorization code + PKCE tests ──
+
+// seedPublicClient writes a clients JSONL file with a public client
+// (no secret, redirect_uris only) and returns the path.
+func seedPublicClient(t *testing.T, dir, id string, redirectURIs []string) string {
+	t.Helper()
+	path := filepath.Join(dir, "clients.jsonl")
+	rec := ClientRecord{
+		ID:           id,
+		Label:        id + "-label",
+		RedirectURIs: redirectURIs,
+		Scopes:       []string{"mcp"},
+	}
+	f, err := os.Create(path)
+	require.NoError(t, err)
+	require.NoError(t, json.NewEncoder(f).Encode(&rec))
+	require.NoError(t, f.Close())
+	return path
+}
+
+// seedMixedClients writes a clients JSONL with one confidential and
+// one public client.
+func seedMixedClients(t *testing.T, dir string) string {
+	t.Helper()
+	path := filepath.Join(dir, "clients.jsonl")
+	f, err := os.Create(path)
+	require.NoError(t, err)
+	// Confidential client.
+	h, err := HashClientSecret("s3cret")
+	require.NoError(t, err)
+	require.NoError(t, json.NewEncoder(f).Encode(&ClientRecord{
+		ID: "confidential", Label: "Confidential",
+		SecretHash: h, Scopes: []string{"mcp"},
+	}))
+	// Public client.
+	require.NoError(t, json.NewEncoder(f).Encode(&ClientRecord{
+		ID: "public", Label: "Public",
+		RedirectURIs: []string{"http://localhost:3000/callback"},
+		Scopes:       []string{"mcp"},
+	}))
+	require.NoError(t, f.Close())
+	return path
+}
+
+// pkceChallenge computes BASE64URL(SHA256(verifier)) — the S256
+// code_challenge method from RFC 7636.
+func pkceChallenge(t *testing.T, verifier string) string {
+	t.Helper()
+	h := sha256.Sum256([]byte(verifier))
+	return base64.RawURLEncoding.EncodeToString(h[:])
+}
+
+func TestOAuth2Provider_IssueAuthorizationCode_HappyPath(t *testing.T) {
+	dir := t.TempDir()
+	path := seedMixedClients(t, dir)
+	p := newOAuth2ProviderForTest(t, path, 3600)
+
+	challenge := pkceChallenge(t, "my-code-verifier")
+	ac, err := p.IssueAuthorizationCode("public", "http://localhost:3000/callback", nil, "test-state", challenge, "S256")
+	require.NoError(t, err)
+	assert.NotEmpty(t, ac.Code)
+	assert.True(t, strings.HasPrefix(ac.Code, "pf_ac_"))
+	assert.Equal(t, "public", ac.ClientID)
+	assert.Equal(t, "http://localhost:3000/callback", ac.RedirectURI)
+	assert.Equal(t, "test-state", ac.State)
+	assert.Equal(t, challenge, ac.CodeChallenge)
+	assert.Equal(t, "S256", ac.CodeChallengeMethod)
+	assert.False(t, ac.Consumed)
+	assert.True(t, time.Until(ac.ExpiresAt) > 50*time.Second)
+}
+
+func TestOAuth2Provider_IssueAuthorizationCode_UnknownClient(t *testing.T) {
+	dir := t.TempDir()
+	path := seedMixedClients(t, dir)
+	p := newOAuth2ProviderForTest(t, path, 3600)
+
+	_, err := p.IssueAuthorizationCode("ghost", "http://localhost:3000/callback", nil, "state", "challenge", "S256")
+	assert.ErrorIs(t, err, ErrInvalidClient)
+}
+
+func TestOAuth2Provider_IssueAuthorizationCode_InvalidRedirectURI(t *testing.T) {
+	dir := t.TempDir()
+	path := seedMixedClients(t, dir)
+	p := newOAuth2ProviderForTest(t, path, 3600)
+
+	_, err := p.IssueAuthorizationCode("public", "http://evil.com/callback", nil, "state", "challenge", "S256")
+	assert.ErrorIs(t, err, model.ErrInvalidRequest)
+}
+
+func TestOAuth2Provider_IssueAuthorizationCode_NoRegisteredURIs(t *testing.T) {
+	dir := t.TempDir()
+	path, _ := seedClients(t, dir, map[string]string{
+		"confidential": "s3cret",
+	})
+	p := newOAuth2ProviderForTest(t, path, 3600)
+
+	// Confidential client has no redirect_uris — auth code flow not
+	// allowed for this client.
+	_, err := p.IssueAuthorizationCode("confidential", "http://localhost:3000/callback", nil, "state", "challenge", "S256")
+	assert.ErrorIs(t, err, model.ErrInvalidRequest)
+}
+
+func TestOAuth2Provider_ExchangeAuthorizationCode_HappyPath(t *testing.T) {
+	dir := t.TempDir()
+	path := seedMixedClients(t, dir)
+	p := newOAuth2ProviderForTest(t, path, 3600)
+
+	verifier := "my-code-verifier"
+	challenge := pkceChallenge(t, verifier)
+	ac, err := p.IssueAuthorizationCode("public", "http://localhost:3000/callback", nil, "state", challenge, "S256")
+	require.NoError(t, err)
+
+	tok, err := p.ExchangeAuthorizationCode(ac.Code, "http://localhost:3000/callback", "public", verifier)
+	require.NoError(t, err)
+	assert.NotEmpty(t, tok.AccessToken)
+	assert.True(t, strings.HasPrefix(tok.AccessToken, "pf_at_"))
+	assert.Equal(t, "public", tok.ClientID)
+	assert.Equal(t, []string{"mcp"}, tok.Scopes)
+}
+
+func TestOAuth2Provider_ExchangeAuthorizationCode_ExpiredCode(t *testing.T) {
+	dir := t.TempDir()
+	path := seedMixedClients(t, dir)
+	// 1-second auth code TTL so the code expires fast.
+	p := newOAuth2ProviderWithAuthCodeTTL(t, path, 3600, 1)
+
+	verifier := "my-code-verifier"
+	challenge := pkceChallenge(t, verifier)
+	ac, err := p.IssueAuthorizationCode("public", "http://localhost:3000/callback", nil, "state", challenge, "S256")
+	require.NoError(t, err)
+
+	time.Sleep(1100 * time.Millisecond)
+
+	_, err = p.ExchangeAuthorizationCode(ac.Code, "http://localhost:3000/callback", "public", verifier)
+	assert.ErrorIs(t, err, ErrInvalidGrant)
+}
+
+func TestOAuth2Provider_ExchangeAuthorizationCode_ConsumedCode(t *testing.T) {
+	dir := t.TempDir()
+	path := seedMixedClients(t, dir)
+	p := newOAuth2ProviderForTest(t, path, 3600)
+
+	verifier := "my-code-verifier"
+	challenge := pkceChallenge(t, verifier)
+	ac, err := p.IssueAuthorizationCode("public", "http://localhost:3000/callback", nil, "state", challenge, "S256")
+	require.NoError(t, err)
+
+	// First exchange succeeds.
+	_, err = p.ExchangeAuthorizationCode(ac.Code, "http://localhost:3000/callback", "public", verifier)
+	require.NoError(t, err)
+
+	// Second exchange fails — code already consumed.
+	_, err = p.ExchangeAuthorizationCode(ac.Code, "http://localhost:3000/callback", "public", verifier)
+	assert.ErrorIs(t, err, ErrInvalidGrant)
+}
+
+func TestOAuth2Provider_ExchangeAuthorizationCode_WrongRedirectURI(t *testing.T) {
+	dir := t.TempDir()
+	path := seedMixedClients(t, dir)
+	p := newOAuth2ProviderForTest(t, path, 3600)
+
+	verifier := "my-code-verifier"
+	challenge := pkceChallenge(t, verifier)
+	ac, err := p.IssueAuthorizationCode("public", "http://localhost:3000/callback", nil, "state", challenge, "S256")
+	require.NoError(t, err)
+
+	_, err = p.ExchangeAuthorizationCode(ac.Code, "http://evil.com/callback", "public", verifier)
+	assert.ErrorIs(t, err, ErrInvalidGrant)
+}
+
+func TestOAuth2Provider_ExchangeAuthorizationCode_WrongClientID(t *testing.T) {
+	dir := t.TempDir()
+	path := seedMixedClients(t, dir)
+	p := newOAuth2ProviderForTest(t, path, 3600)
+
+	verifier := "my-code-verifier"
+	challenge := pkceChallenge(t, verifier)
+	ac, err := p.IssueAuthorizationCode("public", "http://localhost:3000/callback", nil, "state", challenge, "S256")
+	require.NoError(t, err)
+
+	_, err = p.ExchangeAuthorizationCode(ac.Code, "http://localhost:3000/callback", "wrong-client", verifier)
+	assert.ErrorIs(t, err, ErrInvalidGrant)
+}
+
+func TestOAuth2Provider_ExchangeAuthorizationCode_PKCEVerification(t *testing.T) {
+	dir := t.TempDir()
+	path := seedMixedClients(t, dir)
+	p := newOAuth2ProviderForTest(t, path, 3600)
+
+	verifier := "correct-code-verifier"
+	challenge := pkceChallenge(t, verifier)
+	ac, err := p.IssueAuthorizationCode("public", "http://localhost:3000/callback", nil, "state", challenge, "S256")
+	require.NoError(t, err)
+
+	// Wrong verifier → PKCE failure → invalid_grant.
+	_, err = p.ExchangeAuthorizationCode(ac.Code, "http://localhost:3000/callback", "public", "wrong-verifier")
+	assert.ErrorIs(t, err, ErrInvalidGrant)
+}
+
+func TestOAuth2Provider_ExchangeAuthorizationCode_UnknownCode(t *testing.T) {
+	dir := t.TempDir()
+	path := seedMixedClients(t, dir)
+	p := newOAuth2ProviderForTest(t, path, 3600)
+
+	_, err := p.ExchangeAuthorizationCode("pf_ac_nonexistent", "http://localhost:3000/callback", "public", "verifier")
+	assert.ErrorIs(t, err, ErrInvalidGrant)
+}
+
+func TestVerifyCodeChallenge(t *testing.T) {
+	verifier := "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+	// Expected challenge from RFC 7636 Appendix B.
+	challenge := "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+	assert.True(t, verifyCodeChallenge(verifier, challenge))
+	assert.False(t, verifyCodeChallenge("wrong", challenge))
+	assert.False(t, verifyCodeChallenge(verifier, "wrong"))
+}
+
+func TestOAuth2Provider_PublicClient_NoSecret(t *testing.T) {
+	dir := t.TempDir()
+	path := seedPublicClient(t, dir, "claude-desktop", []string{
+		"http://localhost:3000/callback",
+		"http://127.0.0.1:3000/callback",
+	})
+	p := newOAuth2ProviderForTest(t, path, 3600)
+	assert.Equal(t, 1, p.ClientCount())
+
+	// Public client can use auth code flow.
+	verifier := "my-verifier"
+	challenge := pkceChallenge(t, verifier)
+	ac, err := p.IssueAuthorizationCode("claude-desktop", "http://localhost:3000/callback", nil, "state", challenge, "S256")
+	require.NoError(t, err)
+
+	tok, err := p.ExchangeAuthorizationCode(ac.Code, "http://localhost:3000/callback", "claude-desktop", verifier)
+	require.NoError(t, err)
+	assert.Equal(t, "claude-desktop", tok.ClientID)
+
+	// Public client cannot use client_credentials (no secret).
+	_, err = p.IssueToken(context.Background(), "claude-desktop", "", nil)
+	assert.ErrorIs(t, err, ErrInvalidClient)
+}
+
+func TestOAuth2Provider_PublicClient_MultipleRedirectURIs(t *testing.T) {
+	dir := t.TempDir()
+	path := seedPublicClient(t, dir, "multi", []string{
+		"http://localhost:3000/callback",
+		"http://127.0.0.1:3000/callback",
+	})
+	p := newOAuth2ProviderForTest(t, path, 3600)
+
+	verifier := "v"
+	challenge := pkceChallenge(t, verifier)
+
+	// Both redirect URIs work.
+	ac1, err := p.IssueAuthorizationCode("multi", "http://localhost:3000/callback", nil, "s1", challenge, "S256")
+	require.NoError(t, err)
+	assert.NotNil(t, ac1)
+
+	ac2, err := p.IssueAuthorizationCode("multi", "http://127.0.0.1:3000/callback", nil, "s2", challenge, "S256")
+	require.NoError(t, err)
+	assert.NotNil(t, ac2)
+}
+
+func TestNewOAuth2Provider_RejectsRecordWithNoSecretAndNoURIs(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "clients.jsonl")
+	f, err := os.Create(path)
+	require.NoError(t, err)
+	require.NoError(t, json.NewEncoder(f).Encode(&ClientRecord{
+		ID: "bad", Label: "Bad", Scopes: []string{"mcp"},
+	}))
+	require.NoError(t, f.Close())
+
+	cfg := config.AuthConfig{
+		Mode:   "oauth2",
+		OAuth2: config.OAuth2Config{ClientsFile: path},
+	}
+	_, err = NewOAuth2Provider(cfg)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "empty secret_hash and no redirect_uris")
+}
+
+func TestGenerateAuthCode_Unique(t *testing.T) {
+	a, err := generateAuthCode()
+	require.NoError(t, err)
+	b, err := generateAuthCode()
+	require.NoError(t, err)
+	assert.NotEqual(t, a, b)
+	assert.True(t, strings.HasPrefix(a, "pf_ac_"))
 }

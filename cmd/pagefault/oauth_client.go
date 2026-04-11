@@ -74,6 +74,8 @@ func runOAuthClientCreate(args []string) error {
 	label := fs.String("label", "", "human-readable label for the client (required)")
 	id := fs.String("id", "", "custom client id (default: derived from label)")
 	scopes := fs.String("scopes", "", "space-separated allowed scopes (default: mcp)")
+	redirectURIs := fs.String("redirect-uris", "", "comma-separated allowed redirect URIs (required for authorization_code flow)")
+	public := fs.Bool("public", false, "create a public client (no secret, PKCE-only for authorization_code flow)")
 	configPath, clientsFile := oauthClientFlags(fs)
 
 	if err := fs.Parse(args); err != nil {
@@ -106,15 +108,6 @@ func runOAuthClientCreate(args []string) error {
 		}
 	}
 
-	secret, err := auth.GenerateClientSecret()
-	if err != nil {
-		return err
-	}
-	hash, err := auth.HashClientSecret(secret)
-	if err != nil {
-		return err
-	}
-
 	var scopeList []string
 	if *scopes != "" {
 		scopeList = strings.Fields(*scopes)
@@ -122,11 +115,46 @@ func runOAuthClientCreate(args []string) error {
 		scopeList = []string{"mcp"}
 	}
 
+	// Parse redirect URIs.
+	var uriList []string
+	if *redirectURIs != "" {
+		for _, u := range strings.Split(*redirectURIs, ",") {
+			u = strings.TrimSpace(u)
+			if u != "" {
+				uriList = append(uriList, u)
+			}
+		}
+	}
+
+	// Public clients must have redirect URIs.
+	if *public && len(uriList) == 0 {
+		return errors.New("--public requires --redirect-uris (public clients use PKCE + authorization_code flow)")
+	}
+
+	var secretHash string
+	var secret string
+	if *public {
+		// Public client: no secret, PKCE-only.
+		secretHash = ""
+	} else {
+		// Confidential client: generate a secret.
+		secret, err = auth.GenerateClientSecret()
+		if err != nil {
+			return err
+		}
+		hash, err := auth.HashClientSecret(secret)
+		if err != nil {
+			return err
+		}
+		secretHash = hash
+	}
+
 	rec := auth.ClientRecord{
-		ID:         idVal,
-		Label:      *label,
-		SecretHash: hash,
-		Scopes:     scopeList,
+		ID:           idVal,
+		Label:        *label,
+		SecretHash:   secretHash,
+		Scopes:       scopeList,
+		RedirectURIs: uriList,
 		Metadata: map[string]any{
 			"created_at": time.Now().UTC().Format(time.RFC3339),
 		},
@@ -141,9 +169,18 @@ func runOAuthClientCreate(args []string) error {
 	fmt.Printf("  id:     %s\n", idVal)
 	fmt.Printf("  label:  %s\n", *label)
 	fmt.Printf("  scopes: %s\n", strings.Join(scopeList, " "))
-	fmt.Printf("  secret: %s\n", secret)
-	fmt.Printf("\nRecord this secret now — it will not be shown again.\n")
-	fmt.Printf("Use the id as the OAuth2 Client ID and the secret as the OAuth2 Client Secret.\n")
+	if len(uriList) > 0 {
+		fmt.Printf("  redirect_uris: %s\n", strings.Join(uriList, ", "))
+	}
+	if *public {
+		fmt.Printf("  type:   public (PKCE-only, no client_secret)\n")
+		fmt.Printf("\nUse the id as the OAuth2 Client ID in your client configuration.\n")
+		fmt.Printf("This is a public client — no client_secret is needed; PKCE protects the flow.\n")
+	} else {
+		fmt.Printf("  secret: %s\n", secret)
+		fmt.Printf("\nRecord this secret now — it will not be shown again.\n")
+		fmt.Printf("Use the id as the OAuth2 Client ID and the secret as the OAuth2 Client Secret.\n")
+	}
 	return nil
 }
 
@@ -170,7 +207,7 @@ func runOAuthClientList(args []string) error {
 	}
 
 	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "ID\tLABEL\tSCOPES\tCREATED")
+	fmt.Fprintln(tw, "ID\tLABEL\tTYPE\tSCOPES\tREDIRECT_URIS\tCREATED")
 	for _, r := range records {
 		created := ""
 		if r.Metadata != nil {
@@ -182,7 +219,15 @@ func runOAuthClientList(args []string) error {
 		if scopes == "" {
 			scopes = "(default)"
 		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", r.ID, r.Label, scopes, created)
+		clientType := "confidential"
+		if r.SecretHash == "" {
+			clientType = "public"
+		}
+		redirectURIs := strings.Join(r.RedirectURIs, ", ")
+		if redirectURIs == "" {
+			redirectURIs = "-"
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n", r.ID, r.Label, clientType, scopes, redirectURIs, created)
 	}
 	return tw.Flush()
 }

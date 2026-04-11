@@ -1,14 +1,15 @@
-// This file implements the OAuth2 client_credentials auth provider
-// (shipped in 0.7.0). It exists to make pagefault reachable from
-// Claude Desktop's built-in MCP SSE configuration, which only accepts
-// OAuth2 Client ID / Client Secret credentials — it cannot attach a
-// plain `Authorization: Bearer pf_...` header to the SSE GET.
+// This file implements the OAuth2 auth provider (shipped in 0.7.0,
+// extended in 0.8.0). It supports two grant types:
 //
-// The provider is deliberately minimal: client_credentials grant only,
-// opaque access tokens held in memory with a TTL, no refresh flow, no
-// PKCE, no dynamic client registration. Clients are registered
-// out-of-band via `pagefault oauth-client create`, which appends a
-// bcrypt-hashed secret to the configured clients JSONL file.
+//   - client_credentials (0.7.0): machine-to-machine auth where the
+//     client authenticates with a pre-registered client_secret.
+//   - authorization_code + PKCE (0.8.0): the MCP-standard browser-
+//     based flow that Claude Desktop requires. Public clients (no
+//     secret) use PKCE to protect the code exchange.
+//
+// No dynamic client registration (DCR) endpoint is provided —
+// operators pre-register clients via `pagefault oauth-client create`
+// and paste credentials into the MCP client's configuration UI.
 //
 // The provider runs as a **compound** provider: issued OAuth2 access
 // tokens are validated first, and — when `auth.bearer.tokens_file` is
@@ -25,6 +26,8 @@ package auth
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -46,16 +49,24 @@ import (
 // into the RFC 6749 §5.2 `invalid_client` error on the token endpoint.
 var ErrInvalidClient = errors.New("oauth2: invalid client")
 
+// ErrInvalidGrant is returned by ExchangeAuthorizationCode when the
+// authorization code is expired, consumed, or otherwise invalid.
+// Callers translate this into the RFC 6749 §5.2 `invalid_grant` error.
+var ErrInvalidGrant = errors.New("oauth2: invalid grant")
+
 // ClientRecord is one line of the OAuth2 clients JSONL file. The
 // secret is stored hashed via bcrypt — `pagefault oauth-client create`
 // prints the plaintext secret exactly once at creation time and does
-// not store it anywhere else.
+// not store it anywhere else. Public clients (those using
+// authorization_code + PKCE without a secret) have an empty SecretHash
+// and at least one RedirectURI.
 type ClientRecord struct {
-	ID         string         `json:"id"`
-	Label      string         `json:"label"`
-	SecretHash string         `json:"secret_hash"`
-	Scopes     []string       `json:"scopes,omitempty"`
-	Metadata   map[string]any `json:"metadata,omitempty"`
+	ID           string         `json:"id"`
+	Label        string         `json:"label"`
+	SecretHash   string         `json:"secret_hash"`
+	Scopes       []string       `json:"scopes,omitempty"`
+	RedirectURIs []string       `json:"redirect_uris,omitempty"`
+	Metadata     map[string]any `json:"metadata,omitempty"`
 }
 
 // IssuedToken is one access token currently held in the in-memory
@@ -69,6 +80,23 @@ type IssuedToken struct {
 	ExpiresAt   time.Time
 }
 
+// AuthorizationCode is a short-lived, one-time-use authorization code
+// issued by the authorization endpoint (GET /oauth/authorize). Codes
+// live for the configured AuthCodeTTL (default 60s), can only be
+// exchanged once (Consumed is set on first use), and are bound to a
+// specific client_id, redirect_uri, and PKCE code_challenge.
+type AuthorizationCode struct {
+	Code                string
+	ClientID            string
+	RedirectURI         string
+	Scopes              []string
+	State               string
+	CodeChallenge       string
+	CodeChallengeMethod string
+	ExpiresAt           time.Time
+	Consumed            bool
+}
+
 // OAuth2Provider implements AuthProvider for the OAuth2 mode. It
 // validates bearer tokens against an in-memory access-token store,
 // with an optional fallback to BearerTokenAuth for the compound-mode
@@ -76,12 +104,15 @@ type IssuedToken struct {
 type OAuth2Provider struct {
 	clientsPath string
 
-	mu      sync.RWMutex
-	clients map[string]ClientRecord // keyed by client id
-	issued  map[string]IssuedToken  // keyed by access token string
+	mu        sync.RWMutex
+	clients   map[string]ClientRecord      // keyed by client id
+	issued    map[string]IssuedToken       // keyed by access token string
+	authCodes map[string]AuthorizationCode // keyed by code string
 
 	ttl           time.Duration
+	authCodeTTL   time.Duration
 	defaultScopes []string
+	autoApprove   bool
 
 	fallback AuthProvider // nil unless bearer.tokens_file is also configured
 }
@@ -102,8 +133,11 @@ func NewOAuth2Provider(cfg config.AuthConfig) (*OAuth2Provider, error) {
 		clientsPath:   cfg.OAuth2.ClientsFile,
 		clients:       map[string]ClientRecord{},
 		issued:        map[string]IssuedToken{},
+		authCodes:     map[string]AuthorizationCode{},
 		ttl:           time.Duration(cfg.OAuth2.AccessTokenTTLOrDefault()) * time.Second,
+		authCodeTTL:   time.Duration(cfg.OAuth2.AuthCodeTTLOrDefault()) * time.Second,
 		defaultScopes: cfg.OAuth2.DefaultScopesOrDefault(),
+		autoApprove:   cfg.OAuth2.AutoApproveOrDefault(),
 	}
 	if err := p.ReloadClients(); err != nil {
 		return nil, err
@@ -143,8 +177,11 @@ func (p *OAuth2Provider) ReloadClients() error {
 		if r.ID == "" {
 			return fmt.Errorf("auth: oauth2: record with empty id in %s", p.clientsPath)
 		}
-		if r.SecretHash == "" {
-			return fmt.Errorf("auth: oauth2: record %q has empty secret_hash", r.ID)
+		// Confidential clients must have a secret_hash. Public clients
+		// (those using authorization_code + PKCE) may have an empty
+		// secret_hash but must have at least one redirect_uri.
+		if r.SecretHash == "" && len(r.RedirectURIs) == 0 {
+			return fmt.Errorf("auth: oauth2: record %q has empty secret_hash and no redirect_uris (must be either confidential or public)", r.ID)
 		}
 		if _, dup := m[r.ID]; dup {
 			return fmt.Errorf("auth: oauth2: duplicate client id %q in %s", r.ID, p.clientsPath)
@@ -310,12 +347,18 @@ func (p *OAuth2Provider) IssueToken(ctx context.Context, clientID, providedSecre
 }
 
 // sweepExpiredLocked removes every expired token from the issued
-// map. Caller must hold p.mu as a write lock.
+// map and every expired authorization code from the authCodes map.
+// Caller must hold p.mu as a write lock.
 func (p *OAuth2Provider) sweepExpiredLocked() {
 	now := time.Now()
 	for k, it := range p.issued {
 		if !it.ExpiresAt.IsZero() && now.After(it.ExpiresAt) {
 			delete(p.issued, k)
+		}
+	}
+	for k, ac := range p.authCodes {
+		if !ac.ExpiresAt.IsZero() && now.After(ac.ExpiresAt) {
+			delete(p.authCodes, k)
 		}
 	}
 }
@@ -332,6 +375,189 @@ func (p *OAuth2Provider) ClientCount() int {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	return len(p.clients)
+}
+
+// LookupClient returns the ClientRecord for the given client ID, or
+// false if no such client is registered. Exported so the authorize
+// endpoint can validate client_id and look up redirect URIs.
+func (p *OAuth2Provider) LookupClient(clientID string) (ClientRecord, bool) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	rec, ok := p.clients[clientID]
+	return rec, ok
+}
+
+// AutoApprove returns whether the provider is configured to skip the
+// consent page on the authorization endpoint.
+func (p *OAuth2Provider) AutoApprove() bool {
+	return p.autoApprove
+}
+
+// ValidateClientSecret checks if the provided secret matches the
+// stored hash for the given client. Returns true if the client is
+// confidential and the secret matches. Returns false if the client
+// is public (no secret_hash) or the secret doesn't match. Used by
+// the authorization_code token exchange to authenticate confidential
+// clients without issuing a new client_credentials token.
+func (p *OAuth2Provider) ValidateClientSecret(clientID, providedSecret string) bool {
+	p.mu.RLock()
+	rec, ok := p.clients[clientID]
+	p.mu.RUnlock()
+	if !ok || rec.SecretHash == "" {
+		return false
+	}
+	return bcrypt.CompareHashAndPassword([]byte(rec.SecretHash), []byte(providedSecret)) == nil
+}
+
+// IssueAuthorizationCode validates the request parameters and issues a
+// new authorization code bound to the given client, redirect URI, and
+// PKCE code challenge. The code is stored in memory with the
+// configured AuthCodeTTL and can only be exchanged once.
+//
+// The caller (the HTTP handler) is responsible for validating
+// response_type, state presence, and code_challenge_method before
+// calling this method — it only checks that the client exists and the
+// redirect_uri is registered.
+func (p *OAuth2Provider) IssueAuthorizationCode(clientID, redirectURI string, scopes []string, state, codeChallenge, codeChallengeMethod string) (*AuthorizationCode, error) {
+	p.mu.RLock()
+	rec, ok := p.clients[clientID]
+	p.mu.RUnlock()
+	if !ok {
+		return nil, ErrInvalidClient
+	}
+	// Validate redirect_uri is registered for this client.
+	if len(rec.RedirectURIs) > 0 {
+		found := false
+		for _, ru := range rec.RedirectURIs {
+			if ru == redirectURI {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return nil, fmt.Errorf("%w: redirect_uri not registered for client %q", model.ErrInvalidRequest, clientID)
+		}
+	} else if redirectURI != "" {
+		// Client has no registered redirect_uris — this client was
+		// created for client_credentials flow only.
+		return nil, fmt.Errorf("%w: client %q has no registered redirect_uris", model.ErrInvalidRequest, clientID)
+	}
+
+	// Pick effective scopes.
+	allowed := rec.Scopes
+	if len(allowed) == 0 {
+		allowed = p.defaultScopes
+	}
+	effective := allowed
+	if len(scopes) > 0 {
+		filtered := make([]string, 0, len(scopes))
+		allowMap := make(map[string]struct{}, len(allowed))
+		for _, s := range allowed {
+			allowMap[s] = struct{}{}
+		}
+		for _, s := range scopes {
+			if _, ok := allowMap[s]; ok {
+				filtered = append(filtered, s)
+			}
+		}
+		effective = filtered
+	}
+
+	code, err := generateAuthCode()
+	if err != nil {
+		return nil, fmt.Errorf("auth: oauth2: generate auth code: %w", err)
+	}
+
+	ac := AuthorizationCode{
+		Code:                code,
+		ClientID:            clientID,
+		RedirectURI:         redirectURI,
+		Scopes:              effective,
+		State:               state,
+		CodeChallenge:       codeChallenge,
+		CodeChallengeMethod: codeChallengeMethod,
+		ExpiresAt:           time.Now().Add(p.authCodeTTL),
+	}
+
+	p.mu.Lock()
+	p.sweepExpiredLocked()
+	p.authCodes[code] = ac
+	p.mu.Unlock()
+
+	return &ac, nil
+}
+
+// ExchangeAuthorizationCode validates and consumes an authorization
+// code, verifies PKCE, and issues an access token. The code is marked
+// as consumed (one-time use) regardless of whether PKCE verification
+// succeeds — this prevents replay attacks.
+func (p *OAuth2Provider) ExchangeAuthorizationCode(code, redirectURI, clientID, codeVerifier string) (*IssuedToken, error) {
+	p.mu.Lock()
+	ac, ok := p.authCodes[code]
+	if !ok {
+		p.mu.Unlock()
+		return nil, ErrInvalidGrant
+	}
+	// Mark consumed immediately to prevent replay, even if
+	// subsequent checks fail.
+	if ac.Consumed {
+		p.mu.Unlock()
+		return nil, ErrInvalidGrant
+	}
+	ac.Consumed = true
+	p.authCodes[code] = ac
+
+	// Check expiry.
+	if !ac.ExpiresAt.IsZero() && time.Now().After(ac.ExpiresAt) {
+		p.mu.Unlock()
+		return nil, ErrInvalidGrant
+	}
+	p.mu.Unlock()
+
+	// Validate client_id matches.
+	if ac.ClientID != clientID {
+		return nil, ErrInvalidGrant
+	}
+	// Validate redirect_uri matches.
+	if ac.RedirectURI != redirectURI {
+		return nil, ErrInvalidGrant
+	}
+	// Verify PKCE code_challenge.
+	if ac.CodeChallenge != "" {
+		if !verifyCodeChallenge(codeVerifier, ac.CodeChallenge) {
+			return nil, ErrInvalidGrant
+		}
+	}
+
+	// Look up the client record to get the label for the issued token.
+	p.mu.RLock()
+	rec, ok := p.clients[clientID]
+	p.mu.RUnlock()
+	if !ok {
+		return nil, ErrInvalidClient
+	}
+
+	// For confidential clients, authenticate the client at the token
+	// endpoint. The HTTP handler extracts client_secret separately;
+	// this method trusts the handler to have already validated it.
+	// Public clients (empty SecretHash) skip secret validation.
+
+	raw, err := generateAccessToken()
+	if err != nil {
+		return nil, fmt.Errorf("auth: oauth2: generate access token: %w", err)
+	}
+	issued := IssuedToken{
+		AccessToken: raw,
+		ClientID:    rec.ID,
+		Label:       rec.Label,
+		Scopes:      ac.Scopes,
+		ExpiresAt:   time.Now().Add(p.ttl),
+	}
+	p.mu.Lock()
+	p.sweepExpiredLocked()
+	p.issued[raw] = issued
+	p.mu.Unlock()
+	return &issued, nil
 }
 
 // generateAccessToken returns a cryptographically random access token
@@ -365,6 +591,26 @@ func GenerateClientSecret() (string, error) {
 		return "", fmt.Errorf("auth: oauth2: generate client secret: %w", err)
 	}
 	return "pf_cs_" + base64.RawURLEncoding.EncodeToString(raw[:]), nil
+}
+
+// generateAuthCode returns a cryptographically random authorization
+// code with a "pf_ac_" prefix to distinguish it from access tokens
+// and client secrets in logs.
+func generateAuthCode() (string, error) {
+	var raw [32]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return "", err
+	}
+	return "pf_ac_" + base64.RawURLEncoding.EncodeToString(raw[:]), nil
+}
+
+// verifyCodeChallenge computes BASE64URL(SHA256(codeVerifier)) and
+// compares it against the expected challenge using constant-time
+// comparison, per RFC 7636 §4.6.
+func verifyCodeChallenge(verifier, expectedChallenge string) bool {
+	h := sha256.Sum256([]byte(verifier))
+	computed := base64.RawURLEncoding.EncodeToString(h[:])
+	return subtle.ConstantTimeCompare([]byte(computed), []byte(expectedChallenge)) == 1
 }
 
 // ParseClientsJSONL parses an OAuth2 clients JSONL file. Blank lines
