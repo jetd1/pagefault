@@ -4,9 +4,9 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/jet/pagefault/internal/backend"
-	"github.com/jet/pagefault/internal/dispatcher"
-	"github.com/jet/pagefault/internal/model"
+	"jetd.one/pagefault/internal/backend"
+	"jetd.one/pagefault/internal/dispatcher"
+	"jetd.one/pagefault/internal/model"
 )
 
 // ReadInput is the request shape for read.

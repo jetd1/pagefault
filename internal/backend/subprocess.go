@@ -12,8 +12,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jet/pagefault/internal/config"
-	"github.com/jet/pagefault/internal/model"
+	"jetd.one/pagefault/internal/config"
+	"jetd.one/pagefault/internal/model"
 )
 
 // SubprocessBackend runs an external command to answer Search requests.

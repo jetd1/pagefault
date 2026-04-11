@@ -12,11 +12,11 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/jet/pagefault/internal/audit"
-	"github.com/jet/pagefault/internal/backend"
-	"github.com/jet/pagefault/internal/filter"
-	"github.com/jet/pagefault/internal/model"
-	"github.com/jet/pagefault/internal/task"
+	"jetd.one/pagefault/internal/audit"
+	"jetd.one/pagefault/internal/backend"
+	"jetd.one/pagefault/internal/filter"
+	"jetd.one/pagefault/internal/model"
+	"jetd.one/pagefault/internal/task"
 )
 
 // mockSubagent implements backend.SubagentBackend for dispatcher tests.

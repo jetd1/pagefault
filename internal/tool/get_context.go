@@ -4,8 +4,8 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/jet/pagefault/internal/dispatcher"
-	"github.com/jet/pagefault/internal/model"
+	"jetd.one/pagefault/internal/dispatcher"
+	"jetd.one/pagefault/internal/model"
 )
 
 // GetContextInput is the request shape for get_context.

@@ -258,6 +258,29 @@ bash scripts/smoke.sh   # end-to-end smoke test
 
 ## Recent Changes
 
+### 0.11.1 — 2026-04-12
+
+- **Two 0.11.0 follow-up fixes.** (1) The landing page's version
+  badge no longer drifts from `VERSION` — `web/index.html` now
+  carries a `{{version}}` sentinel in the three places where
+  the version string appears (nav badge, footer badge,
+  quickstart `pagefault --version` snippet), and
+  `internal/server.New` substitutes it at startup against the
+  injected `Version` variable, serving the rendered bytes
+  through `http.ServeContent` (so Content-Type, Content-Length,
+  Last-Modified, HEAD, and Range handling all stay correct).
+  0.11.0 shipped with `v0.10.1` literally hardcoded in the HTML —
+  cosmetic but embarrassing; this fix makes the class of bug
+  impossible on future bumps. (2) The Go module path has been
+  renamed from `github.com/jet/pagefault` to the vanity path
+  `jetd.one/pagefault`. `go.mod` plus every `import` statement
+  (144 occurrences across 51 Go files) has been rewritten; no
+  runtime behaviour changes, and the GitHub hosting URL
+  (`github.com/jetd1/pagefault`) is unchanged. Module path and
+  hosting URL are now correctly treated as two independent
+  identifiers, closing the confusion that caused 0.11.0's
+  initial href bug.
+
 ### 0.11.0 — 2026-04-12
 
 - **Landing site + design system.** `pagefault serve` now
@@ -301,31 +324,6 @@ bash scripts/smoke.sh   # end-to-end smoke test
   `task.Manager.Wait` TTL-sweep race, task-manager cleanup on
   `dispatcher.New` failure, and audit-log error wrapping for
   `GenerateSpawnID`. Regression tests added under `-race`.
-
-### 0.10.0 — 2026-04-11
-
-- **Async `pf_fault` + `{spawn_id}` session isolation.** Two
-  architectural changes that fix the "every pf_fault pollutes the
-  main session" class of bugs reported against real openclaw
-  deployments. First, subagent backends now accept a new
-  `{spawn_id}` placeholder in their command / URL / body template
-  — pagefault mints a cryptographically random `pf_sp_*` token per
-  call and substitutes it in-place, so wiring e.g. `openclaw agent
-  run --session-id {spawn_id} …` gives one fresh session per
-  `pf_fault` call. Second, `pf_fault` is now **async by default**:
-  it returns `{task_id, status: "running"}` immediately and the
-  subagent runs on a detached goroutine (HTTP disconnects no longer
-  kill the spawn). Callers poll `pf_ps(task_id=...)` every 30
-  seconds (up to 6 times ≈ 3 minutes for the default 120s budget)
-  until the status is terminal. `wait: true` restores the old
-  synchronous behaviour as a compatibility escape hatch; the CLI
-  (`pagefault fault`) still defaults to sync for human-friendly
-  blocking. New `server.tasks.{ttl_seconds, max_concurrent}` config
-  block tunes the task manager (defaults 600s TTL, 16 concurrent).
-  `pf_poke` mode:agent continues to return synchronously (the
-  write path expects placement confirmation before returning),
-  but the spawn still runs on the detached goroutine so proxy
-  timeouts no longer kill it.
 
 See [`CHANGELOG.md`](CHANGELOG.md) for the full history.
 

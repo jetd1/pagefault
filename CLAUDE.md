@@ -45,7 +45,7 @@ pagefault/
 ├── VERSION                               # Current version (single line, read by the Makefile and -ldflags)
 ├── README.md                             # Quick-start guide
 ├── Makefile                              # build/test/lint/run/clean/smoke targets
-├── go.mod                                # Go module: github.com/jet/pagefault
+├── go.mod                                # Go module: jetd.one/pagefault (vanity path; repo lives at github.com/jetd1/pagefault)
 ├── go.sum                                # Module checksums
 ├── .gitignore                            # Go-standard ignores
 │

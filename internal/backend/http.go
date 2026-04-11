@@ -11,8 +11,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jet/pagefault/internal/config"
-	"github.com/jet/pagefault/internal/model"
+	"jetd.one/pagefault/internal/config"
+	"jetd.one/pagefault/internal/model"
 )
 
 // HTTPBackend is a generic HTTP-call-and-parse backend. It answers

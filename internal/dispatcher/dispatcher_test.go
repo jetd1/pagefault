@@ -11,11 +11,11 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/jet/pagefault/internal/audit"
-	"github.com/jet/pagefault/internal/backend"
-	"github.com/jet/pagefault/internal/config"
-	"github.com/jet/pagefault/internal/filter"
-	"github.com/jet/pagefault/internal/model"
+	"jetd.one/pagefault/internal/audit"
+	"jetd.one/pagefault/internal/backend"
+	"jetd.one/pagefault/internal/config"
+	"jetd.one/pagefault/internal/filter"
+	"jetd.one/pagefault/internal/model"
 )
 
 // jsonUnmarshal is a tiny test helper that parses a JSON string into v,

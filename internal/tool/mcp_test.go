@@ -13,7 +13,7 @@ import (
 	mcppkg "github.com/mark3labs/mcp-go/mcp"
 	mcpserver "github.com/mark3labs/mcp-go/server"
 
-	"github.com/jet/pagefault/internal/backend"
+	"jetd.one/pagefault/internal/backend"
 )
 
 // ────────────────── result-helper tests ──────────────────

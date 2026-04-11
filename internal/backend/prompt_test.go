@@ -7,7 +7,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/jet/pagefault/internal/config"
+	"jetd.one/pagefault/internal/config"
 )
 
 // TestDefaultTemplates_NotEmptyAndDistinct guards against the two

@@ -33,7 +33,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jet/pagefault/internal/auth"
+	"jetd.one/pagefault/internal/auth"
 )
 
 // oauthError is the RFC 6749 §5.2 error envelope emitted by the

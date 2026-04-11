@@ -13,9 +13,9 @@ import (
 
 	"github.com/bmatcuk/doublestar/v4"
 
-	"github.com/jet/pagefault/internal/config"
-	"github.com/jet/pagefault/internal/model"
-	"github.com/jet/pagefault/internal/write"
+	"jetd.one/pagefault/internal/config"
+	"jetd.one/pagefault/internal/model"
+	"jetd.one/pagefault/internal/write"
 )
 
 // FilesystemBackend serves files from a local directory tree. It is the core

@@ -6,8 +6,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jet/pagefault/internal/dispatcher"
-	"github.com/jet/pagefault/internal/model"
+	"jetd.one/pagefault/internal/dispatcher"
+	"jetd.one/pagefault/internal/model"
 )
 
 // DeepRetrieveInput is the request shape for pf_fault.

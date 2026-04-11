@@ -3,8 +3,8 @@ package tool
 import (
 	"context"
 
-	"github.com/jet/pagefault/internal/dispatcher"
-	"github.com/jet/pagefault/internal/model"
+	"jetd.one/pagefault/internal/dispatcher"
+	"jetd.one/pagefault/internal/model"
 )
 
 // ListAgentsInput is the request shape for pf_ps.

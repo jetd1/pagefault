@@ -15,8 +15,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/jet/pagefault/internal/config"
-	"github.com/jet/pagefault/internal/model"
+	"jetd.one/pagefault/internal/config"
+	"jetd.one/pagefault/internal/model"
 )
 
 // Entry is a single audit log line.

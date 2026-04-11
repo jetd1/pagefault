@@ -12,14 +12,14 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/jet/pagefault/internal/audit"
-	"github.com/jet/pagefault/internal/auth"
-	"github.com/jet/pagefault/internal/backend"
-	"github.com/jet/pagefault/internal/config"
-	"github.com/jet/pagefault/internal/dispatcher"
-	"github.com/jet/pagefault/internal/filter"
-	"github.com/jet/pagefault/internal/server"
-	"github.com/jet/pagefault/internal/task"
+	"jetd.one/pagefault/internal/audit"
+	"jetd.one/pagefault/internal/auth"
+	"jetd.one/pagefault/internal/backend"
+	"jetd.one/pagefault/internal/config"
+	"jetd.one/pagefault/internal/dispatcher"
+	"jetd.one/pagefault/internal/filter"
+	"jetd.one/pagefault/internal/server"
+	"jetd.one/pagefault/internal/task"
 )
 
 // runServe parses flags, loads config, wires every subsystem together, and

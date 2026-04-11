@@ -8,7 +8,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/jet/pagefault/internal/config"
+	"jetd.one/pagefault/internal/config"
 )
 
 // corsTestHandler is a throwaway handler used by the CORS middleware tests.

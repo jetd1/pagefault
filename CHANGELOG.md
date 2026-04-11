@@ -7,6 +7,94 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+## 0.11.1 (2026-04-12)
+
+Two follow-ups to 0.11.0 bundled into one patch release — both of
+them flushing out pre-existing 0.11.0 bugs that came from conflating
+identifiers that were supposed to be distinct:
+
+1. **Landing-page version badge is now live.** 0.11.0 shipped with
+   `v0.10.1` hardcoded in the nav badge, the footer badge, and the
+   quickstart `pagefault --version` snippet — a cosmetic bug caused
+   by me forgetting to bump hand-written HTML on the release. Fixed
+   by introducing a `{{version}}` sentinel the server substitutes
+   at startup against the injected `Version` variable.
+2. **Go module path renamed to a vanity path** — `jetd.one/pagefault`
+   replaces `github.com/jet/pagefault`. This corrects the
+   module-path / hosting-URL confusion that caused me to wrongly
+   write `github.com/jet/pagefault` into the landing site's GitHub
+   hyperlinks during 0.11.0, and establishes a stable vanity
+   identifier the module can live under permanently.
+
+No runtime behaviour changes: every binary, config key, tool, HTTP
+endpoint, CLI verb, audit-log field, and wire format continues to
+work identically.
+
+### Fixed
+
+- **Landing page version badge no longer drifts from `VERSION`.**
+  `web/index.html` now carries a `{{version}}` sentinel in the
+  three places where the version string appears — the nav badge,
+  the footer badge, and the `pagefault --version` line in the
+  quickstart code block. `internal/server.New` reads `index.html`
+  from the embed FS at server startup, substitutes the sentinel
+  against the package-level `Version` variable via
+  `bytes.ReplaceAll`, and serves the resulting bytes from a
+  closure that wraps `http.ServeContent`. Since `ServeContent`
+  handles Content-Type, Content-Length, Last-Modified, HEAD
+  body-stripping, `If-Modified-Since`, and Range requests, the
+  switch from `FileServerFS` to a custom handler costs nothing
+  in HTTP semantics. The substitution happens exactly once per
+  process, the byte slice is shared across requests, and each
+  request instantiates its own `bytes.NewReader` for the seek
+  state. A new assertion in
+  `TestServer_Root_ServesEmbeddedLanding` pins `"v"+Version` to
+  the served body and forbids any leftover `{{version}}` sentinel
+  — any future refactor that accidentally falls back to serving
+  `index.html` raw will break loudly.
+
+### Changed
+
+- **`go.mod` module declaration** is now `jetd.one/pagefault`
+  (was `github.com/jet/pagefault`). The vanity path is expected
+  to resolve to the hosted repository at
+  `github.com/jetd1/pagefault` via a meta-refresh served from
+  `jetd.one`; stand-up of that redirect is out of scope for this
+  commit.
+
+- **Every Go import statement rewritten** — 144 occurrences
+  across 51 files under `cmd/pagefault/`, `internal/**`, and the
+  `web/` package now carry the `jetd.one/pagefault/…` prefix.
+  The rewrite was mechanical (`git ls-files '*.go' | xargs sed`)
+  and verified by `go mod tidy` + `make build` + `make test
+  -race` + `make lint` — every package still builds and every
+  test still passes.
+
+- **`CLAUDE.md` directory-tree** comment next to `go.mod` now
+  records the vanity path and notes that the repo itself still
+  lives at `github.com/jetd1/pagefault`, to defend against the
+  same import-path / hosting-URL confusion that bit the landing
+  site in 0.11.0.
+
+### Not changed
+
+- **GitHub repo URL.** Hyperlinks in `web/index.html`,
+  `README.md`, the site footer, and every `gh` invocation
+  continue to point at `https://github.com/jetd1/pagefault`.
+  The Go module path and the repository hosting URL are two
+  independent identifiers; changing one does not imply the
+  other.
+
+- **Binary surface.** Binary name, CLI verbs, YAML config keys,
+  HTTP routes, REST / MCP / SSE / OAuth2 wire formats, and
+  audit-log field names are all untouched.
+
+- **Historical CHANGELOG entries.** The prior rename from
+  `page-fault` to `pagefault` that set the module path to
+  `github.com/jet/pagefault` is left as it was shipped — it
+  correctly recorded the state at the time of that release and
+  is not rewritten.
+
 ## 0.11.0 (2026-04-12)
 
 First user-facing surface beyond the API. `pagefault serve` now

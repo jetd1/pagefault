@@ -11,10 +11,10 @@ import (
 	"strings"
 	"text/tabwriter"
 
-	"github.com/jet/pagefault/internal/config"
-	"github.com/jet/pagefault/internal/dispatcher"
-	"github.com/jet/pagefault/internal/model"
-	"github.com/jet/pagefault/internal/tool"
+	"jetd.one/pagefault/internal/config"
+	"jetd.one/pagefault/internal/dispatcher"
+	"jetd.one/pagefault/internal/model"
+	"jetd.one/pagefault/internal/tool"
 )
 
 // cliCaller is the fixed Caller identity attributed to `pagefault <tool>`

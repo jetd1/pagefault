@@ -3,8 +3,8 @@ package tool
 import (
 	"context"
 
-	"github.com/jet/pagefault/internal/dispatcher"
-	"github.com/jet/pagefault/internal/model"
+	"jetd.one/pagefault/internal/dispatcher"
+	"jetd.one/pagefault/internal/model"
 )
 
 // ListContextsInput has no fields; it is included for symmetry with the

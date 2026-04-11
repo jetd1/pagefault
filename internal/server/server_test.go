@@ -17,14 +17,14 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/jet/pagefault/internal/audit"
-	"github.com/jet/pagefault/internal/auth"
-	"github.com/jet/pagefault/internal/backend"
-	"github.com/jet/pagefault/internal/config"
-	"github.com/jet/pagefault/internal/dispatcher"
-	"github.com/jet/pagefault/internal/filter"
-	"github.com/jet/pagefault/internal/model"
-	"github.com/jet/pagefault/internal/tool"
+	"jetd.one/pagefault/internal/audit"
+	"jetd.one/pagefault/internal/auth"
+	"jetd.one/pagefault/internal/backend"
+	"jetd.one/pagefault/internal/config"
+	"jetd.one/pagefault/internal/dispatcher"
+	"jetd.one/pagefault/internal/filter"
+	"jetd.one/pagefault/internal/model"
+	"jetd.one/pagefault/internal/tool"
 )
 
 // newTestServer spins up a full pagefault Server with a filesystem backend
@@ -594,10 +594,13 @@ func TestServer_OpenAPISpec_IncludesPoke(t *testing.T) {
 
 // TestServer_Root_ServesEmbeddedLanding proves `/` is wired to the
 // embedded landing site in the `web` package: the response is HTML,
-// the brand and tagline are present, and every `pf_*` tool is
-// referenced by name in the tools table. This is a smoke test — if
-// it fails after a redesign, rewrite the assertions, don't loosen
-// them.
+// the brand and tagline are present, every `pf_*` tool is referenced
+// by name in the tools table, and — critically — the `{{version}}`
+// sentinel has been substituted at server startup with the live
+// [Version] value (which in `go test` builds is the source default
+// "dev", since tests don't pass `-ldflags -X main.version=...`). If
+// this test fails after a redesign, rewrite the assertions, don't
+// loosen them.
 func TestServer_Root_ServesEmbeddedLanding(t *testing.T) {
 	ts, _ := newTestServer(t, "none", "")
 	resp, body := get(t, ts, "/", "")
@@ -615,6 +618,16 @@ func TestServer_Root_ServesEmbeddedLanding(t *testing.T) {
 		assert.Contains(t, s, name,
 			"tool %q should appear on the landing page", name)
 	}
+	// The version substitution is the whole point of rendering
+	// the landing through a handler instead of FileServerFS —
+	// verify the sentinel was replaced and the live Version value
+	// appears in the served body. Guards against future refactors
+	// that accidentally serve index.html raw.
+	assert.NotContains(t, s, versionSentinel,
+		"version sentinel should be substituted at server startup")
+	require.NotEmpty(t, Version, "server.Version should never be empty")
+	assert.Contains(t, s, "v"+Version,
+		"landing should carry the live Version (%q) in the badge", Version)
 }
 
 // TestServer_StaticAssets_Served verifies the four static asset

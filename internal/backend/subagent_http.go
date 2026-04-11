@@ -10,8 +10,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jet/pagefault/internal/config"
-	"github.com/jet/pagefault/internal/model"
+	"jetd.one/pagefault/internal/config"
+	"jetd.one/pagefault/internal/model"
 )
 
 // SubagentHTTPBackend spawns an agent by POSTing to a configured HTTP

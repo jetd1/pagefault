@@ -25,9 +25,9 @@ import (
 
 	"golang.org/x/time/rate"
 
-	"github.com/jet/pagefault/internal/auth"
-	"github.com/jet/pagefault/internal/config"
-	"github.com/jet/pagefault/internal/model"
+	"jetd.one/pagefault/internal/auth"
+	"jetd.one/pagefault/internal/config"
+	"jetd.one/pagefault/internal/model"
 )
 
 // rateLimiter is a thread-safe registry of per-caller token buckets.

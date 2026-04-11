@@ -18,8 +18,8 @@ import (
 
 	"github.com/bmatcuk/doublestar/v4"
 
-	"github.com/jet/pagefault/internal/config"
-	"github.com/jet/pagefault/internal/model"
+	"jetd.one/pagefault/internal/config"
+	"jetd.one/pagefault/internal/model"
 )
 
 // Filter is the composable unit of the pipeline. Filters return true to allow

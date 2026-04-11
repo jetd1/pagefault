@@ -13,7 +13,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/jet/pagefault/internal/config"
+	"jetd.one/pagefault/internal/config"
 )
 
 // corsMiddleware returns an HTTP middleware that applies CORS headers from

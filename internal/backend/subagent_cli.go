@@ -9,8 +9,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jet/pagefault/internal/config"
-	"github.com/jet/pagefault/internal/model"
+	"jetd.one/pagefault/internal/config"
+	"jetd.one/pagefault/internal/model"
 )
 
 // SubagentCLIBackend spawns an external CLI process to do deep retrieval.

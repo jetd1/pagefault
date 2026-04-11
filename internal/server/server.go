@@ -16,6 +16,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -28,14 +29,22 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 	mcpserver "github.com/mark3labs/mcp-go/server"
 
-	"github.com/jet/pagefault/internal/auth"
-	"github.com/jet/pagefault/internal/backend"
-	"github.com/jet/pagefault/internal/config"
-	"github.com/jet/pagefault/internal/dispatcher"
-	"github.com/jet/pagefault/internal/model"
-	"github.com/jet/pagefault/internal/tool"
-	"github.com/jet/pagefault/web"
+	"jetd.one/pagefault/internal/auth"
+	"jetd.one/pagefault/internal/backend"
+	"jetd.one/pagefault/internal/config"
+	"jetd.one/pagefault/internal/dispatcher"
+	"jetd.one/pagefault/internal/model"
+	"jetd.one/pagefault/internal/tool"
+	"jetd.one/pagefault/web"
 )
+
+// versionSentinel is the placeholder the embedded landing page
+// (web/index.html) uses for the running binary's version string.
+// Rendered once at server startup against [Version] so the badge
+// in the nav, the `pagefault --version` line in the quickstart
+// snippet, and the footer chip can never drift from VERSION on
+// a release bump. Governed by docs/design.md §11.
+const versionSentinel = "{{version}}"
 
 // Version is injected by cmd/pagefault so the /health endpoint can report it.
 var Version = "dev"
@@ -150,24 +159,53 @@ func New(cfg *config.Config, d *dispatcher.ToolDispatcher, authP auth.AuthProvid
 	r.Use(corsMiddleware(cfg.Server.CORS))
 
 	// Static landing site served from the embedded `web` package.
-	// Governed by docs/design.md — index.html at `/` plus the
-	// named assets. Served via net/http.FileServerFS so content
-	// types come from the file extension and ETag / Last-Modified
-	// headers are handled by the stdlib. Each asset is registered
-	// as an explicit GET+HEAD pair rather than a catch-all so it
-	// never shadows /api/*, /mcp, /sse, or the OAuth2 routes below.
-	// HEAD matters for link-preview crawlers and proxy probes —
-	// chi.Get does not imply HEAD the way net/http.FileServer does.
+	// Governed by docs/design.md. Two layers:
+	//
+	//   1. GET/HEAD `/` serves index.html with the `{{version}}`
+	//      sentinel replaced by the live [Version] string. The
+	//      substitution runs once at New() and the resulting
+	//      bytes are served by net/http.ServeContent, which
+	//      handles Content-Type, Content-Length, Last-Modified,
+	//      HEAD, If-Modified-Since, and Range for free. Doing
+	//      the substitution at startup (rather than per request)
+	//      means every GET is a static byte copy and eliminates
+	//      the class of bug where a release bump leaves the
+	//      landing-page version badge stale.
+	//
+	//   2. GET/HEAD `/styles.css`, `/script.js`, `/favicon.svg`,
+	//      `/icons.svg` served by net/http.FileServerFS straight
+	//      from the embed. Each asset is an explicit GET+HEAD
+	//      pair (chi.Get does not imply HEAD the way
+	//      net/http.FileServer does) so link-preview crawlers
+	//      and proxy probes don't 405. Explicit paths (no
+	//      catch-all) so /api/*, /mcp, /sse, and the OAuth2
+	//      routes below are never shadowed.
+	indexBytes, err := web.Files.ReadFile("index.html")
+	if err != nil {
+		return nil, fmt.Errorf("server: read embedded index.html: %w", err)
+	}
+	indexBytes = bytes.ReplaceAll(indexBytes, []byte(versionSentinel), []byte(Version))
+	landingModTime := time.Now().UTC()
+	// Each request gets its own bytes.Reader because the reader's
+	// seek offset is mutated by ServeContent and readers are not
+	// concurrency-safe. The underlying []byte is immutable and
+	// shared, so this is O(1) per request.
+	landingHandler := func(w http.ResponseWriter, req *http.Request) {
+		http.ServeContent(w, req, "index.html", landingModTime, bytes.NewReader(indexBytes))
+	}
+
+	r.Get("/", landingHandler)
+	r.Head("/", landingHandler)
+
 	webAssets := http.FileServerFS(web.Files)
-	static := func(path string) {
+	staticAsset := func(path string) {
 		r.Get(path, webAssets.ServeHTTP)
 		r.Head(path, webAssets.ServeHTTP)
 	}
-	static("/")
-	static("/styles.css")
-	static("/script.js")
-	static("/favicon.svg")
-	static("/icons.svg")
+	staticAsset("/styles.css")
+	staticAsset("/script.js")
+	staticAsset("/favicon.svg")
+	staticAsset("/icons.svg")
 
 	// Public endpoints (no auth).
 	r.Get("/health", s.handleHealth)

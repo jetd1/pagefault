@@ -8,8 +8,8 @@ import (
 	mcppkg "github.com/mark3labs/mcp-go/mcp"
 	mcpserver "github.com/mark3labs/mcp-go/server"
 
-	"github.com/jet/pagefault/internal/auth"
-	"github.com/jet/pagefault/internal/dispatcher"
+	"jetd.one/pagefault/internal/auth"
+	"jetd.one/pagefault/internal/dispatcher"
 )
 
 // RegisterMCP registers every enabled tool on the given MCP server. The

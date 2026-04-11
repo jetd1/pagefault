@@ -15,7 +15,7 @@ package server
 import (
 	"net/http"
 
-	"github.com/jet/pagefault/internal/dispatcher"
+	"jetd.one/pagefault/internal/dispatcher"
 )
 
 // buildOpenAPISpec returns a JSON-serializable OpenAPI 3.1.0 document for

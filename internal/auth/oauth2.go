@@ -44,8 +44,8 @@ import (
 
 	"golang.org/x/crypto/bcrypt"
 
-	"github.com/jet/pagefault/internal/config"
-	"github.com/jet/pagefault/internal/model"
+	"jetd.one/pagefault/internal/config"
+	"jetd.one/pagefault/internal/model"
 )
 
 // ErrInvalidClient is returned by IssueToken when the client id or

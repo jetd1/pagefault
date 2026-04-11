@@ -17,12 +17,12 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/jet/pagefault/internal/audit"
-	"github.com/jet/pagefault/internal/backend"
-	"github.com/jet/pagefault/internal/config"
-	"github.com/jet/pagefault/internal/filter"
-	"github.com/jet/pagefault/internal/model"
-	"github.com/jet/pagefault/internal/task"
+	"jetd.one/pagefault/internal/audit"
+	"jetd.one/pagefault/internal/backend"
+	"jetd.one/pagefault/internal/config"
+	"jetd.one/pagefault/internal/filter"
+	"jetd.one/pagefault/internal/model"
+	"jetd.one/pagefault/internal/task"
 )
 
 // ToolDispatcher routes tool calls to backends, applies filters, and audits

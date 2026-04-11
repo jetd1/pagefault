@@ -12,8 +12,8 @@ import (
 	"text/tabwriter"
 	"time"
 
-	"github.com/jet/pagefault/internal/auth"
-	"github.com/jet/pagefault/internal/config"
+	"jetd.one/pagefault/internal/auth"
+	"jetd.one/pagefault/internal/config"
 )
 
 // runOAuthClient dispatches `pagefault oauth-client <subcommand>`. The
