@@ -258,6 +258,25 @@ bash scripts/smoke.sh   # end-to-end smoke test
 
 ## Recent Changes
 
+### 0.10.1 — 2026-04-11
+
+- **Three regressions from 0.10.0 fixed.** (1) A panic in any
+  backend `Spawn` method no longer crashes the entire server — the
+  task manager's detached goroutine now recovers panics and
+  converts them into `StatusFailed` tasks (before, the goroutine
+  was outside `net/http`'s panic-recovery reach and an
+  unrecovered panic killed the whole `pagefault` binary). (2)
+  `pf_poke` mode:agent no longer reports failed subagent writes as
+  `{status:"written", result:""}` — the handler now inspects the
+  task snapshot's `Status` field and returns
+  `ErrBackendUnavailable` for `failed` / non-terminal tasks
+  instead of silently losing the content. (3) `pf_poke` mode:agent
+  surfaces caller-cancel-during-Wait as an error rather than a
+  false success. Plus three low-severity nits around the
+  `task.Manager.Wait` TTL-sweep race, task-manager cleanup on
+  `dispatcher.New` failure, and audit-log error wrapping for
+  `GenerateSpawnID`. Regression tests added under `-race`.
+
 ### 0.10.0 — 2026-04-11
 
 - **Async `pf_fault` + `{spawn_id}` session isolation.** Two
@@ -295,35 +314,6 @@ bash scripts/smoke.sh   # end-to-end smoke test
   comparisons elsewhere), and a misleading comment in
   `isLocalhostOrHTTPS` was rewritten. No behavior change beyond the
   constant-time compare. See CHANGELOG.md for details.
-
-### 0.9.0 — 2026-04-11
-
-- **RFC 7591 Dynamic Client Registration (`POST /register`).** When
-  `auth.oauth2.dcr_enabled: true` is set, pagefault mounts a public
-  `/register` endpoint that lets MCP clients like Claude Desktop's
-  remote-connector UI self-register as public OAuth2 clients
-  (PKCE-only, no `client_secret`) without running
-  `pagefault oauth-client create` by hand. Dynamically-registered
-  client IDs get a `pf_dcr_` prefix, are persisted via atomic
-  append+fsync to the clients JSONL file, and appear with
-  `SOURCE=dcr` in `oauth-client ls`. Redirect URIs are restricted
-  to localhost or HTTPS per MCP security conventions. DCR is opt-in
-  because it creates clients without authentication; operators
-  running on internet-exposed deployments should gate it with
-  `auth.oauth2.dcr_bearer_token` or a reverse-proxy ACL.
-  `grant_types: ["refresh_token"]` is silently accepted to avoid
-  breaking Claude Desktop's DCR request.
-
-- **CORS preflight handling fixed.** The auth middleware now passes
-  OPTIONS requests with `Access-Control-Request-Method` through
-  unauthenticated so the CORS middleware upstream can handle them
-  (browsers never attach credentials to preflights, so
-  authenticating them always failed and blocked the subsequent
-  real request). The CORS middleware unconditionally short-circuits
-  preflights with 204 — allowed origins get CORS headers, disallowed
-  origins get no CORS headers (the browser rejects the response
-  either way). Plain OPTIONS without `Access-Control-Request-Method`
-  is NOT a preflight and still requires auth.
 
 See [`CHANGELOG.md`](CHANGELOG.md) for the full history.
 

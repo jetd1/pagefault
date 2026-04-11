@@ -335,3 +335,40 @@ func TestStatus_IsTerminal(t *testing.T) {
 	assert.True(t, StatusFailed.IsTerminal())
 	assert.True(t, StatusTimedOut.IsTerminal())
 }
+
+// TestSubmit_PanicRecovered — a panic in Run is converted into a
+// StatusFailed task instead of crashing the goroutine (and with
+// it the whole process). The error message preserves the panic
+// value so operators can correlate with upstream bug reports.
+//
+// Regression test for 0.10.1: before the recover() was added,
+// this test would have taken the binary down with an unhandled
+// goroutine panic.
+func TestSubmit_PanicRecovered(t *testing.T) {
+	m := NewManager(Config{})
+	defer m.Close()
+
+	snap, err := m.Submit(SubmitRequest{
+		Agent:   "alpha",
+		Backend: "cli",
+		Timeout: 5 * time.Second,
+		Run: func(ctx context.Context) (string, error) {
+			panic("boom")
+		},
+	})
+	require.NoError(t, err)
+
+	done, err := m.Wait(context.Background(), snap.ID)
+	require.NoError(t, err)
+	assert.Equal(t, StatusFailed, done.Status)
+	assert.Contains(t, done.Error, "subagent panic")
+	assert.Contains(t, done.Error, "boom")
+	assert.Empty(t, done.Result)
+	assert.NotNil(t, done.CompletedAt)
+
+	// The running counter must have been decremented even though
+	// the panic short-circuited the normal terminal-state code
+	// path. Otherwise the manager's max_concurrent slot bleeds
+	// out with each panic.
+	assert.Equal(t, 0, m.Stats().Running)
+}

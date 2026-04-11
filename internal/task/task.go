@@ -267,11 +267,30 @@ func (m *Manager) Submit(req SubmitRequest) (*Task, error) {
 // against the detached ctx, updates the entry with the terminal
 // status, closes the done channel, and decrements the running
 // counter.
+//
+// A panic from req.Run is converted into a StatusFailed task with
+// Error="task: subagent panic: <value>". Without the recover, a
+// panic here would escape an unhandled goroutine and crash the
+// whole pagefault binary — Go's net/http panic recovery only
+// catches panics inside request handler goroutines, and run() is
+// detached from the HTTP call stack on purpose. Every backend
+// Spawn method is user-facing code we do not control, so treat
+// panics as the normal "subagent failed" path instead of a
+// process-level fatal.
 func (m *Manager) run(e *entry, ctx context.Context, cancel context.CancelFunc, req SubmitRequest) {
 	defer m.wg.Done()
 	defer cancel()
 
-	result, err := req.Run(ctx)
+	var result string
+	var err error
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				err = fmt.Errorf("task: subagent panic: %v", r)
+			}
+		}()
+		result, err = req.Run(ctx)
+	}()
 	completed := time.Now().UTC()
 
 	m.mu.Lock()
@@ -320,6 +339,13 @@ func (m *Manager) Get(id string) (*Task, error) {
 // running in the background. Subsequent Get calls will eventually
 // return the final state. This is the whole point of the async
 // model — caller disconnect does not cancel the subagent.
+//
+// On the done path we snapshot e.task directly rather than calling
+// Get, because Get triggers a TTL sweep and with a sub-second TTL
+// the just-finished entry could be reclaimed between the done
+// signal and the map lookup. Holding a reference to `e` keeps the
+// entry alive for the read even after a concurrent sweep removes
+// it from the map.
 func (m *Manager) Wait(ctx context.Context, id string) (*Task, error) {
 	m.mu.Lock()
 	e, ok := m.tasks[id]
@@ -329,7 +355,10 @@ func (m *Manager) Wait(ctx context.Context, id string) (*Task, error) {
 	}
 	select {
 	case <-e.done:
-		return m.Get(id)
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		snapshot := e.task
+		return &snapshot, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}

@@ -694,9 +694,13 @@ func (d *ToolDispatcher) DeepRetrieve(ctx context.Context, query string, agentID
 		return nil, err
 	}
 
-	spawnID, err := task.GenerateSpawnID()
-	if err != nil {
-		return nil, fmt.Errorf("dispatcher: generate spawn id: %w", err)
+	spawnID, genErr := task.GenerateSpawnID()
+	if genErr != nil {
+		// Assign the wrapped error to the audit local so the
+		// deferred audit.NewEntry call records the dispatcher-
+		// framed context, not just the raw rand.Read failure.
+		err = fmt.Errorf("dispatcher: generate spawn id: %w", genErr)
+		return nil, err
 	}
 
 	// Submit the task to the in-memory manager. Run() wraps
@@ -721,7 +725,7 @@ func (d *ToolDispatcher) DeepRetrieve(ctx context.Context, query string, agentID
 			if errors.Is(spawnErr, model.ErrSubagentTimeout) {
 				slog.Warn("deep_retrieve: subagent timed out",
 					"agent", agentName, "backend", target.Name(),
-					"caller", caller.ID, "task_id", "", "spawn_id", spawnID)
+					"caller", caller.ID, "spawn_id", spawnID)
 				return "", &task.TimeoutError{Partial: answer}
 			}
 			return answer, spawnErr
@@ -891,9 +895,10 @@ func (d *ToolDispatcher) DelegateWrite(ctx context.Context, content string, agen
 		return nil, err
 	}
 
-	spawnID, err := task.GenerateSpawnID()
-	if err != nil {
-		return nil, fmt.Errorf("dispatcher: generate spawn id: %w", err)
+	spawnID, genErr := task.GenerateSpawnID()
+	if genErr != nil {
+		err = fmt.Errorf("dispatcher: generate spawn id: %w", genErr)
+		return nil, err
 	}
 
 	submitted, submitErr := d.tasks.Submit(task.SubmitRequest{

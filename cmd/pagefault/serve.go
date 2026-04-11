@@ -202,6 +202,10 @@ func buildDispatcher(cfg *config.Config) (*dispatcher.ToolDispatcher, func() err
 		Tasks:    tasks,
 	})
 	if err != nil {
+		// Close both dependencies we just constructed — tasks has
+		// no running goroutines yet but staying symmetric with
+		// auditLog keeps the error path obviously leak-free.
+		_ = tasks.Close()
 		_ = auditLog.Close()
 		return nil, nil, err
 	}

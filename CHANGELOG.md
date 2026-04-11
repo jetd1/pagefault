@@ -7,6 +7,72 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+## 0.10.1 (2026-04-11)
+
+Retrospective-driven fixes for three regressions introduced with the
+0.10.0 async task manager. The behavioural gaps were not caught by
+the 0.10.0 test suite because no tests exercised backend panics or
+non-timeout subagent failures in the detached-goroutine flow.
+
+### Fixed
+
+- **Panic in subagent `Spawn` no longer crashes the server.** Before
+  0.10.0, `target.Spawn` was called synchronously from the HTTP
+  request handler goroutine, so `net/http`'s built-in panic recovery
+  absorbed any panic as a 500. 0.10.0 moved `Spawn` onto a detached
+  task-manager goroutine where `net/http` cannot reach it; an
+  unrecovered panic there crashed the entire `pagefault` binary. The
+  task manager now wraps every `req.Run` call in `defer recover()` so
+  panics are converted into `StatusFailed` tasks with
+  `Error="task: subagent panic: <value>"`, and the running counter is
+  released correctly. A new `TestSubmit_PanicRecovered` regression
+  test under `-race` exercises the path.
+
+- **`pf_poke` mode:agent reports failed subagent writes as failures,
+  not as `written:success`.** The 0.10.0 dispatcher encodes backend
+  errors on the task snapshot (`Status=failed`, `Error=...`) rather
+  than returning them via the Go error channel, and the pf_poke
+  handler was hardcoding `Status:"written"` regardless — so a failed
+  subagent silently returned `{status:"written", result:""}` and the
+  content was lost. `handleWriteAgent` now switches on `res.Status`
+  and returns `ErrBackendUnavailable` for `failed` / non-terminal
+  snapshots. Two new regression tests cover the failure and
+  caller-cancel-mid-wait paths.
+
+- **`pf_poke` mode:agent surfaces caller-cancel mid-Wait as an
+  error.** If the caller's HTTP context cancelled while the subagent
+  was still running, the dispatcher returned the running snapshot
+  with `err=nil` (intentional, for pf_fault polling) and pf_poke
+  then reported the write as successful. Same switch statement
+  rejects non-terminal snapshots from the sync write path.
+
+- **`task.Manager.Wait` is immune to the TTL sweep race.** The
+  done-channel path used to call `Get(id)`, which runs a sweep and
+  could reclaim the just-finished entry between the done signal
+  and the map lookup under a sub-second TTL. `Wait` now snapshots
+  `e.task` directly under lock, bypassing the sweep entirely. The
+  returned entry pointer keeps the record alive through
+  concurrent reclaims.
+
+- **`dispatcher.New` error path no longer leaks the task manager.**
+  `serve.go`'s `buildDispatcher` now calls `_ = tasks.Close()`
+  alongside `_ = auditLog.Close()` when `dispatcher.New` fails.
+  Harmless in practice (the freshly-constructed manager owns no
+  goroutines yet), but symmetric with the audit logger cleanup.
+
+- **Deep-retrieve audit entries capture the wrapped spawn-id error.**
+  `GenerateSpawnID` failure now assigns the wrapped
+  `"dispatcher: generate spawn id: ..."` context to the audit-log
+  local before returning, so audit rows carry the dispatcher frame
+  instead of just the raw `rand.Read` failure. Minor hygiene.
+
+- **`slog.Warn` on subagent timeout drops the placeholder empty
+  `task_id` field.** The 0.10.0 closure could not access the
+  dispatcher-assigned task id (the variable is declared by the
+  `Submit` statement the closure is an argument to), so the log
+  hint was hardcoded to `""`. Removed — the `spawn_id` is enough
+  for correlation, and a task always has exactly one.
+
 ## 0.10.0 (2026-04-11)
 
 Two architectural changes motivated by real-world openclaw integration:

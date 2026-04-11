@@ -321,11 +321,16 @@ func TestHandleWrite_DirectContentAtCapSucceeds(t *testing.T) {
 // tests. It records the full SpawnRequest so tests can assert the
 // purpose, target, and raw task (no template wrapping — the stub
 // bypasses the CLI/HTTP backend implementations that apply it).
+//
+// If `block` is set, Spawn waits on it (or on ctx.Done) before
+// returning — used by the 0.10.1 caller-cancel regression test to
+// hold the task in StatusRunning until the test's caller ctx fires.
 type agentStub struct {
 	name    string
 	agents  []backend.AgentInfo
 	answer  string
 	err     error
+	block   chan struct{}
 	lastReq backend.SpawnRequest
 }
 
@@ -340,8 +345,15 @@ func (s *agentStub) ListResources(context.Context) ([]backend.ResourceInfo, erro
 	return nil, nil
 }
 func (s *agentStub) ListAgents() []backend.AgentInfo { return s.agents }
-func (s *agentStub) Spawn(_ context.Context, req backend.SpawnRequest) (string, error) {
+func (s *agentStub) Spawn(ctx context.Context, req backend.SpawnRequest) (string, error) {
 	s.lastReq = req
+	if s.block != nil {
+		select {
+		case <-s.block:
+		case <-ctx.Done():
+			return "", ctx.Err()
+		}
+	}
 	return s.answer, s.err
 }
 
@@ -434,6 +446,84 @@ func TestHandleWrite_AgentTimeoutSurfacesAsResult(t *testing.T) {
 	require.NoError(t, err, "timeout should not escape as error")
 	assert.True(t, out.TimedOut)
 	assert.Equal(t, "partial draft", out.Result)
+}
+
+// TestHandleWrite_AgentFailureReturnsError — a non-timeout subagent
+// error must surface as a Go error, not a false {status:"written"}
+// success envelope.
+//
+// Regression test for 0.10.1. Before the handler's switch on
+// res.Status, dispatcher.DelegateWrite would encode the error onto
+// the task snapshot (Status=failed, Error=...) and return
+// (result, nil); handleWriteAgent then hardcoded Status:"written"
+// and emitted an empty Result, silently losing the content.
+func TestHandleWrite_AgentFailureReturnsError(t *testing.T) {
+	sa := &agentStub{
+		name:   "w",
+		agents: []backend.AgentInfo{{ID: "alpha"}},
+		err:    errors.New("network unreachable"),
+	}
+	d, err := dispatcher.New(dispatcher.Options{
+		Backends: []backend.Backend{sa},
+		Filter:   filter.NewCompositeFilter(),
+		Audit:    audit.NopLogger{},
+	})
+	require.NoError(t, err)
+
+	_, err = HandleWrite(context.Background(), d, WriteInput{
+		Content: "x",
+		Mode:    "agent",
+	}, model.AnonymousCaller)
+	require.Error(t, err, "subagent failure must propagate, not mask as success")
+	assert.True(t, errors.Is(err, model.ErrBackendUnavailable),
+		"failure should map to backend_unavailable so REST returns 502")
+	assert.Contains(t, err.Error(), "network unreachable",
+		"underlying error message should survive for operator diagnosis")
+}
+
+// TestHandleWrite_AgentRunningOnCallerCancelReturnsError — when the
+// caller's ctx cancels before the task completes, the dispatcher
+// returns a running snapshot; handleWriteAgent must surface that as
+// an error rather than a false success envelope.
+//
+// Regression test for 0.10.1. The task keeps running in the
+// background on the detached task-manager goroutine — that is the
+// whole point of the async model — but pf_poke mode:agent is the
+// sync-by-default path and cannot claim placement succeeded when
+// the subagent has not yet confirmed it.
+func TestHandleWrite_AgentRunningOnCallerCancelReturnsError(t *testing.T) {
+	block := make(chan struct{})
+	// Unblock the background Spawn on test cleanup so the task
+	// manager goroutine doesn't linger past the test.
+	defer close(block)
+
+	sa := &agentStub{
+		name:   "w",
+		agents: []backend.AgentInfo{{ID: "alpha"}},
+		answer: "ok",
+		block:  block,
+	}
+	d, err := dispatcher.New(dispatcher.Options{
+		Backends: []backend.Backend{sa},
+		Filter:   filter.NewCompositeFilter(),
+		Audit:    audit.NopLogger{},
+	})
+	require.NoError(t, err)
+
+	// Caller ctx: very short. Task ctx (set via TimeoutSeconds): far
+	// longer. The caller ctx fires first, Wait returns ctx.Err, the
+	// dispatcher's wait path returns the still-running snapshot.
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+
+	_, err = HandleWrite(ctx, d, WriteInput{
+		Content:        "x",
+		Mode:           "agent",
+		TimeoutSeconds: 30,
+	}, model.AnonymousCaller)
+	require.Error(t, err, "running snapshot must not be reported as written")
+	assert.True(t, errors.Is(err, model.ErrBackendUnavailable))
+	assert.Contains(t, err.Error(), "did not complete")
 }
 
 func TestCallerLabelFor_FallsBackToID(t *testing.T) {

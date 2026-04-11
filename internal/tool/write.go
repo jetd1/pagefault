@@ -168,6 +168,34 @@ func handleWriteAgent(ctx context.Context, d *dispatcher.ToolDispatcher, in Writ
 		return WriteOutput{}, err
 	}
 
+	// The dispatcher's wait path encodes backend errors on the task
+	// snapshot (Status=failed, Error=...) rather than returning
+	// them via the Go error return, so a nil err here does NOT
+	// mean the subagent succeeded. pf_poke mode:agent is supposed
+	// to confirm placement: returning "written" for a failed or
+	// still-running task would silently lose the content. Fan out
+	// by terminal status before building the success envelope.
+	//
+	// Regression fix for 0.10.1 — before this switch, failed
+	// subagents surfaced as {status:"written", result:""}.
+	switch res.Status {
+	case "done", "timed_out":
+		// fall through — both emit the success envelope, with
+		// TimedOut flagging the partial case for the client.
+	case "failed":
+		return WriteOutput{}, fmt.Errorf("%w: subagent %q failed: %s",
+			model.ErrBackendUnavailable, res.Agent, res.Error)
+	default:
+		// "running" — only reachable when the caller's ctx was
+		// cancelled mid-wait and the dispatcher returned the
+		// running snapshot. The write is still in flight on the
+		// background task manager goroutine, but we cannot
+		// confirm placement, so surface it as an error rather
+		// than a false success.
+		return WriteOutput{}, fmt.Errorf("%w: subagent task did not complete (status=%s)",
+			model.ErrBackendUnavailable, res.Status)
+	}
+
 	answer := res.Answer
 	if res.TimedOut {
 		// Preserve whatever the subagent produced before the
