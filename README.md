@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  <code>v0.11.3</code>
+  <code>v0.11.4</code>
   ·
   <a href="https://jetd1.github.io/pagefault/"><strong>live preview</strong> ↗</a>
   ·
@@ -347,6 +347,25 @@ conventions, versioning rules, and the "adding a new X" checklists.
 
 ## Recent changes
 
+### 0.11.4 — 2026-04-12
+
+- **Mobile readability on the landing site's Quick start section.**
+  Long shell commands like `./bin/pagefault peek memory://README.md
+  --config configs/minimal.yaml` used to force a horizontal scroll
+  on every step because `.code-block` was stuck with the browser
+  default `white-space: pre`. `web/styles.css` now carries
+  `white-space: pre-wrap; overflow-wrap: anywhere;` unconditionally
+  so long commands wrap at the viewport edge instead of scrolling
+  sideways — copy-paste still yields the original unwrapped text
+  because `pre-wrap` is visual-only. The `@media (max-width: 720px)`
+  block also tightens code-block padding (`16×24` → `12×16`) and
+  drops the font from `--fs-sm` (14px) to `--fs-xs` (12px), shrinks
+  mobile `.step__title` and `.step__marker` from `--fs-lg` to
+  `--fs-md` for a lighter step rail, and drops `.step__title`'s
+  bottom margin so titles sit closer to their code block. Desktop
+  layout is unchanged. Reaches the live preview via 0.11.3's
+  GitHub Pages auto-deploy.
+
 ### 0.11.3 — 2026-04-12
 
 - **Landing site auto-deployed to GitHub Pages.** New
@@ -373,26 +392,6 @@ conventions, versioning rules, and the "adding a new X" checklists.
   stays front-and-center while the `client_credentials` and `supergateway`
   fallbacks become reference material), and a **Documentation** links table
   that now includes `docs/design.md`. No content removed, no commands changed.
-
-### 0.11.1 — 2026-04-12
-
-- **Two 0.11.0 follow-up fixes.** (1) The landing page's version badge no
-  longer drifts from `VERSION` — `web/index.html` now carries a
-  `{{version}}` sentinel in the three places where the version string
-  appears (nav badge, footer badge, quickstart `pagefault --version`
-  snippet), and `internal/server.New` substitutes it at startup against
-  the injected `Version` variable, serving the rendered bytes through
-  `http.ServeContent` (so Content-Type, Content-Length, Last-Modified,
-  HEAD, and Range handling all stay correct). 0.11.0 shipped with
-  `v0.10.1` literally hardcoded in the HTML — cosmetic but embarrassing;
-  this fix makes the class of bug impossible on future bumps. (2) The Go
-  module path has been renamed from `github.com/jet/pagefault` to the
-  vanity path `jetd.one/pagefault`. `go.mod` plus every `import`
-  statement (144 occurrences across 51 Go files) has been rewritten; no
-  runtime behaviour changes, and the GitHub hosting URL
-  (`github.com/jetd1/pagefault`) is unchanged. Module path and hosting
-  URL are now correctly treated as two independent identifiers, closing
-  the confusion that caused 0.11.0's initial href bug.
 
 See [`CHANGELOG.md`](CHANGELOG.md) for the full history.
 

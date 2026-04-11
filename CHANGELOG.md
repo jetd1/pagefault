@@ -7,6 +7,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+## 0.11.4 (2026-04-12)
+
+Mobile readability polish on the landing site's Quick start section.
+No binary behaviour, wire-format, or Go code changes; purely a CSS
+tweak to `web/styles.css` that reaches the live site via the
+0.11.3 GitHub Pages auto-deploy pipeline.
+
+### Fixed
+
+- **Quick start code blocks overflowed on mobile.** On a 375px
+  viewport, `.code-block` was stuck with the browser default
+  `white-space: pre` plus `overflow-x: auto`, so every shell
+  command longer than ~28 characters — i.e. all of them, e.g.
+  `./bin/pagefault peek memory://README.md --config configs/minimal.yaml` —
+  forced a horizontal scroll. Compounding it, the `16px × 24px`
+  internal padding and 14px mono font left only ~277px of text
+  area inside a 375px viewport. Fixed with three targeted CSS
+  edits:
+  1. **Unconditional wrap.** `.code-block` now carries
+     `white-space: pre-wrap; overflow-wrap: anywhere;` on every
+     viewport. Long shell commands wrap at the edge instead of
+     overflowing; `pre-wrap` is visual-only so copy-paste still
+     yields the original unwrapped text with authored
+     whitespace preserved. Desktop layout is unaffected because
+     desktop commands already fit on one line.
+  2. **Tighter mobile code-block chrome.** The
+     `@media (max-width: 720px)` block now shrinks
+     `.code-block` padding from `var(--sp-4) var(--sp-5)` (16 × 24)
+     to `var(--sp-3) var(--sp-4)` (12 × 16) and drops the font
+     from `var(--fs-sm)` (14px) to `var(--fs-xs)` (12px) with a
+     slightly tighter `line-height: 1.5`. Net effect: the
+     horizontal text area on a 375px viewport grows from ~277px
+     to ~293px **and** the character width shrinks 14→12, so
+     `./bin/pagefault peek memory://README.md --config configs/minimal.yaml`
+     now wraps into two clean visual lines instead of a
+     sideways scroll.
+  3. **Proportional mobile step titles.** `.step__title` and the
+     `.step__marker` "01/02/03/04" glyph both drop from
+     `var(--fs-lg)` (24px) to `var(--fs-md)` (18px) on mobile so
+     the quickstart rail reads lighter alongside the tighter
+     code blocks. `.step__title`'s bottom margin also shrinks
+     from `var(--sp-3)` to `var(--sp-2)` so titles sit closer to
+     their code block.
+
+### Not changed
+
+- No Go code, no HTML, no JS, no icons.
+- Design tokens in `:root` are untouched; this is purely layout
+  and sizing on existing tokens.
+- Desktop layout of the Quick start section is visually
+  identical — `pre-wrap` only has an effect when content would
+  have overflowed, and all the other changes are gated behind
+  `@media (max-width: 720px)`.
+- No test changes: `TestServer_StaticAssets_Served` still
+  asserts `/styles.css` contains `--accent`, which it does.
+
 ## 0.11.3 (2026-04-12)
 
 The embedded landing site is now auto-deployed to GitHub Pages so

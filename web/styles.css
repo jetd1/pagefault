@@ -841,6 +841,11 @@ button { font: inherit; }
   font-size: var(--fs-sm);
   line-height: 1.55;
   color: var(--text);
+  /* let long shell commands wrap at the viewport edge instead of
+     forcing a horizontal scroll on narrow screens. pre-wrap is
+     visual-only, so copy-paste still yields the original text. */
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 .code-block code {
   background: none;
@@ -858,7 +863,19 @@ button { font: inherit; }
     border-right: none;
     border-bottom: 1px solid var(--border);
     padding: 0 0 var(--sp-2) 0;
-    font-size: var(--fs-lg);
+    font-size: var(--fs-md);
+  }
+  .step__title {
+    font-size: var(--fs-md);
+    margin-bottom: var(--sp-2);
+  }
+  .code-block {
+    /* tighter padding + smaller glyph reclaim ~30% of the horizontal
+       text area on a 375px viewport, so most commands fit in one or
+       two wrapped lines instead of three or four. */
+    padding: var(--sp-3) var(--sp-4);
+    font-size: var(--fs-xs);
+    line-height: 1.5;
   }
 }
 
