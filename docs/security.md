@@ -250,20 +250,36 @@ Security-relevant properties of the implementation:
   gate or a proxy-level access list.
 - **Public OAuth2 endpoints are outside the in-process rate
   limiter.** `server.rate_limit` keys on the authenticated
-  `caller.id`, and the discovery / token / authorize paths run
-  *before* auth, so the in-process bucket does not apply to them.
-  Of the four, `/oauth/authorize` is the only one with a
-  memory cost per request: each successful call allocates one
-  `AuthorizationCode` (~300 bytes) kept in memory until it is
-  exchanged, swept, or `auth_code_ttl_seconds` (default 60) passes.
-  At an attacker-sustained 1000 req/s this caps at roughly 18 MB,
-  which `sweepExpiredLocked` reclaims on the next `IssueToken` /
-  `IssueAuthorizationCode` call — unpleasant but bounded.
+  `caller.id`, and the discovery / token / authorize / register
+  paths run *before* auth, so the in-process bucket does not apply
+  to them. Four endpoints are always mounted when `auth.mode:
+  oauth2` is set (the two `/.well-known/` discovery documents,
+  `/oauth/token`, and `/oauth/authorize`); `POST /register` is a
+  fifth that is mounted only when `dcr_enabled: true`. Two of
+  those five carry a per-request cost and deserve tighter
+  proxy-level bounds:
+  - **`/oauth/authorize`** — each successful call allocates one
+    `AuthorizationCode` (~300 bytes) kept in memory until it is
+    exchanged, swept, or `auth_code_ttl_seconds` (default 60)
+    passes. At an attacker-sustained 1000 req/s this caps at
+    roughly 18 MB, which `sweepExpiredLocked` reclaims on the
+    next `IssueToken` / `IssueAuthorizationCode` call —
+    unpleasant but bounded.
+  - **`/register`** (DCR only) — each successful call appends a
+    line to the clients JSONL file (with `fsync`) and inserts one
+    `ClientRecord` into the in-memory client map. Unlike auth
+    codes, DCR records are *persistent* — there is no TTL sweep,
+    so sustained registration traffic grows the file and the
+    in-memory map without bound. When DCR is enabled, setting
+    `auth.oauth2.dcr_bearer_token` to gate registration is the
+    primary defence; a proxy-level rate limit on `/register` is
+    the secondary defence.
   Rate-limiting the OAuth public endpoints is the reverse proxy's
   responsibility; Caddy's `rate_limit` handler, nginx
-  `limit_req_zone`, or Hermes's upstream limiter should each apply
-  a tighter bound on `/.well-known/oauth-*`, `/oauth/authorize`,
-  and `/oauth/token` than on the authenticated MCP paths.
+  `limit_req_zone`, or Hermes's upstream limiter should each
+  apply a tighter bound on `/.well-known/oauth-*`,
+  `/oauth/authorize`, `/oauth/token`, and (when DCR is enabled)
+  `/register` than on the authenticated MCP paths.
 
 Auth middleware is applied to every authenticated route, including both
 MCP transports: streamable-http at `/mcp` and `/mcp/*`, and legacy SSE

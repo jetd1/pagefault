@@ -707,7 +707,10 @@ func isLocalhostOrHTTPS(rawURI string) bool {
 	case u.Scheme == "https":
 		return true
 	case host == "localhost", host == "127.0.0.1", host == "::1":
-		return u.Scheme == "http" // localhost must still be http(s)
+		// https://localhost is already accepted by the case above;
+		// the loopback case only needs to additionally allow http.
+		// Other schemes (ftp, file, ...) fall through to false.
+		return u.Scheme == "http"
 	default:
 		return false
 	}

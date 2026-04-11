@@ -21,6 +21,7 @@ package server
 
 import (
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -165,7 +166,12 @@ func (s *Server) handleOAuthRegister(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		parts := strings.SplitN(authHeader, " ", 2)
-		if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") || parts[1] != tok {
+		// Constant-time compare against the operator-set gate token so a
+		// timing side channel cannot leak it byte-by-byte. Low-risk over
+		// the internet (network jitter dominates) but matches the bcrypt
+		// / PKCE comparisons used elsewhere for consistency.
+		if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") ||
+			subtle.ConstantTimeCompare([]byte(parts[1]), []byte(tok)) != 1 {
 			w.Header().Set("WWW-Authenticate", `Bearer realm="pagefault"`)
 			writeOAuthError(w, http.StatusUnauthorized, "invalid_request", "invalid DCR bearer token")
 			return

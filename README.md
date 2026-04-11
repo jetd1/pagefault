@@ -15,17 +15,21 @@ directory, answers search via subprocess or HTTP backends, spawns
 real subagents for deep retrieval, writes back through a sandboxed
 append path or a subagent, and exposes the surface over MCP
 (streamable-http **and** legacy SSE), REST, and the CLI with opt-in
-rate limiting, CORS, and a live OpenAPI spec. The 0.8.0 release adds
-the MCP-standard **OAuth 2.1 authorization code + PKCE flow** so
-Claude Desktop (and any other browser-based MCP client) can
-authenticate natively — no `supergateway` bridge required — and
-0.7.0's client_credentials grant remains available as a fallback for
-programmatic clients. Seven tools (`pf_maps`, `pf_load`, `pf_scan`,
-`pf_peek`, `pf_fault`, `pf_ps`, `pf_poke`), four auth modes
-(`none` / `bearer` / `trusted_header` / `oauth2`, the last running
-compound with `bearer` for migration), path/tag/redaction filters,
-and JSONL audit logging. Tool names follow a `pf_*` scheme borrowed
-from Unix memory management and kernel debugging — see
+rate limiting, CORS, and a live OpenAPI spec. 0.8.0 added the
+MCP-standard **OAuth 2.1 authorization code + PKCE flow** so Claude
+Desktop (and any other browser-based MCP client) can authenticate
+natively without the `supergateway` bridge, and 0.9.0 layered **RFC
+7591 Dynamic Client Registration** on top so Claude Desktop's
+remote-connector UI can self-register a public client against
+`POST /register` instead of needing a manual
+`pagefault oauth-client create` step. 0.7.0's client_credentials
+grant remains available as a fallback for programmatic clients.
+Seven tools (`pf_maps`, `pf_load`, `pf_scan`, `pf_peek`, `pf_fault`,
+`pf_ps`, `pf_poke`), four auth modes (`none` / `bearer` /
+`trusted_header` / `oauth2`, the last running compound with
+`bearer` for migration), path/tag/redaction filters, and JSONL
+audit logging. Tool names follow a `pf_*` scheme borrowed from
+Unix memory management and kernel debugging — see
 `docs/api-doc.md` for the mapping.
 
 ## Quick start
@@ -251,6 +255,48 @@ bash scripts/smoke.sh   # end-to-end smoke test
 
 ## Recent Changes
 
+### 0.9.1 — 2026-04-11
+
+- **0.9.0 follow-up: doc drift + two minor code polish items.**
+  `README.md` Recent Changes and intro paragraph now reflect 0.9.0's
+  DCR; `docs/security.md` updated to cover the fifth public OAuth2
+  endpoint (`POST /register`) in the rate-limiter discussion,
+  including its per-request disk + memory cost. Code polish: the DCR
+  bearer-token gate in `handleOAuthRegister` now uses
+  `subtle.ConstantTimeCompare` (matches the bcrypt / PKCE
+  comparisons elsewhere), and a misleading comment in
+  `isLocalhostOrHTTPS` was rewritten. No behavior change beyond the
+  constant-time compare. See CHANGELOG.md for details.
+
+### 0.9.0 — 2026-04-11
+
+- **RFC 7591 Dynamic Client Registration (`POST /register`).** When
+  `auth.oauth2.dcr_enabled: true` is set, pagefault mounts a public
+  `/register` endpoint that lets MCP clients like Claude Desktop's
+  remote-connector UI self-register as public OAuth2 clients
+  (PKCE-only, no `client_secret`) without running
+  `pagefault oauth-client create` by hand. Dynamically-registered
+  client IDs get a `pf_dcr_` prefix, are persisted via atomic
+  append+fsync to the clients JSONL file, and appear with
+  `SOURCE=dcr` in `oauth-client ls`. Redirect URIs are restricted
+  to localhost or HTTPS per MCP security conventions. DCR is opt-in
+  because it creates clients without authentication; operators
+  running on internet-exposed deployments should gate it with
+  `auth.oauth2.dcr_bearer_token` or a reverse-proxy ACL.
+  `grant_types: ["refresh_token"]` is silently accepted to avoid
+  breaking Claude Desktop's DCR request.
+
+- **CORS preflight handling fixed.** The auth middleware now passes
+  OPTIONS requests with `Access-Control-Request-Method` through
+  unauthenticated so the CORS middleware upstream can handle them
+  (browsers never attach credentials to preflights, so
+  authenticating them always failed and blocked the subsequent
+  real request). The CORS middleware unconditionally short-circuits
+  preflights with 204 — allowed origins get CORS headers, disallowed
+  origins get no CORS headers (the browser rejects the response
+  either way). Plain OPTIONS without `Access-Control-Request-Method`
+  is NOT a preflight and still requires auth.
+
 ### 0.8.1 — 2026-04-11
 
 - **Security review-pass on the 0.8.0 OAuth2 authorize endpoint.**
@@ -266,27 +312,6 @@ bash scripts/smoke.sh   # end-to-end smoke test
   sentinels instead of string matching. Regression tests pin every
   fix. CLI test coverage added for `--public` and `--redirect-uris`
   (both flags shipped uncovered in 0.8.0). See CHANGELOG.md for details.
-
-### 0.8.0 — 2026-04-11
-
-- **OAuth2 authorization code + PKCE flow.** Claude Desktop
-  uses the MCP-standard browser-based OAuth 2.1 flow with PKCE,
-  not the client_credentials grant. pagefault now supports the
-  full authorization_code grant alongside client_credentials. New
-  endpoints: `GET /oauth/authorize` (auto-approves by default),
-  `POST /oauth/authorize` (consent form), and `POST /oauth/token`
-  extended for `grant_type=authorization_code`. Public clients
-  (no client_secret) authenticate via PKCE alone. The RFC 8414
-  metadata now advertises `authorization_endpoint`,
-  `code_challenge_methods_supported: ["S256"]`, and both grant
-  types. Operators register clients with `--redirect-uris` and
-  optionally `--public` for PKCE-only clients. No dynamic client
-  registration (DCR) endpoint — clients are pre-registered via
-  CLI for security on internet-facing deployments.
-
-### 0.7.1 — 2026-04-11
-
-- **OAuth2 review-pass hardening.** See CHANGELOG.md for details.
 
 See [`CHANGELOG.md`](CHANGELOG.md) for the full history.
 

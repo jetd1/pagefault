@@ -7,6 +7,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+## 0.9.1 (2026-04-11)
+
+Follow-up to 0.9.0. A review pass against the DCR commit turned up
+three doc-drift items and two minor code polish nits. No behavior
+change beyond the constant-time compare; existing tests keep passing
+unmodified.
+
+### Changed
+
+- **`handleOAuthRegister` DCR bearer-token check uses
+  `subtle.ConstantTimeCompare`.** The 0.9.0 gate compared the
+  submitted token against the configured `dcr_bearer_token` with a
+  plain `!=` string compare. Timing-side-channel risk is low in
+  practice (the token is operator-set, opaque, and the attack
+  surface is a reverse-proxied HTTP endpoint where network jitter
+  dominates), but bcrypt for client secrets and
+  `crypto/subtle.ConstantTimeCompare` for PKCE challenges are used
+  elsewhere — this makes the DCR path consistent with the rest of
+  the OAuth2 code.
+- **`isLocalhostOrHTTPS` comment rewritten.** The inline comment on
+  the loopback branch read "localhost must still be http(s)", which
+  was confusing — https://localhost is already accepted by the
+  preceding `u.Scheme == "https"` case, so the loopback branch only
+  needs to additionally allow plain `http`. The new comment spells
+  that out. Logic unchanged; the existing `TestIsLocalhostOrHTTPS`
+  table still pins every supported and rejected URI shape.
+
+### Docs
+
+- **`README.md` — Recent Changes reflects 0.9.0.** The section was
+  missing the 0.9.0 entry entirely and still showed 0.7.1 at the
+  bottom. It now holds 0.9.1 / 0.9.0 / 0.8.1 per the CLAUDE.md
+  "three most recent" rule.
+- **`README.md` — intro paragraph mentions 0.9.0's DCR.** The
+  narrative used to stop at 0.8.0's PKCE flow as the headline
+  OAuth2 feature; it now frames 0.9.0's RFC 7591 DCR as the layer
+  on top that lets Claude Desktop's remote-connector UI
+  self-register a public client against `POST /register` without a
+  manual `pagefault oauth-client create` step.
+- **`docs/security.md` — rate-limiter bullet now covers `/register`.**
+  The "Public OAuth2 endpoints are outside the in-process rate
+  limiter" note previously said "Of the four" and only discussed
+  `/oauth/authorize`'s per-request memory cost. With DCR there is
+  a fifth endpoint (`/register`) that *also* carries a per-request
+  cost — each successful call does a JSONL append + fsync and adds
+  one `ClientRecord` to the in-memory map, and unlike
+  authorization codes these records are persistent (no TTL sweep),
+  so sustained registration traffic grows the file and the map
+  without bound. The bullet now splits into a sub-list covering
+  both `/oauth/authorize` and `/register`, and the proxy-level
+  rate-limit recommendation now lists `/register` alongside the
+  other four when DCR is enabled.
+
 ## 0.9.0 (2026-04-11)
 
 ### Added
