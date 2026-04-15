@@ -45,6 +45,10 @@ server:
   mcp:
     sse_enabled: true    # default — mount /sse + /message for Claude Desktop and other SSE clients
     instructions: ""     # optional override — replaces the built-in default text
+    title: ""            # optional override — serverInfo.title shown in MCP clients (default: "pagefault")
+    description: ""      # optional override — serverInfo.description shown in MCP clients
+    website_url: ""      # optional override — serverInfo.websiteUrl; empty falls back to server.public_url
+    icon_url: ""         # optional override — serverInfo.icons[].src; empty uses an embedded data URI
 ```
 
 | Field        | Type   | Default       | Notes |
@@ -132,8 +136,10 @@ Controls the MCP transports and the initialize-time metadata advertised
 to connecting clients. Both the streamable-http transport (`/mcp`) and
 the legacy-SSE transport (`/sse` + `/message`) share the same underlying
 MCPServer, so tool registrations, auth, and rate limiting are identical
-across the two — this block just gates the SSE pair and lets operators
-replace the built-in instructions text.
+across the two — this block gates the SSE pair, lets operators replace
+the built-in instructions text, and carries the `serverInfo` branding
+fields (title, description, website URL, icon) advertised in the MCP
+`initialize` response.
 
 | Field                              | Type   | Default  | Notes |
 |------------------------------------|--------|----------|-------|
@@ -141,6 +147,10 @@ replace the built-in instructions text.
 | `instructions`                     | string | built-in | Overrides the server-level instructions string advertised in the MCP `initialize` response. Most MCP clients (Claude Desktop, Claude Code, etc.) surface this text in the agent's system prompt, which makes it the single most reliable lever for teaching agents *when* to reach for `pf_*` tools vs the built-ins. Empty means "use the built-in default from `internal/tool/instructions.go`", which is the recommended starting point — only override when you want to add installation-specific guidance (e.g. "daily notes live under `memory://daily/`, project docs under `memory://projects/`"). |
 | `sse_keepalive`                    | bool   | `true`   | Emits JSON-RPC `ping` events on the persistent `GET /sse` stream to keep intermediate proxies from closing an idle connection during a long `pf_fault` call. Defaults to **on** because the failure mode without it (tool calls dying after "几十秒" regardless of `timeout_seconds`) is hard to diagnose. Set `false` only when you have verified your proxy chain never closes idle SSE streams or you have a client that rejects unsolicited `ping` requests. |
 | `sse_keepalive_interval_seconds`   | int    | `15`     | Ticker interval (in seconds) for the SSE keepalive pings. Pagefault's default of 15 is longer than mcp-go's own 10-second default but still comfortably under the common 30 / 60 second proxy idle timeouts. Set lower for aggressive proxies (e.g. nginx with `proxy_read_timeout 10s`); values at or below zero are clamped to the default. Ignored when `sse_keepalive: false`. |
+| `title`                            | string | `pagefault` | Human-readable display name advertised as `serverInfo.title` in the MCP `initialize` response. Claude Desktop and similar clients show this in the connector picker and "about this server" panes. Override when running a branded instance (e.g. `acme-memory`) — the lowercase default matches `docs/design.md §2`. |
+| `description`                      | string | built-in | One-line blurb advertised as `serverInfo.description`. Defaults to the design-system tagline (*"Memory, mapped. Search, load, and write personal notes, journals, and past conversations — like a page fault for your agent."*). Replace with an operator-specific description when you brand the instance. |
+| `website_url`                      | string | `server.public_url` | URL advertised as `serverInfo.websiteUrl`. Empty falls back to `server.public_url`; if that is also empty the field is omitted from the initialize response. Deliberately does **not** default to the upstream project URL — shipping that on a self-hosted instance would mislead operators into thinking the connector is upstream-hosted. |
+| `icon_url`                         | string | embedded data URI | URL advertised as `serverInfo.icons[].src`. Empty uses a `data:image/svg+xml;base64,…` URI built from the embedded `web/icon.svg` at startup so local and internal deployments (localhost, private networks, no `public_url`) still ship a branded icon with zero extra configuration. Set to a public HTTPS URL (including this server's own `https://<host>/icon.svg`, which is always served) to override the default. |
 
 > **Why keepalives?** A `pf_fault` call blocks inside
 > `SubagentBackend.Spawn` for as long as the subagent takes to

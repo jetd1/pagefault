@@ -7,6 +7,89 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+## 0.12.0 (2026-04-15)
+
+MCP serverInfo branding. The `initialize` response now carries a
+human-readable title, a design-system-aligned description, a
+website URL, and a self-contained amber-on-dark SVG icon so
+Claude Desktop and other MCP clients render pagefault as a
+first-class connector (with a logomark in the sidebar and a
+sentence of context in the connector list) instead of a generic
+"pagefault" row with a globe icon. Tools also pick up
+human-readable titles, corrected read-only / destructive hints,
+and a per-tool glyph from the landing-site sprite.
+
+### Added
+
+- **`server.mcp.title`, `server.mcp.description`, `server.mcp.website_url`, `server.mcp.icon_url`.**
+  Four new optional YAML fields on `MCPConfig` that override the
+  corresponding `serverInfo.*` fields in the MCP `initialize`
+  response. Defaults follow `docs/design.md §2` voice: the
+  lowercase `"pagefault"` brand title, the *"Memory, mapped…"*
+  tagline as description, `server.public_url` as the website
+  fallback, and a `data:image/svg+xml;base64,…` URI built from
+  the embedded `web/icon.svg` bytes as the icon. Operators who
+  brand the instance (`acme-memory`, etc.) set the overrides; most
+  operators do nothing and inherit the design-system defaults.
+- **`web/icon.svg` — standalone 48×48 logomark on a dark tile.**
+  Mirrors `web/favicon.svg#mark` geometry (page outline + diagonal
+  fault slice at the top-right corner + inward load chevron) with
+  explicit `#ff7e1f` stroke instead of `currentColor`, so the icon
+  renders correctly when MCP clients fetch it as a standalone
+  resource without CSS context. Served at `/icon.svg` via
+  `net/http.FileServerFS` and also embedded as a data URI in the
+  initialize response, so local/internal deployments without a
+  public URL still ship a branded icon. Governed by
+  `docs/design.md §5.1`.
+- **Per-tool icons.** Every `pf_*` tool registration now attaches
+  a `data:image/svg+xml;base64,…` icon built by parsing
+  `web/icons.svg` once at init time and wrapping each symbol in a
+  rounded dark tile with the `currentColor` references rewritten
+  to the brand amber. `pf_maps` gets the 2×2 grid glyph,
+  `pf_fault` gets the three chevrons, `pf_poke` gets the upward
+  arrow, and so on — one source of truth (`web/icons.svg`) for
+  both the landing site and the MCP surface.
+- **Tool annotation titles and hints.** Each of the seven tools
+  now advertises a human-readable `Annotations.Title` (e.g.
+  `"List Memory Regions"`, `"Search Memory"`, `"Deep Memory Query"`,
+  `"Write to Memory"`) plus the correct
+  `ReadOnlyHint` / `DestructiveHint` / `IdempotentHint` trio.
+  Without these, mcp-go's `NewTool` defaults would have every
+  tool — including `pf_scan` and `pf_peek` — flagged as
+  `DestructiveHint:true`, which MCP clients surface as a warning
+  dialog on every call. Only `pf_poke` keeps the destructive hint.
+
+### Changed
+
+- **MCP `initialize` now emits `serverInfo.{title, description, websiteUrl, icons}`.**
+  mcp-go builds `ServerInfo` itself inside `handleInitialize` with
+  only `Name` and `Version` populated, so pagefault now registers
+  an `AddAfterInitialize` hook that patches the four new fields
+  onto the result before `createResponse` marshals it. Hook runs
+  on every initialize call (cheap: a handful of string copies)
+  and uses a branding value resolved once at `server.New` time.
+  Older MCP clients that negotiate a pre-`2025-11-25` protocol
+  version ignore the extra fields (`Implementation` marshals them
+  with `omitempty`), so no backward-compat gating is required.
+- **mcp-go bump surface.** This feature relies on
+  `mcp.Implementation.{Title, Description, WebsiteURL, Icons}`
+  (mcp-go v0.47.0+) and `server.Hooks.AddAfterInitialize`.
+  Pagefault has tracked that library since before 0.11.0 — no
+  `go.mod` change required.
+
+### Not changed
+
+- Wire format for any `pf_*` tool call. Branding only affects the
+  `initialize` response and the `tools/list` response's per-tool
+  metadata (title, annotations, icons). Tool arguments, return
+  shapes, error envelopes, and audit entries are byte-identical.
+- `web/favicon.svg`, `web/icons.svg`, and the landing page
+  (`web/index.html`) — the new `web/icon.svg` is a sibling, not
+  a replacement.
+- YAML config compatibility — the new `server.mcp.*` fields are
+  optional. Configs written for 0.11.x continue to parse and
+  run unchanged.
+
 ## 0.11.4 (2026-04-12)
 
 Mobile readability polish on the landing site's Quick start section.

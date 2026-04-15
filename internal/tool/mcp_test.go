@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -103,6 +104,64 @@ func TestRegisterMCP_AllToolsRegistered(t *testing.T) {
 	srv := newMCPServerForTest(t)
 	for _, name := range []string{"pf_maps", "pf_load", "pf_scan", "pf_peek", "pf_fault", "pf_ps", "pf_poke"} {
 		assert.NotNil(t, srv.GetTool(name), "tool %q should be registered", name)
+	}
+}
+
+// TestRegisterMCP_ToolBranding verifies every tool ships with a
+// human-readable title (Annotations.Title), the correct
+// read-only/destructive/idempotent hint trio, and a per-tool icon
+// loaded from web/icons.svg. The hint trio matters because
+// mcp-go's NewTool defaults to DestructiveHint:true and
+// ReadOnlyHint:false — which would cause every MCP client to
+// surface a "destructive" warning on a pf_scan or pf_peek call
+// if left unset. Pinning the hints here means future edits to
+// the brandingOpts helper cannot silently regress back to the
+// library defaults.
+func TestRegisterMCP_ToolBranding(t *testing.T) {
+	srv := newMCPServerForTest(t)
+	// Include the one backend-dependent tool (pf_fault) by building
+	// a second server against a subagent-backed dispatcher; pf_ps
+	// is registered unconditionally but exercising both paths keeps
+	// the assertion table dense.
+	subSrv := newSubagentMCPServer(t, &stubSubagent{
+		name:   "sa",
+		agents: []backend.AgentInfo{{ID: "a"}},
+	})
+
+	cases := []struct {
+		name        string
+		srv         *mcpserver.MCPServer
+		title       string
+		readOnly    bool
+		destructive bool
+		idempotent  bool
+	}{
+		{"pf_maps", srv, "List Memory Regions", true, false, true},
+		{"pf_load", srv, "Load Memory Region", true, false, true},
+		{"pf_scan", srv, "Search Memory", true, false, true},
+		{"pf_peek", srv, "Read Resource", true, false, true},
+		{"pf_fault", subSrv, "Deep Memory Query", true, false, false},
+		{"pf_ps", srv, "Agent Status", true, false, true},
+		{"pf_poke", srv, "Write to Memory", false, true, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			st := tc.srv.GetTool(tc.name)
+			require.NotNil(t, st, "tool %q should be registered", tc.name)
+			assert.Equal(t, tc.title, st.Tool.Annotations.Title, "Title")
+			require.NotNil(t, st.Tool.Annotations.ReadOnlyHint, "ReadOnlyHint must be set")
+			assert.Equal(t, tc.readOnly, *st.Tool.Annotations.ReadOnlyHint, "ReadOnlyHint")
+			require.NotNil(t, st.Tool.Annotations.DestructiveHint, "DestructiveHint must be set")
+			assert.Equal(t, tc.destructive, *st.Tool.Annotations.DestructiveHint, "DestructiveHint")
+			require.NotNil(t, st.Tool.Annotations.IdempotentHint, "IdempotentHint must be set")
+			assert.Equal(t, tc.idempotent, *st.Tool.Annotations.IdempotentHint, "IdempotentHint")
+
+			require.NotEmpty(t, st.Tool.Icons, "per-tool icon missing for %q", tc.name)
+			icon := st.Tool.Icons[0]
+			assert.Equal(t, "image/svg+xml", icon.MIMEType)
+			assert.True(t, strings.HasPrefix(icon.Src, "data:image/svg+xml;base64,"),
+				"icon src should be a data URI, got %q", icon.Src)
+		})
 	}
 }
 

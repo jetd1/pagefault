@@ -18,6 +18,7 @@ package server
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -27,6 +28,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+	mcppkg "github.com/mark3labs/mcp-go/mcp"
 	mcpserver "github.com/mark3labs/mcp-go/server"
 
 	"jetd.one/pagefault/internal/auth"
@@ -48,6 +50,113 @@ const versionSentinel = "{{version}}"
 
 // Version is injected by cmd/pagefault so the /health endpoint can report it.
 var Version = "dev"
+
+// Default branding advertised in the MCP initialize response when the
+// operator has not overridden `server.mcp.{title,description,icon_url}`
+// in the YAML config. The lowercase "pagefault" title is deliberate —
+// docs/design.md §2 pins the brand to lowercase in running copy — and
+// the description leans on the page-fault metaphor rather than a
+// generic feature list, matching the design system's tagline voice.
+const (
+	defaultBrandTitle       = "pagefault"
+	defaultBrandDescription = "Memory, mapped. Search, load, and write personal notes, journals, and past conversations — like a page fault for your agent."
+)
+
+// defaultIconDataURI is a data:image/svg+xml;base64,… encoding of the
+// embedded web/icon.svg bytes. It is computed once at package init
+// time so every MCP initialize response can ship a branded icon
+// without a public HTTPS host. Data URIs are explicitly supported by
+// the Icon.Src field (see mcp-go mcp/types.go).
+//
+// Using a data URI as the default keeps local/internal deployments
+// (localhost, private networks, operators without server.public_url)
+// self-contained — the icon travels inside the initialize response
+// instead of requiring the MCP client to reach back over HTTP for
+// the asset.
+var defaultIconDataURI string
+
+func init() {
+	// web.Files is populated by the //go:embed directive in
+	// web/embed.go; a missing icon.svg would be a build-time
+	// failure, not a runtime one. The error branch is defensive
+	// only — if someone mutilates the embed directive, the icon
+	// just silently falls off rather than crashing the server.
+	data, err := web.Files.ReadFile("icon.svg")
+	if err == nil {
+		defaultIconDataURI = "data:image/svg+xml;base64," + base64.StdEncoding.EncodeToString(data)
+	}
+}
+
+// serverBranding is the resolved set of serverInfo fields advertised
+// in the MCP initialize response. Computed once at Server.New time
+// from the YAML config + brand defaults + the embedded icon, then
+// applied to every initialize reply via the AfterInitialize hook.
+type serverBranding struct {
+	Title       string
+	Description string
+	WebsiteURL  string
+	Icons       []mcppkg.Icon
+}
+
+// resolveBranding merges operator config with brand defaults. Empty
+// config fields fall back to the lowercase "pagefault" brand title,
+// the design-doc tagline, server.public_url for the website, and
+// the embedded-icon data URI for the icon. An explicit operator
+// override always wins.
+func resolveBranding(cfg *config.Config) serverBranding {
+	b := serverBranding{
+		Title:       cfg.Server.MCP.Title,
+		Description: cfg.Server.MCP.Description,
+		WebsiteURL:  cfg.Server.MCP.WebsiteURL,
+	}
+	if b.Title == "" {
+		b.Title = defaultBrandTitle
+	}
+	if b.Description == "" {
+		b.Description = defaultBrandDescription
+	}
+	if b.WebsiteURL == "" {
+		// server.public_url is the best fallback — it's the URL
+		// the operator has already declared as the canonical
+		// externally-reachable address. When unset, leave empty
+		// (Implementation.WebsiteURL is `omitempty`) rather than
+		// shipping an upstream project URL that could mislead
+		// operators into thinking the connector is hosted by
+		// someone else.
+		b.WebsiteURL = cfg.Server.PublicURL
+	}
+	iconURL := cfg.Server.MCP.IconURL
+	if iconURL == "" {
+		iconURL = defaultIconDataURI
+	}
+	if iconURL != "" {
+		b.Icons = []mcppkg.Icon{{
+			Src:      iconURL,
+			MIMEType: "image/svg+xml",
+			Sizes:    []string{"any"},
+		}}
+	}
+	return b
+}
+
+// buildBrandingHooks returns an mcp-go Hooks value that patches the
+// initialize result's ServerInfo with the resolved branding. mcp-go
+// constructs ServerInfo itself inside handleInitialize (passing only
+// Name + Version), so an after-initialize hook is the supported way
+// to inject title/description/websiteUrl/icons without forking the
+// library. The hook runs on every initialize call but its cost is
+// negligible — initialize is rare and the hook just copies a handful
+// of string fields onto a struct pagefault already owns.
+func buildBrandingHooks(b serverBranding) *mcpserver.Hooks {
+	hooks := &mcpserver.Hooks{}
+	hooks.AddAfterInitialize(func(_ context.Context, _ any, _ *mcppkg.InitializeRequest, result *mcppkg.InitializeResult) {
+		result.ServerInfo.Title = b.Title
+		result.ServerInfo.Description = b.Description
+		result.ServerInfo.WebsiteURL = b.WebsiteURL
+		result.ServerInfo.Icons = b.Icons
+	})
+	return hooks
+}
 
 // Server wraps an http.Handler built from a config, a dispatcher, and an
 // auth provider. Callers typically use Run, but the Handler field is
@@ -90,11 +199,19 @@ func New(cfg *config.Config, d *dispatcher.ToolDispatcher, authP auth.AuthProvid
 		instructions = tool.DefaultInstructions
 	}
 
+	// Resolve the MCP serverInfo branding (title, description,
+	// websiteUrl, icon) once at construction time. mcp-go builds
+	// ServerInfo itself inside handleInitialize with only Name +
+	// Version populated, so we patch the rest back on via an
+	// AfterInitialize hook — the supported extension point short
+	// of forking the library.
+	branding := resolveBranding(cfg)
 	mcpSrv := mcpserver.NewMCPServer(
 		"pagefault",
 		Version,
 		mcpserver.WithToolCapabilities(true),
 		mcpserver.WithInstructions(instructions),
+		mcpserver.WithHooks(buildBrandingHooks(branding)),
 	)
 	tool.RegisterMCP(mcpSrv, d)
 
@@ -173,13 +290,21 @@ func New(cfg *config.Config, d *dispatcher.ToolDispatcher, authP auth.AuthProvid
 	//      landing-page version badge stale.
 	//
 	//   2. GET/HEAD `/styles.css`, `/script.js`, `/favicon.svg`,
-	//      `/icons.svg` served by net/http.FileServerFS straight
-	//      from the embed. Each asset is an explicit GET+HEAD
-	//      pair (chi.Get does not imply HEAD the way
+	//      `/icons.svg`, `/icon.svg` served by net/http.FileServerFS
+	//      straight from the embed. Each asset is an explicit
+	//      GET+HEAD pair (chi.Get does not imply HEAD the way
 	//      net/http.FileServer does) so link-preview crawlers
 	//      and proxy probes don't 405. Explicit paths (no
 	//      catch-all) so /api/*, /mcp, /sse, and the OAuth2
 	//      routes below are never shadowed.
+	//
+	//      `/icon.svg` is the MCP serverInfo icon target — a
+	//      separate 48×48 logomark on a dark tile (see
+	//      docs/design.md §5.1). Even though we also embed it as
+	//      a data URI inside the initialize response, serving
+	//      the file at a stable path gives operators a URL to
+	//      point `server.mcp.icon_url` at when they want to
+	//      override the branding without re-embedding.
 	indexBytes, err := web.Files.ReadFile("index.html")
 	if err != nil {
 		return nil, fmt.Errorf("server: read embedded index.html: %w", err)
@@ -206,6 +331,7 @@ func New(cfg *config.Config, d *dispatcher.ToolDispatcher, authP auth.AuthProvid
 	staticAsset("/script.js")
 	staticAsset("/favicon.svg")
 	staticAsset("/icons.svg")
+	staticAsset("/icon.svg")
 
 	// Public endpoints (no auth).
 	r.Get("/health", s.handleHealth)

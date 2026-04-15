@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"
+     width="48" height="48" role="img" aria-label="pagefault logomark">
+  <!--
+    pagefault MCP icon — governed by docs/design.md §5.1.
+
+    A rounded terminal-dark tile (--bg-elevated) holding the
+    canonical logomark: page outline with a diagonal fault slice
+    at the top-right corner and an inward load chevron pointing
+    at the slice. Same geometry as web/favicon.svg#mark, but
+    with explicit fill/stroke colors (no currentColor) so the
+    icon renders correctly when MCP clients (Claude Desktop,
+    inspectors, etc.) fetch it as a standalone resource without
+    CSS context.
+
+    Served at /icon.svg and also embedded as a data: URI in the
+    MCP initialize response (internal/server.buildServerIcons)
+    so local/internal deployments without a public URL still
+    ship a branded icon.
+  -->
+  <rect width="24" height="24" rx="5" fill="#121216" />
+  <g fill="none" stroke="#ff7e1f" stroke-width="1.6"
+     stroke-linecap="round" stroke-linejoin="round">
+    <!-- page outline with top-right corner sliced off -->
+    <path d="M5 4 L15 4 L20 9 L20 20 L5 20 Z" />
+    <!-- fault line — the slice across the corner -->
+    <path d="M15 4 L15 9 L20 9" />
+    <!-- load chevron — pointing into the sliced corner -->
+    <path d="M13 14 L16 12 L16 16 Z" fill="#ff7e1f" stroke="none" />
+  </g>
+</svg>

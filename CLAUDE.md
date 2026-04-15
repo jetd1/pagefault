@@ -67,7 +67,7 @@ pagefault/
 │
 ├── internal/
 │   ├── config/
-│   │   ├── config.go                     # YAML schema structs, Load/Parse, ${ENV} sub, validator
+│   │   ├── config.go                     # YAML schema structs, Load/Parse, ${ENV} sub, validator (0.12.0 added Title, Description, WebsiteURL, IconURL fields to MCPConfig for serverInfo branding overrides)
 │   │   └── config_test.go                # Config parse/validate/defaults tests
 │   │
 │   ├── model/
@@ -136,16 +136,18 @@ pagefault/
 │   │   ├── deep_retrieve.go              # HandleDeepRetrieve pure function (wire: pf_fault; 0.10.0 reshape: async-by-default with Wait:true sync compat flag, output carries task_id/status/spawn_id)
 │   │   ├── list_agents.go                # HandleListAgents + HandleTaskStatus pure functions (wire: pf_ps; 0.10.0 extended with optional TaskID — empty = list agents, set = poll task snapshot)
 │   │   ├── write.go                      # HandleWrite pure function (wire: pf_poke) — Phase 4; pf_poke mode:agent passes Wait:true so writes return synchronously
-│   │   ├── mcp.go                        # RegisterMCP: wires pure handlers to mcp-go. 0.10.0 added wait flag to pf_fault + task_id to pf_ps + routing between HandleListAgents/HandleTaskStatus, plus asBool coercion helper
+│   │   ├── mcp.go                        # RegisterMCP: wires pure handlers to mcp-go. 0.10.0 added wait flag to pf_fault + task_id to pf_ps + routing between HandleListAgents/HandleTaskStatus, plus asBool coercion helper. 0.12.0 added brandingOpts helper that attaches per-tool Title annotation + correct ReadOnly/Destructive/Idempotent hints + per-tool icon to every pf_* registration (seven tools, one place for the hint trio)
+│   │   ├── icons.go                      # 0.12.0 tool-glyph → data URI builder: parses web/icons.svg once at init time via regex, wraps each 24×24 symbol in a rounded dark tile with currentColor rewritten to brand amber (#ff7e1f), exposes iconOptionFor(wireName) that registerX uses to attach the per-tool icon
 │   │   ├── instructions.go               # DefaultInstructions — server-level MCP initialize text
 │   │   ├── tool_test.go                  # Pure handler tests
 │   │   ├── deep_retrieve_test.go         # pf_fault handler tests (stubSubagent with mutex-guarded snapshot); 0.10.0 added async-default, task-status-unknown, sync-wait variants
 │   │   ├── write_test.go                 # pf_poke direct/agent handler tests — Phase 4
-│   │   └── mcp_test.go                   # MCP registration + toolResult helper tests (incl. pf_poke)
+│   │   ├── icons_test.go                 # Tool-icon data URI tests (all 7 wire names covered, currentColor-leak guard, unknown-tool no-op path)
+│   │   └── mcp_test.go                   # MCP registration + toolResult helper tests (incl. pf_poke). 0.12.0 added TestRegisterMCP_ToolBranding covering Title/ReadOnlyHint/DestructiveHint/IdempotentHint/Icons for every tool
 │   │
 │   └── server/
-│       ├── server.go                     # chi router, MCP streamable-http + SSE mounts, REST adapter, /health, structured error envelope, oauth2 route mounts when enabled
-│       ├── server_test.go                # Integration tests via httptest (incl. MCP smoke, SSE handshake + roundtrip, instructions, OpenAPI, health probe)
+│       ├── server.go                     # chi router, MCP streamable-http + SSE mounts, REST adapter, /health, structured error envelope, oauth2 route mounts when enabled. 0.12.0 added AddAfterInitialize hook that patches serverInfo.{title,description,websiteUrl,icons} from resolved MCPConfig branding (lowercase "pagefault" + design-system tagline + embedded data:image/svg+xml icon URI as defaults; server.public_url fallback for websiteUrl), mounts /icon.svg alongside the existing /favicon.svg and /icons.svg statics
+│       ├── server_test.go                # Integration tests via httptest (incl. MCP smoke, SSE handshake + roundtrip, instructions, OpenAPI, health probe, 0.12.0 added branding-default + branding-override + public_url fallback + /icon.svg served tests)
 │       ├── oauth2.go                     # OAuth2 HTTP surface (0.7.0+, 0.8.0 added authorize + auth code flow, 0.8.1 hardened validation order + consent, 0.9.0 added DCR): /.well-known/oauth-protected-resource (RFC 9728), /.well-known/oauth-authorization-server (RFC 8414, includes registration_endpoint when DCR enabled), POST /oauth/token (client_credentials + authorization_code, Basic + form body), GET+POST /oauth/authorize (consent page + auto-approve + PKCE), POST /register (RFC 7591 DCR, public-only, opt-in), consentParams whitelist, errors.Is classification
 │       ├── oauth2_test.go                # OAuth2 HTTP integration: discovery shape, Basic/form/invalid/unsupported/missing-creds paths, end-to-end token → /api/pf_maps, compound mode, unmounted-when-disabled, URL-encoded Basic credential decoding, authorize happy paths (auto-approve + public/confidential auth code flow), DCR (happy/validation/disabled/bearer-gate/discovery/end-to-end), negative regressions (open redirect on bad response_type or missing client_id, consent-form action-injection bypass, consent default-deny, frame-ancestors CSP)
 │       ├── openapi.go                    # /api/openapi.json spec builder (OpenAPI 3.1.0, live from dispatcher + config)
@@ -170,12 +172,13 @@ pagefault/
 │   └── notes.md                          # Second sample file
 │
 ├── web/                                  # Static landing site (governed by docs/design.md) — embedded into the binary via //go:embed and served at / by internal/server
-│   ├── embed.go                          # `package web` — `//go:embed` directive exporting `Files embed.FS` consumed by internal/server
+│   ├── embed.go                          # `package web` — `//go:embed` directive exporting `Files embed.FS` consumed by internal/server (0.12.0 added icon.svg to the embed list)
 │   ├── index.html                        # Landing page — hero + concept + tools table (inline glyphs) + quickstart + transports + architecture + outro
 │   ├── styles.css                        # Full stylesheet — design tokens, components, sections, reduced-motion, print
 │   ├── script.js                         # Hero terminal animation (cycles pf_fault → fault → handler → resolved; IntersectionObserver pause, prefers-reduced-motion honored)
 │   ├── favicon.svg                       # Logomark — rounded page w/ diagonal fault slice + inward load chevron; ships `#mark` + `#mark-16` symbols
-│   └── icons.svg                         # Tool-glyph sprite — seven `<symbol>`s (maps/load/scan/peek/fault/ps/poke) referenced via `<use href="./icons.svg#X">`
+│   ├── icons.svg                         # Tool-glyph sprite — seven `<symbol>`s (maps/load/scan/peek/fault/ps/poke) referenced via `<use href="./icons.svg#X">` (internal/tool/icons.go also parses this sprite at init time to build per-tool MCP data URI icons)
+│   └── icon.svg                          # 0.12.0 MCP serverInfo icon — 48×48 logomark on a rounded --bg-elevated tile, mirrors favicon.svg#mark geometry but with explicit #ff7e1f stroke (no currentColor) so MCP clients fetching the SVG as a standalone resource render it correctly; served at /icon.svg and also inlined as a data URI in the MCP initialize response
 │
 └── scripts/
     └── smoke.sh                          # End-to-end smoke test script

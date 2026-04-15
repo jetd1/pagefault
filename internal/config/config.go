@@ -42,10 +42,12 @@ type ServerConfig struct {
 
 // MCPConfig configures the MCP transports and initialize-time
 // metadata. Both transports are served from the same MCPServer (and
-// therefore the same tool registrations); this struct just gates the
-// legacy-SSE pair, lets operators override the instructions text, and
+// therefore the same tool registrations); this struct gates the
+// legacy-SSE pair, lets operators override the instructions text,
 // exposes the SSE keepalive knobs that prevent intermediate proxies
-// from closing long-lived streams during a slow pf_fault call.
+// from closing long-lived streams during a slow pf_fault call, and
+// carries the serverInfo branding fields advertised in the MCP
+// initialize response (title, description, website_url, icon_url).
 type MCPConfig struct {
 	// SSEEnabled toggles the legacy-SSE transport (GET /sse + POST
 	// /message) alongside the streamable-http transport at /mcp.
@@ -53,6 +55,33 @@ type MCPConfig struct {
 	// SSE-only clients work out of the box — set false to disable
 	// if you only serve streamable-http clients.
 	SSEEnabled *bool `yaml:"sse_enabled,omitempty"`
+
+	// Title is the human-readable display name advertised in the
+	// MCP initialize response's serverInfo.title. Empty falls back
+	// to a brand-default derived from internal/server — keeps the
+	// lowercase "pagefault" brand aligned with docs/design.md §2.
+	// Override when running a branded instance (e.g. "acme-memory").
+	Title string `yaml:"title,omitempty"`
+	// Description is the human-readable blurb advertised in the
+	// MCP initialize response's serverInfo.description. MCP clients
+	// surface this in connector pickers and "about this server"
+	// panes. Empty uses a brand-default tagline from the design
+	// system (docs/design.md §2).
+	Description string `yaml:"description,omitempty"`
+	// WebsiteURL is advertised in serverInfo.websiteUrl. Empty
+	// falls back to server.public_url when set; otherwise the
+	// field is omitted from the initialize response (preferable
+	// to shipping a generic project URL that could mislead
+	// operators into thinking the connector is upstream-hosted).
+	WebsiteURL string `yaml:"website_url,omitempty"`
+	// IconURL overrides the serverInfo.icons[].src value. Empty
+	// uses a data:image/svg+xml;base64,… URI built from the
+	// embedded web/icon.svg at startup so local and internal
+	// deployments (localhost, private networks, no public_url)
+	// still ship a branded icon without round-tripping to the
+	// landing-site host. Set this to a public HTTPS URL only if
+	// you want to serve a custom icon from your own CDN.
+	IconURL string `yaml:"icon_url,omitempty"`
 	// Instructions overrides the server-level instructions string
 	// advertised in the MCP initialize response. Most clients
 	// surface this in the agent's system prompt, so it is the

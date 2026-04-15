@@ -700,6 +700,136 @@ func TestServer_MCP_InstructionsInInitialize(t *testing.T) {
 	assert.Contains(t, body, "pf_scan")
 }
 
+// TestServer_MCP_BrandingInInitialize verifies that the default
+// serverInfo branding (title, description, icon) is present in the
+// MCP initialize response when no operator override is configured.
+// The MCP spec surfaces these fields in client UIs like Claude
+// Desktop's connector list, so a missing title or icon is a visible
+// regression even though nothing on the wire changes.
+func TestServer_MCP_BrandingInInitialize(t *testing.T) {
+	ts, _ := newTestServer(t, "none", "")
+	body := doInitializeOverStreamable(t, ts)
+
+	// Title / description are the design-system defaults — lowercase
+	// "pagefault" (docs/design.md §2) and the "Memory, mapped."
+	// tagline. If the defaults move, update the assertions in lockstep.
+	assert.Contains(t, body, `"title":"pagefault"`, "serverInfo.title default missing")
+	assert.Contains(t, body, "Memory, mapped.", "serverInfo.description default tagline missing")
+	// Icon travels as a data: URI by default so local/internal
+	// deployments without a public URL still ship a branded icon.
+	assert.Contains(t, body, "data:image/svg+xml;base64,", "serverInfo.icons default data URI missing")
+	assert.Contains(t, body, `"mimeType":"image/svg+xml"`, "serverInfo.icons MIME type missing")
+}
+
+// TestServer_MCP_BrandingOverride verifies that operator-supplied
+// values in server.mcp.{title,description,website_url,icon_url}
+// replace the defaults in the initialize response, and that
+// server.public_url is used as a fallback for the websiteUrl when
+// the explicit override is empty.
+func TestServer_MCP_BrandingOverride(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "hello.md"), []byte("hi"), 0o600))
+	fsCfg := &config.FilesystemBackendConfig{
+		Name: "fs", Type: "filesystem", Root: dir,
+		Include: []string{"**/*.md"}, URIScheme: "memory", Sandbox: true,
+	}
+	fsBackend, err := backend.NewFilesystemBackend(fsCfg)
+	require.NoError(t, err)
+	d, err := dispatcher.New(dispatcher.Options{
+		Backends: []backend.Backend{fsBackend},
+		Filter:   filter.NewCompositeFilter(),
+		Audit:    audit.NopLogger{},
+	})
+	require.NoError(t, err)
+
+	cfg := &config.Config{
+		Server: config.ServerConfig{
+			Host: "127.0.0.1", Port: 0,
+			MCP: config.MCPConfig{
+				Title:       "acme-memory",
+				Description: "Acme internal memory bridge",
+				WebsiteURL:  "https://acme.example/memory",
+				IconURL:     "https://acme.example/icon.svg",
+			},
+		},
+		Auth: config.AuthConfig{Mode: "none"},
+	}
+	p, err := auth.NewProvider(cfg.Auth)
+	require.NoError(t, err)
+	srv, err := New(cfg, d, p)
+	require.NoError(t, err)
+	ts := httptest.NewServer(srv.Handler)
+	t.Cleanup(ts.Close)
+
+	body := doInitializeOverStreamable(t, ts)
+	assert.Contains(t, body, `"title":"acme-memory"`)
+	assert.Contains(t, body, "Acme internal memory bridge")
+	assert.Contains(t, body, `"websiteUrl":"https://acme.example/memory"`)
+	assert.Contains(t, body, `"src":"https://acme.example/icon.svg"`)
+	// Defaults must not leak when every field is overridden.
+	assert.NotContains(t, body, `"title":"pagefault"`)
+	assert.NotContains(t, body, "Memory, mapped.")
+	assert.NotContains(t, body, "data:image/svg+xml;base64,")
+}
+
+// TestServer_MCP_WebsiteURLFallback verifies that when
+// server.mcp.website_url is unset but server.public_url is
+// configured, the initialize response reports the public_url as
+// serverInfo.websiteUrl. This is the realistic default for
+// self-hosted operators who already declared a public URL for
+// SSE base-URL and OAuth2 issuer purposes.
+func TestServer_MCP_WebsiteURLFallback(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "hello.md"), []byte("hi"), 0o600))
+	fsCfg := &config.FilesystemBackendConfig{
+		Name: "fs", Type: "filesystem", Root: dir,
+		Include: []string{"**/*.md"}, URIScheme: "memory", Sandbox: true,
+	}
+	fsBackend, err := backend.NewFilesystemBackend(fsCfg)
+	require.NoError(t, err)
+	d, err := dispatcher.New(dispatcher.Options{
+		Backends: []backend.Backend{fsBackend},
+		Filter:   filter.NewCompositeFilter(),
+		Audit:    audit.NopLogger{},
+	})
+	require.NoError(t, err)
+
+	cfg := &config.Config{
+		Server: config.ServerConfig{
+			Host:      "127.0.0.1",
+			Port:      0,
+			PublicURL: "https://pf.example.internal",
+		},
+		Auth: config.AuthConfig{Mode: "none"},
+	}
+	p, err := auth.NewProvider(cfg.Auth)
+	require.NoError(t, err)
+	srv, err := New(cfg, d, p)
+	require.NoError(t, err)
+	ts := httptest.NewServer(srv.Handler)
+	t.Cleanup(ts.Close)
+
+	body := doInitializeOverStreamable(t, ts)
+	assert.Contains(t, body, `"websiteUrl":"https://pf.example.internal"`)
+}
+
+// TestServer_IconSvgServed verifies the embedded web/icon.svg is
+// served at /icon.svg so operators pointing `server.mcp.icon_url`
+// at their own public host get a fetchable asset — and so the
+// /favicon.svg, /icons.svg, /icon.svg trio stays coherent.
+func TestServer_IconSvgServed(t *testing.T) {
+	ts, _ := newTestServer(t, "none", "")
+	resp, err := http.DefaultClient.Get(ts.URL + "/icon.svg")
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Equal(t, "image/svg+xml", resp.Header.Get("Content-Type"))
+	body, _ := io.ReadAll(resp.Body)
+	s := string(body)
+	assert.Contains(t, s, "pagefault MCP icon")
+	assert.Contains(t, s, "#ff7e1f", "amber accent from design.md §3 missing")
+}
+
 // TestServer_MCP_InstructionsOverride verifies that a non-empty
 // server.mcp.instructions config replaces the built-in default verbatim.
 func TestServer_MCP_InstructionsOverride(t *testing.T) {

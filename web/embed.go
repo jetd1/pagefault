@@ -11,5 +11,5 @@ package web
 
 import "embed"
 
-//go:embed index.html styles.css script.js favicon.svg icons.svg
+//go:embed index.html styles.css script.js favicon.svg icons.svg icon.svg
 var Files embed.FS

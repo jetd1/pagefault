@@ -347,6 +347,30 @@ conventions, versioning rules, and the "adding a new X" checklists.
 
 ## Recent changes
 
+### 0.12.0 — 2026-04-15
+
+- **MCP `serverInfo` branding.** The MCP `initialize` response now
+  emits `title: "pagefault"`, a design-system description, a
+  website URL (default: `server.public_url`), and a self-contained
+  amber-on-dark SVG icon so Claude Desktop and other MCP clients
+  render pagefault as a first-class connector — logomark in the
+  sidebar, one-sentence description in the connector picker —
+  instead of a generic `pagefault` row with a globe icon. Four
+  new optional YAML fields (`server.mcp.{title, description, website_url, icon_url}`)
+  let operators override the defaults for branded instances; the
+  icon travels as a `data:image/svg+xml;base64,…` URI so local
+  and internal deployments without a public URL still ship a
+  branded logomark out of the box. Each of the seven `pf_*` tools
+  also picks up a human-readable `Annotations.Title` (`List Memory
+  Regions`, `Deep Memory Query`, `Write to Memory`, …), corrected
+  `ReadOnlyHint` / `DestructiveHint` / `IdempotentHint` values,
+  and a per-tool glyph extracted from the landing-site sprite —
+  MCP clients no longer flag `pf_scan` or `pf_peek` as destructive
+  by default. Implemented via an `AddAfterInitialize` hook on
+  mcp-go's server (no library fork), a new `web/icon.svg` (governed
+  by `docs/design.md §5.1`) mounted at `/icon.svg`, and a one-time
+  parse of `web/icons.svg` into per-tool data URIs at `init` time.
+
 ### 0.11.4 — 2026-04-12
 
 - **Mobile readability on the landing site's Quick start section.**
@@ -381,17 +405,6 @@ conventions, versioning rules, and the "adding a new X" checklists.
   nav strip now links directly to
   [the live preview](https://jetd1.github.io/pagefault/). One-time
   setup: Settings → Pages → Source: GitHub Actions.
-
-### 0.11.2 — 2026-04-12
-
-- **README overhaul.** The README has been reorganized and visually tightened —
-  a crisper intro with an ASCII fault-flow diagram, a top-of-page nav strip,
-  a table of contents, an "At a glance" summary, dedicated **Tools** and
-  **Transports** tables, a cleaner **Clients** section where Claude Desktop's
-  three auth paths are collapsed behind `<details>` (the recommended PKCE flow
-  stays front-and-center while the `client_credentials` and `supergateway`
-  fallbacks become reference material), and a **Documentation** links table
-  that now includes `docs/design.md`. No content removed, no commands changed.
 
 See [`CHANGELOG.md`](CHANGELOG.md) for the full history.
 
