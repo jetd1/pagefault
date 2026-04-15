@@ -347,6 +347,25 @@ conventions, versioning rules, and the "adding a new X" checklists.
 
 ## Recent changes
 
+### 0.12.1 — 2026-04-15
+
+- **Parallel `pf_scan` fan-out.** `ToolDispatcher.Search` now runs
+  every target backend on its own goroutine and merges results in
+  configured backend order, so a slow HTTP or subprocess search
+  no longer blocks the faster filesystem/ripgrep backends. A
+  `pf_scan` across N backends now takes roughly `max(per-backend
+  latency)` instead of the sum. A failing backend emits a
+  `slog.Warn` ("search: backend failed") with backend + error +
+  caller id instead of a silent `continue`, so operator logs
+  carry a signal when a backend is chronically unhealthy. Wire
+  shape unchanged.
+- **Fixed wrong example path in MCP instructions.** The default
+  server-level instructions cited `memory://daily/2026-04-11.md`
+  for the `pf_peek` example; real default configs lay memory out
+  under `memory://memory/…`, so an agent copying the example
+  verbatim would hit `resource_not_found`. Path corrected to
+  match.
+
 ### 0.12.0 — 2026-04-15
 
 - **MCP `serverInfo` branding.** The MCP `initialize` response now
@@ -389,22 +408,6 @@ conventions, versioning rules, and the "adding a new X" checklists.
   bottom margin so titles sit closer to their code block. Desktop
   layout is unchanged. Reaches the live preview via 0.11.3's
   GitHub Pages auto-deploy.
-
-### 0.11.3 — 2026-04-12
-
-- **Landing site auto-deployed to GitHub Pages.** New
-  `.github/workflows/pages.yml` triggers on every push to `main`
-  that touches `web/**` or `VERSION`, copies the five static
-  assets into a build directory, substitutes the `{{version}}`
-  sentinel against the current `VERSION` via `sed` (mirroring
-  what `internal/server.New` does at binary startup), and
-  deploys the result via the official `actions/deploy-pages@v4`
-  action. The workflow fails loudly if the substitution leaves
-  a literal sentinel behind, so "forgot to update the sed" bugs
-  surface at deploy time instead of in production. The README
-  nav strip now links directly to
-  [the live preview](https://jetd1.github.io/pagefault/). One-time
-  setup: Settings → Pages → Source: GitHub Actions.
 
 See [`CHANGELOG.md`](CHANGELOG.md) for the full history.
 

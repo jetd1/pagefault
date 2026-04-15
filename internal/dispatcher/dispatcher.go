@@ -14,6 +14,7 @@ import (
 	"log/slog"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -422,16 +423,37 @@ func (d *ToolDispatcher) Search(ctx context.Context, query string, limit int, ba
 		}
 	}
 
-	for _, b := range targets {
-		if ctx.Err() != nil {
-			break
-		}
-		results, serr := b.Search(ctx, query, perBackend)
-		if serr != nil {
-			// Continue — one backend failing shouldn't break search.
-			continue
-		}
-		for _, r := range results {
+	// Fan out across backends in parallel: a single slow backend (e.g.
+	// an HTTP/subprocess search that shells out to a multi-second
+	// pipeline) no longer stalls faster ones — the whole pf_scan call
+	// now takes roughly max(per-backend latency) instead of the sum.
+	perResults := make([][]backend.SearchResult, len(targets))
+	var wg sync.WaitGroup
+	for i, b := range targets {
+		wg.Add(1)
+		go func(i int, b backend.Backend) {
+			defer wg.Done()
+			results, serr := b.Search(ctx, query, perBackend)
+			if serr != nil {
+				// One backend failing shouldn't break search.
+				slog.Warn("search: backend failed",
+					"backend", b.Name(),
+					"error", serr,
+					"caller", caller.ID,
+				)
+				return
+			}
+			perResults[i] = results
+		}(i, b)
+	}
+	wg.Wait()
+
+	// Merge in configured backend order so results stay deterministic
+	// across runs. Filtering and the aggregate limit are applied here,
+	// after every backend has reported, so we don't over-truncate
+	// earlier backends that happened to finish first.
+	for i, b := range targets {
+		for _, r := range perResults[i] {
 			if !d.filter.AllowURI(r.URI, &caller) {
 				continue
 			}
@@ -440,11 +462,8 @@ func (d *ToolDispatcher) Search(ctx context.Context, query string, limit int, ba
 			}
 			out = append(out, SearchResult{SearchResult: r, Backend: b.Name()})
 			if len(out) >= limit {
-				break
+				return out, nil
 			}
-		}
-		if len(out) >= limit {
-			break
 		}
 	}
 	return out, nil

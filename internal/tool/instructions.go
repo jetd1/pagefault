@@ -126,7 +126,7 @@ past conversations — not a general search engine.
               pf_scan returns empty on a sentence-shaped query, go
               to pf_fault instead of giving up.
 - pf_peek   — read one specific resource by URI when you already know
-              where it lives (e.g. memory://daily/2026-04-11.md).
+              where it lives (e.g. memory://memory/2026-04-11.md).
               Usually follows a pf_scan hit you want to read in full,
               or a direct user reference.
 - pf_load   — fetch an entire named region assembled from its

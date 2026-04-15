@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+## 0.12.1 (2026-04-15)
+
+Two pre-existing in-flight fixes that had been sitting in the
+working tree before 0.12.0 and deserve a proper release:
+
+### Changed
+
+- **`pf_scan` fans out across backends in parallel.** The
+  dispatcher's Search loop used to iterate targets sequentially,
+  so a single slow backend — an HTTP search shelling out to a
+  multi-second pipeline, say, or a subprocess `rg` over a large
+  tree — blocked every other backend for its whole latency. Now
+  each backend's `.Search` runs on its own goroutine; the whole
+  call takes roughly `max(per-backend latency)` instead of the
+  sum. Results are merged back in the operator's configured
+  backend order so the response shape stays deterministic across
+  runs. A failing backend now also surfaces a `slog.Warn` ("search:
+  backend failed") with backend name + error + caller id instead
+  of a silent `continue`, so the operator has a signal when a
+  backend is chronically unhealthy. Wire format unchanged.
+
+### Fixed
+
+- **Instructions text referenced a wrong example path.** The
+  `pf_peek` entry in the server-level MCP instructions cited
+  `memory://daily/2026-04-11.md` as a worked example, but the
+  real filesystem layout in pagefault's default configs (and
+  every deployment we've seen in the wild) is `memory://memory/…`.
+  Swapped the example path so an agent copying it verbatim into
+  a `pf_peek` call hits an existing file instead of getting
+  `resource_not_found`.
+
 ## 0.12.0 (2026-04-15)
 
 MCP serverInfo branding. The `initialize` response now carries a
