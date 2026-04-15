@@ -3,6 +3,8 @@ package backend
 import (
 	"encoding/json"
 	"fmt"
+	"regexp"
+	"strconv"
 	"strings"
 )
 
@@ -45,8 +47,13 @@ func jsonEscape(s string) string {
 	return string(b)
 }
 
+// indexRe matches a trailing [N] array index on a path segment.
+var indexRe = regexp.MustCompile(`^(.+?)\[(\d+)\]$`)
+
 // walkPath walks a nested map[string]any along a dotted path. It also
-// accepts a leading "$." for JSONPath-like ergonomics. Returns the
+// accepts a leading "$." for JSONPath-like ergonomics. Segments may
+// include a trailing [N] array index (e.g. "payloads[0]") that looks
+// up the map key then indexes into the resulting array. Returns the
 // value and true on success, zero-value and false on any miss.
 // An empty path returns the root unchanged.
 func walkPath(root any, path string) (any, bool) {
@@ -56,6 +63,25 @@ func walkPath(root any, path string) (any, bool) {
 	}
 	cur := root
 	for _, part := range strings.Split(path, ".") {
+		// Check for [N] array index suffix.
+		if m := indexRe.FindStringSubmatch(part); m != nil {
+			key := m[1]
+			idx, _ := strconv.Atoi(m[2])
+			obj, ok := cur.(map[string]any)
+			if !ok {
+				return nil, false
+			}
+			cur, ok = obj[key]
+			if !ok {
+				return nil, false
+			}
+			arr, ok := cur.([]any)
+			if !ok || idx < 0 || idx >= len(arr) {
+				return nil, false
+			}
+			cur = arr[idx]
+			continue
+		}
 		m, ok := cur.(map[string]any)
 		if !ok {
 			return nil, false

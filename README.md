@@ -347,6 +347,20 @@ conventions, versioning rules, and the "adding a new X" checklists.
 
 ## Recent changes
 
+### 0.12.2 — 2026-04-15
+
+- **Subagent response extraction.** New `response_path` field on
+  `subagent-cli` backends extracts just the answer from a CLI
+  subagent's JSON output instead of forwarding the entire blob.
+  Example: `response_path: "result.payloads[0].text"` strips
+  openclaw's `--json` metadata wrapper (which can be 20–50KB of
+  `result.meta` noise) and returns only the text payload. When
+  empty (default), raw stdout is returned as-is; on parse or
+  path-miss failure, Spawn falls back to raw stdout with a
+  `slog.Warn`. The shared `walkPath` helper also gains `[N]`
+  array index support (e.g. `payloads[0]`) so array elements in
+  JSON responses are accessible from all backends that use it.
+
 ### 0.12.1 — 2026-04-15
 
 - **Parallel `pf_scan` fan-out.** `ToolDispatcher.Search` now runs

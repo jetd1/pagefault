@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+## 0.12.2 (2026-04-15)
+
+Subagent response extraction. When a CLI subagent runner emits
+structured JSON (e.g. openclaw's `--json` mode), `pf_fault` now
+returns just the extracted answer instead of forwarding the entire
+JSON blob — which can include 20–50KB of `result.meta` metadata
+that bloats the conversation context without adding value.
+
+### Added
+
+- **`response_path` on `subagent-cli` backends.** A dotted JSON
+  path (with `[N]` array index support) that extracts the answer
+  from the subagent's stdout. Example: `response_path:
+  "result.payloads[0].text"` strips openclaw's metadata wrapper
+  and returns only the text payload. When empty (default), raw
+  stdout is returned as-is. On parse or path-miss failure, Spawn
+  falls back to raw stdout with a `slog.Warn` so the caller still
+  gets a useful result.
+
+- **`[N]` array indexing in `walkPath`.** The shared dotted-path
+  JSON walker used by `subagent-http` and `subagent-cli` now
+  supports `[N]` suffixes on path segments (e.g.
+  `payloads[0].text`) to index into JSON arrays. Previously, array
+  elements were inaccessible — the path could only traverse
+  `map[string]any` nodes.
+
 ## 0.12.1 (2026-04-15)
 
 Two pre-existing in-flight fixes that had been sitting in the

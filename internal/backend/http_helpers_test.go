@@ -80,6 +80,55 @@ func TestWalkPath(t *testing.T) {
 	// Non-map root.
 	_, ok = walkPath("string-root", "a")
 	assert.False(t, ok)
+
+	// ── Array indexing with [N] syntax ──
+
+	// Basic array index.
+	v, ok = walkPath(obj, "a.list[0]")
+	require.True(t, ok)
+	assert.Equal(t, 1, v)
+
+	// Second element.
+	v, ok = walkPath(obj, "a.list[2]")
+	require.True(t, ok)
+	assert.Equal(t, 3, v)
+
+	// Out-of-bounds index.
+	_, ok = walkPath(obj, "a.list[5]")
+	assert.False(t, ok)
+
+	// Negative index is not supported (regex only matches \d+).
+	_, ok = walkPath(obj, "a.list[-1]")
+	assert.False(t, ok, "negative index should fail as a normal map lookup")
+
+	// Non-array value with [0] fails.
+	_, ok = walkPath(obj, "top[0]")
+	assert.False(t, ok)
+
+	// Nested array index + dotted continuation.
+	nested := map[string]any{
+		"data": map[string]any{
+			"items": []any{
+				map[string]any{"name": "first"},
+				map[string]any{"name": "second"},
+			},
+		},
+	}
+	v, ok = walkPath(nested, "data.items[1].name")
+	require.True(t, ok)
+	assert.Equal(t, "second", v)
+
+	// Deep path: result.payloads[0].text (the openclaw shape).
+	openclaw := map[string]any{
+		"result": map[string]any{
+			"payloads": []any{
+				map[string]any{"text": "the answer"},
+			},
+		},
+	}
+	v, ok = walkPath(openclaw, "result.payloads[0].text")
+	require.True(t, ok)
+	assert.Equal(t, "the answer", v)
 }
 
 func TestExtractResponse_EmptyPathReturnsRaw(t *testing.T) {
@@ -128,4 +177,25 @@ func TestExtractResponse_DollarPrefix(t *testing.T) {
 	out, err := extractResponse(body, "$.result")
 	require.NoError(t, err)
 	assert.Equal(t, "ok", out)
+}
+
+func TestExtractResponse_ArrayIndex(t *testing.T) {
+	body := []byte(`{"result": {"payloads": [{"text": "hello"}]}}`)
+	out, err := extractResponse(body, "result.payloads[0].text")
+	require.NoError(t, err)
+	assert.Equal(t, "hello", out)
+}
+
+func TestExtractResponse_ArrayIndexOutOfBounds(t *testing.T) {
+	body := []byte(`{"items": [1]}`)
+	_, err := extractResponse(body, "items[5]")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not found")
+}
+
+func TestExtractResponse_ArrayIndexNonArray(t *testing.T) {
+	body := []byte(`{"items": "not-array"}`)
+	_, err := extractResponse(body, "items[0]")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not found")
 }

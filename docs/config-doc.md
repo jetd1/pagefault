@@ -626,6 +626,10 @@ pagefault just runs the command and waits for stdout.
   type: subagent-cli
   command: "openclaw agent run --agent {agent_id} --task {task} --timeout {timeout}"
   timeout: 300
+  # Optional: extract just the answer from JSON stdout instead of
+  # forwarding the entire blob (which may include 20-50KB of
+  # result.meta metadata). Supports [N] array indexing.
+  # response_path: "result.payloads[0].text"
   # Optional server-side prompt wrappers. See "Subagent prompt
   # templates" below for the full mechanism.
   # retrieve_prompt_template: |
@@ -649,6 +653,7 @@ pagefault just runs the command and waits for stdout.
 | `type`       | string   | yes      | —       | Must be `subagent-cli`. |
 | `command`    | string   | yes      | —       | Tokenized command template. Placeholders: `{agent_id}`, `{task}`, `{timeout}`, `{spawn_id}`. Same non-shell tokenization as `subprocess`. `{task}` is substituted with the *prompt-wrapped* task, not the raw caller input — see the prompt template section below. `{spawn_id}` is a fresh `pf_sp_*` random token per call (0.10.0+) — wire it into your agent runner's session flag to force session isolation, see the "Session isolation" subsection below. |
 | `timeout`    | int      | no       | `300`   | Default seconds before the child is killed. Overridden per call by `pf_fault.timeout_seconds`. |
+| `response_path` | string | no      | —       | Dotted JSON path (with `[N]` array indexing) that extracts the answer from the subagent's stdout. When set, Spawn parses stdout as JSON and walks the path; on parse or path-miss failure, falls back to raw stdout with a `slog.Warn`. Empty (default) returns raw stdout as-is. Example: `"result.payloads[0].text"` strips openclaw's metadata wrapper. |
 | `retrieve_prompt_template` | string | no | built-in default | Backend-wide prompt template for `pf_fault` calls. See the "Subagent prompt templates" subsection below for placeholders and rationale. Empty uses `internal/backend.DefaultRetrievePromptTemplate`. |
 | `write_prompt_template`    | string | no | built-in default | Backend-wide prompt template for `pf_poke` mode:agent calls. Empty uses `internal/backend.DefaultWritePromptTemplate`. |
 | `agents`     | [object] | yes      | —       | At least one. Each has `id` (required), `description`, and optional per-agent `retrieve_prompt_template` / `write_prompt_template` overrides that win over the backend-level fields above. If `pf_fault.agent` / `pf_poke.agent` is empty at call time, the first entry is used as a fallback — but calling agents are told (via the default MCP instructions) to call `pf_ps` first in multi-agent setups and pick by description, so **make each `description` specific enough to route on**. Vague descriptions like "the default agent" silently cause wrong-scope calls. |
@@ -783,6 +788,7 @@ previous calls' context bleeds into the next.
   type: subagent-cli
   command: "openclaw agent run --session-id {spawn_id} --agent {agent_id} --task {task} --timeout {timeout}"
   timeout: 300
+  response_path: "result.payloads[0].text"
   agents:
     - id: wocha
       description: "..."

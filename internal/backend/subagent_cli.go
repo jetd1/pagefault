@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os/exec"
 	"strings"
 	"time"
@@ -44,9 +45,10 @@ type SubagentCLIBackend struct {
 	// backend-level defaults (empty fields fall through to the
 	// built-ins in prompt.go). agentTmpl holds per-agent overrides
 	// keyed on agent id.
-	retrieveTmpl string
-	writeTmpl    string
-	agentTmpl    map[string]agentTemplates
+	retrieveTmpl  string
+	writeTmpl     string
+	agentTmpl     map[string]agentTemplates
+	responsePath  string
 
 	// execCommand is indirected for tests so they can substitute a fake
 	// process (typically `go test -run ... -helper`).
@@ -95,9 +97,10 @@ func NewSubagentCLIBackend(cfg *config.SubagentCLIBackendConfig) (*SubagentCLIBa
 		timeoutSec:   timeout,
 		agents:       agents,
 		defaultID:    agents[0].ID,
-		retrieveTmpl: cfg.RetrievePromptTemplate,
-		writeTmpl:    cfg.WritePromptTemplate,
-		agentTmpl:    agentTmpl,
+		retrieveTmpl:  cfg.RetrievePromptTemplate,
+		writeTmpl:     cfg.WritePromptTemplate,
+		agentTmpl:     agentTmpl,
+		responsePath:  cfg.ResponsePath,
 		execCommand:  exec.CommandContext,
 	}, nil
 }
@@ -206,6 +209,19 @@ func (b *SubagentCLIBackend) Spawn(ctx context.Context, req SpawnRequest) (strin
 
 	err := cmd.Run()
 	out := strings.TrimRight(stdout.String(), "\n")
+
+	// When response_path is configured, extract the answer from the
+	// subagent's JSON output instead of forwarding the entire blob.
+	// On parse or path-miss failure, fall back to raw stdout with a
+	// warning — the caller still gets a useful result.
+	if b.responsePath != "" && err == nil {
+		if extracted, extractErr := extractResponse([]byte(out), b.responsePath); extractErr == nil {
+			out = extracted
+		} else {
+			slog.Warn("subagent-cli: response_path extraction failed, returning raw stdout",
+				"backend", b.name, "path", b.responsePath, "error", extractErr)
+		}
+	}
 
 	// Distinguish timeout (runCtx.Err()) from regular exit errors. When
 	// CommandContext kills the process on deadline, cmd.Run returns a

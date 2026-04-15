@@ -511,6 +511,19 @@ type SubagentCLIBackendConfig struct {
 	// calls. Placeholders: {task}, {target}, {agent_id}. Empty
 	// means "use the built-in default".
 	WritePromptTemplate string `yaml:"write_prompt_template,omitempty"`
+
+	// ResponsePath is a dotted JSON path (with optional [N] array
+	// indexing) that extracts the answer from the subagent's stdout.
+	// When set, Spawn parses stdout as JSON and walks the path to
+	// return only the extracted value — stripping metadata wrappers
+	// that some agent runners emit (e.g. openclaw's result.meta
+	// object can be 20-50KB of noise). When empty, raw stdout is
+	// returned as-is. On parse or path-miss failure, Spawn falls
+	// back to raw stdout and logs a warning.
+	//
+	// Example: "result.payloads[0].text" extracts the first
+	// payload's text field from openclaw's --json output shape.
+	ResponsePath string `yaml:"response_path,omitempty"`
 }
 
 // SubagentHTTPBackendConfig configures an HTTP subagent backend. Spawn

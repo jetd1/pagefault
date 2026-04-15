@@ -284,3 +284,84 @@ func TestSubagentCLIBackend_NoopRead(t *testing.T) {
 	require.NoError(t, err)
 	assert.Nil(t, list)
 }
+
+// TestSubagentCLIBackend_Spawn_ResponsePath verifies that when
+// response_path is configured, Spawn extracts the value from the
+// subagent's JSON output instead of returning the raw blob.
+func TestSubagentCLIBackend_Spawn_ResponsePath(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("echo semantics differ on Windows")
+	}
+	// The command emits openclaw-shaped JSON; response_path extracts
+	// just the text answer.
+	b, err := NewSubagentCLIBackend(&config.SubagentCLIBackendConfig{
+		Name: "sa", Type: "subagent-cli",
+		Command: `echo '{"result":{"payloads":[{"text":"the answer"}],"meta":{"ms":1234}}}'`,
+		Timeout:                10,
+		Agents:                 []config.AgentSpec{{ID: "alpha"}},
+		RetrievePromptTemplate: passthroughTmpl,
+		ResponsePath:           "result.payloads[0].text",
+	})
+	require.NoError(t, err)
+
+	out, err := b.Spawn(context.Background(), SpawnRequest{
+		AgentID: "alpha",
+		Task:    "hello",
+		Timeout: 5 * time.Second,
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "the answer", out)
+}
+
+// TestSubagentCLIBackend_Spawn_ResponsePathFallback verifies that when
+// response_path is set but the subagent's output is not valid JSON
+// (or the path doesn't match), Spawn falls back to raw stdout.
+func TestSubagentCLIBackend_Spawn_ResponsePathFallback(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("echo semantics differ on Windows")
+	}
+	// Non-JSON output with a response_path configured — should fall
+	// back to raw stdout.
+	b, err := NewSubagentCLIBackend(&config.SubagentCLIBackendConfig{
+		Name: "sa", Type: "subagent-cli",
+		Command:                "echo plain-text-output",
+		Timeout:                10,
+		Agents:                 []config.AgentSpec{{ID: "alpha"}},
+		RetrievePromptTemplate: passthroughTmpl,
+		ResponsePath:           "result.payloads[0].text",
+	})
+	require.NoError(t, err)
+
+	out, err := b.Spawn(context.Background(), SpawnRequest{
+		AgentID: "alpha",
+		Task:    "hello",
+		Timeout: 5 * time.Second,
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "plain-text-output", out, "should fall back to raw stdout on parse failure")
+}
+
+// TestSubagentCLIBackend_Spawn_ResponsePathEmpty verifies that an
+// empty response_path (the default) returns raw stdout unchanged.
+func TestSubagentCLIBackend_Spawn_ResponsePathEmpty(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("echo semantics differ on Windows")
+	}
+	b, err := NewSubagentCLIBackend(&config.SubagentCLIBackendConfig{
+		Name: "sa", Type: "subagent-cli",
+		Command: `echo '{"key":"value"}'`,
+		Timeout:                10,
+		Agents:                 []config.AgentSpec{{ID: "alpha"}},
+		RetrievePromptTemplate: passthroughTmpl,
+		// ResponsePath intentionally empty (zero value).
+	})
+	require.NoError(t, err)
+
+	out, err := b.Spawn(context.Background(), SpawnRequest{
+		AgentID: "alpha",
+		Task:    "hello",
+		Timeout: 5 * time.Second,
+	})
+	require.NoError(t, err)
+	assert.Equal(t, `{"key":"value"}`, out, "empty response_path should return raw stdout")
+}

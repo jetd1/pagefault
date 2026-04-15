@@ -67,7 +67,7 @@ pagefault/
 │
 ├── internal/
 │   ├── config/
-│   │   ├── config.go                     # YAML schema structs, Load/Parse, ${ENV} sub, validator (0.12.0 added Title, Description, WebsiteURL, IconURL fields to MCPConfig for serverInfo branding overrides)
+│   │   ├── config.go                     # YAML schema structs, Load/Parse, ${ENV} sub, validator (0.12.0 added Title, Description, WebsiteURL, IconURL fields to MCPConfig for serverInfo branding overrides; 0.12.2 added ResponsePath to SubagentCLIBackendConfig)
 │   │   └── config_test.go                # Config parse/validate/defaults tests
 │   │
 │   ├── model/
@@ -78,13 +78,13 @@ pagefault/
 │   │   ├── filesystem.go                 # FilesystemBackend: glob, sandbox, auto-tag, search, Phase-4 write path
 │   │   ├── filesystem_test.go            # Filesystem backend read-path tests
 │   │   ├── filesystem_write_test.go      # Filesystem backend write-path tests (Phase 4)
-│   │   ├── http_helpers.go               # Shared template/JSON-path helpers (renderTemplate/walkPath/…)
-│   │   ├── http_helpers_test.go          # Helper unit tests (walkPath edge cases, extractResponse variants)
+│   │   ├── http_helpers.go               # Shared template/JSON-path helpers (renderTemplate/walkPath/extractResponse; 0.12.2 added [N] array indexing to walkPath)
+│   │   ├── http_helpers_test.go          # Helper unit tests (walkPath edge cases + array indexing, extractResponse variants)
 │   │   ├── subagent.go                   # SubagentBackend interface + AgentInfo + SpawnRequest
 │   │   ├── prompt.go                     # SpawnRequest / SpawnPurpose (0.10.0 added SpawnID field), default retrieve+write prompt templates, ResolvePromptTemplate + WrapTask
 │   │   ├── prompt_test.go                # Template precedence, placeholder substitution, end-to-end default-template echo
-│   │   ├── subagent_cli.go               # CLI-spawned subagent (exec.CommandContext + argv template, 0.10.0 added {spawn_id} substitution)
-│   │   ├── subagent_cli_test.go          # Tokenizer + spawn/timeout/default-agent tests (passthroughTmpl-based plumbing tests, 0.10.0 added spawn_id passthrough + unused-when-absent)
+│   │   ├── subagent_cli.go               # CLI-spawned subagent (exec.CommandContext + argv template, 0.10.0 added {spawn_id} substitution, 0.12.2 added response_path JSON extraction with walkPath [N] array indexing + raw-stdout fallback)
+│   │   ├── subagent_cli_test.go          # Tokenizer + spawn/timeout/default-agent tests (passthroughTmpl-based plumbing tests, 0.10.0 added spawn_id passthrough + unused-when-absent, 0.12.2 added response_path extraction + fallback + empty-path tests)
 │   │   ├── subagent_http.go              # HTTP-spawned subagent (POST + response_path extraction, 0.10.0 added {spawn_id} substitution in URL path + body template)
 │   │   ├── subagent_http_test.go         # httptest-backed tests: auth, body template, timeout, 0.10.0 spawn_id round-trip
 │   │   ├── subprocess.go                 # Generic subprocess search backend (rg/grep/plain parse)
